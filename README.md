@@ -9,6 +9,10 @@ The application deliberately keeps goal progress separate from XP:
 
 AI integration is intentionally not included in this release.
 
+Live application: [evolvra-seven.vercel.app](https://evolvra-seven.vercel.app)
+
+Source repository: [github.com/YM-MMV/Evolvra](https://github.com/YM-MMV/Evolvra)
+
 ## What is included
 
 - Guided onboarding with suggested or clean starting states
@@ -56,7 +60,7 @@ npm run build
 
 ## Deployment
 
-Import the GitHub repository into Vercel, add the two public Supabase environment variables, and deploy. The PWA service worker is registered in production builds.
+The production project is connected to the GitHub repository and deployed through Vercel. Pushes to the production branch trigger deployments automatically. The two public Supabase environment variables are configured for Production, Preview, and Development, and the PWA service worker is registered in production builds.
 
 ## Privacy model
 
