@@ -28,6 +28,7 @@ export default function DashboardPage() {
   });
   const maxDay = Math.max(...days.map((day) => day.xp), 1);
   const weeklyXp = days.reduce((sum, day) => sum + day.xp, 0);
+  const overallLevel = levelFromXp(state.overallXp, state.settings.scoring.levelBase, state.settings.scoring.levelGrowth);
   const developedStats = [...state.stats].filter((stat) => !stat.archived).sort((a, b) => b.xp - a.xp).slice(0, 4);
 
   return (
@@ -41,16 +42,15 @@ export default function DashboardPage() {
         <div className="hero-actions"><Link href="/quests" className="button button-secondary">View today <ArrowRight size={17} /></Link><Link href="/goals?new=true" className="button button-primary"><Plus size={17} /> New goal</Link></div>
       </section>
 
-      <div className="dashboard-grid">
-        <div className="dashboard-primary">
-          <LifeCalendar />
-          <section>
-            <div className="section-heading"><div><p className="eyebrow">Active objectives</p><h2>Your current goals</h2></div><Link href="/goals">View all <ChevronRight size={16} /></Link></div>
-            {activeGoals.length ? <div className="goal-grid">{activeGoals.slice(0, 4).map((goal) => <GoalCard key={goal.id} goal={goal} area={getArea(state, goal.areaId)} />)}</div> : <EmptyState icon={<Sparkles />} title="A clear field" body="Create your first goal and define what genuine progress looks like." action={<Link href="/goals?new=true" className="button button-primary">Create a goal</Link>} />}
-          </section>
-        </div>
+      <section className="dashboard-kpis" aria-label="Progress overview">
+        <div className="dashboard-kpi"><span>Overall level</span><strong>{overallLevel.level}</strong><small>{Math.round(overallLevel.current)} / {overallLevel.needed} XP</small></div>
+        <div className="dashboard-kpi"><span>Total XP</span><strong>{Math.round(state.overallXp)}</strong><small>All-time progress</small></div>
+        <div className="dashboard-kpi"><span>Active goals</span><strong>{activeGoals.length}</strong><small>Current objectives</small></div>
+        <div className="dashboard-kpi"><span>7-day XP</span><strong>{weeklyXp}</strong><small>Recent momentum</small></div>
+      </section>
 
-        <aside className="dashboard-rail">
+      <div className="dashboard-command-grid">
+        <aside className="dashboard-command-rail">
           <Panel className="today-panel">
             <div className="section-heading compact"><div><p className="eyebrow">Next actions</p><h2>Today’s quests</h2></div><span className="count-badge">{todayQuests.length}</span></div>
             <div className="quest-mini-list">
@@ -62,14 +62,28 @@ export default function DashboardPage() {
             </div>
             <Link href="/quests" className="panel-link">Open quest board <ArrowRight size={15} /></Link>
           </Panel>
+        </aside>
 
+        <div className="dashboard-command-main">
+          <LifeCalendar />
           <Panel className="momentum-panel">
             <div className="section-heading compact"><div><p className="eyebrow">Last 7 days</p><h2>Momentum</h2></div><span className="section-icon warm"><Flame size={18} /></span></div>
             <div className="momentum-total"><strong>{weeklyXp}</strong><span>XP earned this week</span></div>
             <div className="mini-chart">{days.map((day) => <div key={day.key}><span style={{ height: `${Math.max(6, (day.xp / maxDay) * 100)}%` }} title={`${day.xp} XP`} /><small>{day.label}</small></div>)}</div>
             <p className="supportive-copy">Momentum describes recent activity. It is information, never a verdict.</p>
           </Panel>
+        </div>
+      </div>
 
+      <div className="dashboard-grid dashboard-followup-grid">
+        <div className="dashboard-primary">
+          <section>
+            <div className="section-heading"><div><p className="eyebrow">Active objectives</p><h2>Your current goals</h2></div><Link href="/goals">View all <ChevronRight size={16} /></Link></div>
+            {activeGoals.length ? <div className="goal-grid">{activeGoals.slice(0, 4).map((goal) => <GoalCard key={goal.id} goal={goal} area={getArea(state, goal.areaId)} />)}</div> : <EmptyState icon={<Sparkles />} title="A clear field" body="Create your first goal and define what genuine progress looks like." action={<Link href="/goals?new=true" className="button button-primary">Create a goal</Link>} />}
+          </section>
+        </div>
+
+        <aside className="dashboard-rail">
           <Panel className="stats-mini-panel">
             <div className="section-heading compact"><div><p className="eyebrow">Character growth</p><h2>Developing stats</h2></div><span className="section-icon"><TrendingUp size={18} /></span></div>
             <div className="stats-mini-list">

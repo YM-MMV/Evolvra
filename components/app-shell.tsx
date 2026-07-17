@@ -6,8 +6,6 @@ import { usePathname } from "next/navigation";
 import {
   BarChart3,
   CheckSquare2,
-  ChevronLeft,
-  ChevronRight,
   Cloud,
   CloudOff,
   Command,
@@ -37,7 +35,6 @@ const nav: { href: string; label: string; termKey?: "goals" | "quests" | "stats"
 export function AppShell({ children }: { children: React.ReactNode }) {
   const { state, ready, user, syncStatus, canUndo, undo } = useApp();
   const pathname = usePathname();
-  const [collapsed, setCollapsed] = useState(false);
   const [mobileOpen, setMobileOpen] = useState(false);
 
   useEffect(() => {
@@ -57,42 +54,51 @@ export function AppShell({ children }: { children: React.ReactNode }) {
 
   const level = levelFromXp(state.overallXp, state.settings.scoring.levelBase, state.settings.scoring.levelGrowth);
   const current = nav.find((item) => item.href === pathname) ?? nav.find((item) => item.href !== "/" && pathname.startsWith(item.href));
+  const currentLabel = pathname.startsWith("/settings")
+    ? "Customise"
+    : current?.termKey
+      ? state.settings.terminology[current.termKey]
+      : current?.label ?? "Evolvra";
 
   return (
-    <div className={`app-layout ${collapsed ? "nav-collapsed" : ""}`}>
+    <div className="app-layout">
       <aside className={`sidebar ${mobileOpen ? "mobile-open" : ""}`}>
         <div className="sidebar-top">
           <Link className="brand" href="/"><span className="brand-mark"><Sparkles size={20} /></span><span className="brand-copy"><strong>Evolvra</strong><small>Personal OS</small></span></Link>
           <button className="mobile-close icon-button" onClick={() => setMobileOpen(false)} aria-label="Close menu"><X size={20} /></button>
         </div>
-        <div className="level-card">
-          <span className="level-orb">{level.level}</span>
-          <div><small>Overall level</small><strong>{Math.round(level.current)} / {level.needed} XP</strong><div className="mini-track"><span style={{ width: `${level.percent}%` }} /></div></div>
-        </div>
         <nav className="nav-list">
           {nav.map(({ href, label, termKey, icon: Icon }) => {
             const active = href === "/" ? pathname === href : pathname.startsWith(href);
             const displayLabel = termKey ? state.settings.terminology[termKey] : label;
-            return <Link key={href} href={href} className={active ? "active" : ""} onClick={() => setMobileOpen(false)}><Icon size={19} /><span>{displayLabel}</span>{active && <i />}</Link>;
+            return <Link key={href} href={href} className={active ? "active" : ""} aria-current={active ? "page" : undefined} onClick={() => setMobileOpen(false)}><Icon size={17} /><span>{displayLabel}</span>{active && <i />}</Link>;
           })}
         </nav>
+        <div className="level-card" aria-label={`Overall level ${level.level}, ${Math.round(level.current)} of ${level.needed} XP`}>
+          <span className="level-orb">LVL {level.level}</span>
+          <div><small>Progress</small><strong>{Math.round(level.current)} / {level.needed} XP</strong><div className="mini-track"><span style={{ width: `${level.percent}%` }} /></div></div>
+        </div>
         <div className="sidebar-bottom">
-          <Link href="/settings" className={pathname.startsWith("/settings") ? "active" : ""}><Settings size={19} /><span>Customise</span></Link>
+          <Link href="/settings" className={pathname.startsWith("/settings") ? "active" : ""} aria-current={pathname.startsWith("/settings") ? "page" : undefined}><Settings size={17} /><span>Customise</span></Link>
           <div className="sync-indicator">{user ? <Cloud size={16} /> : <CloudOff size={16} />}<span>{user ? (syncStatus === "saving" ? "Saving…" : "Cloud synced") : "Private on this device"}</span></div>
         </div>
-        <button className="collapse-button" onClick={() => setCollapsed((value) => !value)} aria-label={collapsed ? "Expand navigation" : "Collapse navigation"}>{collapsed ? <ChevronRight size={16} /> : <ChevronLeft size={16} />}</button>
       </aside>
       {mobileOpen && <button className="mobile-scrim" onClick={() => setMobileOpen(false)} aria-label="Close navigation" />}
       <div className="app-main">
         <header className="topbar">
-          <div className="topbar-title"><button className="mobile-menu icon-button" onClick={() => setMobileOpen(true)} aria-label="Open menu"><Menu size={21} /></button><div><small>{current?.label ?? "Evolvra"}</small><strong>{state.profile.chapter}</strong></div></div>
+          <div className="topbar-title"><button className="mobile-menu icon-button" onClick={() => setMobileOpen(true)} aria-label="Open menu"><Menu size={21} /></button><div><small>Workspace / {currentLabel}</small><strong>{state.profile.chapter}</strong></div></div>
           <div className="topbar-actions">
-            {canUndo && <button className="undo-button" onClick={undo}><RotateCcw size={15} /><span>Undo</span></button>}
-            <Link href="/goals?new=true" className="quick-add"><Plus size={17} /><span>New goal</span></Link>
+            {canUndo && <button className="undo-button" onClick={undo} aria-label="Undo most recent change"><RotateCcw size={15} /><span>Undo</span></button>}
+            <Link href="/goals?new=true" className="quick-add" aria-label="Create a new goal"><Plus size={17} /><span>New goal</span></Link>
             <Link href="/settings" className="avatar" aria-label="Open settings">{state.profile.displayName.slice(0, 2).toUpperCase()}</Link>
           </div>
         </header>
         <main className="page-container">{children}</main>
+        <footer className="system-footer">
+          <span><i className={user ? "online" : "local"} />{user ? "PRIVATE SYNC ONLINE" : "LOCAL-FIRST MODE"}</span>
+          <span>XP {Math.round(state.overallXp).toLocaleString("en-GB")}</span>
+          <span>EVOLVRA / V1.0</span>
+        </footer>
       </div>
     </div>
   );
