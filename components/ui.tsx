@@ -1,6 +1,6 @@
 "use client";
 
-import { type ButtonHTMLAttributes, type PropsWithChildren, useEffect } from "react";
+import { type ButtonHTMLAttributes, type PropsWithChildren, useEffect, useId } from "react";
 import { X } from "lucide-react";
 
 export function Button({ className = "", variant = "primary", ...props }: ButtonHTMLAttributes<HTMLButtonElement> & { variant?: "primary" | "secondary" | "ghost" | "danger" }) {
@@ -12,14 +12,17 @@ export function Panel({ children, className = "", ...props }: PropsWithChildren<
 }
 
 export function ProgressBar({ value, color = "var(--accent)", label }: { value: number; color?: string; label?: string }) {
+  const progress = Math.max(0, Math.min(100, value));
   return (
-    <div className="progress-wrap" aria-label={label ?? `${Math.round(value)}% progress`}>
-      <div className="progress-track"><span style={{ width: `${Math.max(0, Math.min(100, value))}%`, background: color }} /></div>
+    <div className="progress-wrap" role="progressbar" aria-label={label ?? `${Math.round(progress)}% progress`} aria-valuemin={0} aria-valuemax={100} aria-valuenow={progress}>
+      <div className="progress-track"><span style={{ width: `${progress}%`, background: color }} /></div>
     </div>
   );
 }
 
 export function Modal({ open, onClose, title, eyebrow, children, wide = false }: PropsWithChildren<{ open: boolean; onClose: () => void; title: string; eyebrow?: string; wide?: boolean }>) {
+  const titleId = useId();
+
   useEffect(() => {
     if (!open) return;
     const close = (event: KeyboardEvent) => event.key === "Escape" && onClose();
@@ -34,9 +37,9 @@ export function Modal({ open, onClose, title, eyebrow, children, wide = false }:
   if (!open) return null;
   return (
     <div className="modal-backdrop" role="presentation" onMouseDown={onClose}>
-      <div className={`modal ${wide ? "modal-wide" : ""}`} role="dialog" aria-modal="true" aria-labelledby="modal-title" onMouseDown={(event) => event.stopPropagation()}>
+      <div className={`modal ${wide ? "modal-wide" : ""}`} role="dialog" aria-modal="true" aria-labelledby={titleId} onMouseDown={(event) => event.stopPropagation()}>
         <header className="modal-header">
-          <div>{eyebrow && <p className="eyebrow">{eyebrow}</p>}<h2 id="modal-title">{title}</h2></div>
+          <div>{eyebrow && <p className="eyebrow">{eyebrow}</p>}<h2 id={titleId}>{title}</h2></div>
           <button className="icon-button" onClick={onClose} aria-label="Close"><X size={18} /></button>
         </header>
         <div className="modal-body">{children}</div>

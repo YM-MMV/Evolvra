@@ -31,7 +31,7 @@ export function GoalCard({ goal, area }: { goal: Goal; area?: Area }) {
         <span>{nextMilestone?.title ?? nextQuest?.title ?? "Ready for review"}</span>
       </div>
       <div className="goal-card-meta">
-        <Pill color={goal.priority === "critical" ? "#ff718a" : goal.priority === "high" ? "#f4b65e" : undefined}><Flag size={12} /> {goal.priority}</Pill>
+        <Pill color={goal.priority === "critical" ? "#df4444" : goal.priority === "high" ? "#ffc15c" : undefined}><Flag size={12} /> {goal.priority}</Pill>
         {goal.status === "paused" && <Pill><PauseCircle size={12} /> Paused</Pill>}
         {goal.targetDate && <span><CalendarDays size={13} /> {shortDate(goal.targetDate)}</span>}
       </div>
