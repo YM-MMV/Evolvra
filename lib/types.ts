@@ -1,9 +1,6 @@
 export type GoalStatus = "active" | "paused" | "completed" | "archived";
 export type GoalModel = "numeric" | "weighted" | "consistency" | "open";
 export type Priority = "low" | "medium" | "high" | "critical";
-export type QuestEffort = "quick" | "standard" | "focused" | "major";
-export type QuestDifficulty = "easy" | "moderate" | "difficult";
-export type QuestImpact = "supporting" | "meaningful" | "important";
 export type ReviewCadence = "daily" | "weekly" | "monthly";
 
 export interface Area {
@@ -21,7 +18,6 @@ export interface LifeStat {
   name: string;
   color: string;
   icon: string;
-  xp: number;
   archived?: boolean;
 }
 
@@ -43,7 +39,6 @@ export interface Milestone {
   id: string;
   title: string;
   weight: number;
-  xp: number;
   completed: boolean;
   completedAt?: string;
 }
@@ -53,15 +48,17 @@ export interface Quest {
   title: string;
   description?: string;
   dueDate?: string;
-  effort: QuestEffort;
-  difficulty: QuestDifficulty;
-  impact: QuestImpact;
-  xp: number;
   repeat: "none" | "daily" | "weekly" | "monthly";
   completed: boolean;
   completedAt?: string;
   durationMinutes?: number;
   metricDeltas: MetricDelta[];
+}
+
+export interface GoalCheckIn {
+  id: string;
+  createdAt: string;
+  note: string;
 }
 
 export interface Goal {
@@ -78,10 +75,29 @@ export interface Goal {
   metrics: ProgressMetric[];
   milestones: Milestone[];
   quests: Quest[];
-  statWeights: Record<string, number>;
-  checkInScore?: number;
+  statIds: string[];
+  checkIns: GoalCheckIn[];
   evidence: string[];
   notes: string;
+}
+
+export interface QuestCompletion {
+  id: string;
+  goalId: string;
+  questId: string;
+  title: string;
+  completedAt: string;
+  durationMinutes?: number;
+}
+
+export interface MetricEntry {
+  id: string;
+  goalId: string;
+  metricId: string;
+  value: number;
+  previousValue: number;
+  recordedAt: string;
+  source: "manual" | "quest";
 }
 
 export interface Review {
@@ -93,13 +109,12 @@ export interface Review {
 
 export interface TimelineEvent {
   id: string;
-  type: "quest" | "milestone" | "goal" | "level" | "review" | "note" | "metric";
+  type: "quest" | "milestone" | "goal" | "review" | "note" | "metric";
   title: string;
   detail: string;
   at: string;
   goalId?: string;
   areaId?: string;
-  xp?: number;
 }
 
 export interface Terminology {
@@ -110,22 +125,12 @@ export interface Terminology {
   stats: string;
 }
 
-export interface ScoringSettings {
-  effort: Record<QuestEffort, number>;
-  difficulty: Record<QuestDifficulty, number>;
-  impact: Record<QuestImpact, number>;
-  questCap: number;
-  levelBase: number;
-  levelGrowth: number;
-}
-
 export interface UserSettings {
   theme: "dark" | "light" | "system";
   gameIntensity: "minimal" | "balanced" | "immersive";
   birthDate?: string;
   notifications: boolean;
   terminology: Terminology;
-  scoring: ScoringSettings;
 }
 
 export interface Profile {
@@ -136,14 +141,15 @@ export interface Profile {
 }
 
 export interface AppState {
-  version: number;
+  version: 2;
   updatedAt: string;
   profile: Profile;
   settings: UserSettings;
   areas: Area[];
   stats: LifeStat[];
   goals: Goal[];
+  questCompletions: QuestCompletion[];
+  metricEntries: MetricEntry[];
   reviews: Review[];
   timeline: TimelineEvent[];
-  overallXp: number;
 }

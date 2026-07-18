@@ -28,8 +28,8 @@ export function Onboarding() {
             <p className="lead">Connect meaningful goals to real-world progress, focused actions, and the qualities you are developing — without guilt, punishment, or fragile streaks.</p>
             <div className="principle-grid">
               <div><Target /><span><strong>Real progress</strong><small>Measure outcomes, not busywork.</small></span></div>
-              <div><ShieldCheck /><span><strong>Nothing is failed</strong><small>Pause, adapt, and keep what you earned.</small></span></div>
-              <div><Layers3 /><span><strong>Your system</strong><small>Custom areas, stats, scoring, and language.</small></span></div>
+              <div><ShieldCheck /><span><strong>Change is allowed</strong><small>Pause, adapt, and keep your history.</small></span></div>
+              <div><Layers3 /><span><strong>Your system</strong><small>Custom areas, qualities, actions, and language.</small></span></div>
             </div>
             <Button onClick={() => setStep(1)}>Begin setup <ArrowRight size={17} /></Button>
           </div>

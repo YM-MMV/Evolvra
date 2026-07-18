@@ -6,30 +6,40 @@ import { useApp } from "@/components/app-provider";
 import { DynamicIcon } from "@/components/icons";
 import { GoalCard } from "@/components/goal-card";
 import { LifeCalendar } from "@/components/life-calendar";
-import { EmptyState, Panel, ProgressBar } from "@/components/ui";
-import { getArea, levelFromXp } from "@/lib/utils";
+import { EmptyState, Panel } from "@/components/ui";
+import { getArea } from "@/lib/utils";
 
 export default function DashboardPage() {
   const { state, completeQuest } = useApp();
   const activeGoals = state.goals.filter((goal) => goal.status === "active");
-  const todayQuests = activeGoals.flatMap((goal) => goal.quests.filter((quest) => !quest.completed).map((quest) => ({ quest, goal })));
+  const todayKey = new Date().toLocaleDateString("en-CA");
+  const todayQuests = activeGoals.flatMap((goal) => goal.quests.filter((quest) => !quest.completed && (!quest.dueDate || quest.dueDate <= todayKey)).map((quest) => ({ quest, goal })));
   const hour = new Date().getHours();
   const greeting = hour < 12 ? "Good morning" : hour < 18 ? "Good afternoon" : "Good evening";
 
   const days = Array.from({ length: 7 }, (_, offset) => {
     const date = new Date();
     date.setDate(date.getDate() - (6 - offset));
-    const key = date.toISOString().slice(0, 10);
+    const key = date.toLocaleDateString("en-CA");
     return {
       key,
       label: date.toLocaleDateString("en-GB", { weekday: "short" }).slice(0, 1),
-      xp: state.timeline.filter((event) => event.at.startsWith(key)).reduce((sum, event) => sum + (event.xp ?? 0), 0),
+      activity: state.timeline.filter((event) => new Date(event.at).toLocaleDateString("en-CA") === key).length,
     };
   });
-  const maxDay = Math.max(...days.map((day) => day.xp), 1);
-  const weeklyXp = days.reduce((sum, day) => sum + day.xp, 0);
-  const overallLevel = levelFromXp(state.overallXp, state.settings.scoring.levelBase, state.settings.scoring.levelGrowth);
-  const developedStats = [...state.stats].filter((stat) => !stat.archived).sort((a, b) => b.xp - a.xp).slice(0, 4);
+  const maxDay = Math.max(...days.map((day) => day.activity), 1);
+  const weeklyActivity = days.reduce((sum, day) => sum + day.activity, 0);
+  const milestoneCount = state.timeline.filter((event) => event.type === "milestone").length;
+  const activityDays = new Set(state.timeline.map((event) => new Date(event.at).toLocaleDateString("en-CA"))).size;
+  const developedStats = state.stats
+    .filter((stat) => !stat.archived)
+    .map((stat) => {
+      const goalIds = state.goals.filter((goal) => goal.statIds.includes(stat.id)).map((goal) => goal.id);
+      const activity = state.timeline.filter((event) => event.goalId && goalIds.includes(event.goalId) && ["quest", "milestone", "metric"].includes(event.type)).length;
+      return { stat, activity, goals: goalIds.length };
+    })
+    .sort((a, b) => b.activity - a.activity || b.goals - a.goals)
+    .slice(0, 4);
 
   return (
     <div className="dashboard-page">
@@ -43,10 +53,10 @@ export default function DashboardPage() {
       </section>
 
       <section className="dashboard-kpis" aria-label="Progress overview">
-        <div className="dashboard-kpi"><span>Overall level</span><strong>{overallLevel.level}</strong><small>{Math.round(overallLevel.current)} / {overallLevel.needed} XP</small></div>
-        <div className="dashboard-kpi"><span>Total XP</span><strong>{Math.round(state.overallXp)}</strong><small>All-time progress</small></div>
         <div className="dashboard-kpi"><span>Active goals</span><strong>{activeGoals.length}</strong><small>Current objectives</small></div>
-        <div className="dashboard-kpi"><span>7-day XP</span><strong>{weeklyXp}</strong><small>Recent momentum</small></div>
+        <div className="dashboard-kpi"><span>Actions completed</span><strong>{state.questCompletions.length}</strong><small>All-time record</small></div>
+        <div className="dashboard-kpi"><span>Milestones reached</span><strong>{milestoneCount}</strong><small>All-time record</small></div>
+        <div className="dashboard-kpi"><span>Active days</span><strong>{activityDays}</strong><small>Days with a recorded moment</small></div>
       </section>
 
       <div className="dashboard-command-grid">
@@ -56,7 +66,7 @@ export default function DashboardPage() {
             <div className="quest-mini-list">
               {todayQuests.slice(0, 5).map(({ quest, goal }) => {
                 const area = getArea(state, goal.areaId);
-                return <div className="quest-mini" key={quest.id}><button onClick={() => completeQuest(goal.id, quest.id)} aria-label={`Complete ${quest.title}`}><Check size={15} /></button><div><strong>{quest.title}</strong><span><i style={{ background: area?.color }} />{goal.title}</span></div><small>+{quest.xp}</small></div>;
+                return <div className="quest-mini" key={quest.id}><button onClick={() => completeQuest(goal.id, quest.id)} aria-label={`Complete ${quest.title}`}><Check size={15} /></button><div><strong>{quest.title}</strong><span><i style={{ background: area?.color }} />{goal.title}</span></div><small>{quest.durationMinutes ? `${quest.durationMinutes} min` : "Ready"}</small></div>;
               })}
               {!todayQuests.length && <div className="calm-empty"><Check size={20} /><strong>Clear for now</strong><p>Add a next action when you are ready.</p></div>}
             </div>
@@ -68,8 +78,8 @@ export default function DashboardPage() {
           <LifeCalendar />
           <Panel className="momentum-panel">
             <div className="section-heading compact"><div><p className="eyebrow">Last 7 days</p><h2>Momentum</h2></div><span className="section-icon warm"><Flame size={18} /></span></div>
-            <div className="momentum-total"><strong>{weeklyXp}</strong><span>XP earned this week</span></div>
-            <div className="mini-chart">{days.map((day) => <div key={day.key}><span style={{ height: `${Math.max(6, (day.xp / maxDay) * 100)}%` }} title={`${day.xp} XP`} /><small>{day.label}</small></div>)}</div>
+            <div className="momentum-total"><strong>{weeklyActivity}</strong><span>recorded moments this week</span></div>
+            <div className="mini-chart">{days.map((day) => <div key={day.key}><span style={{ height: `${day.activity ? Math.max(6, (day.activity / maxDay) * 100) : 0}%` }} title={`${day.activity} recorded ${day.activity === 1 ? "moment" : "moments"}`} /><small>{day.label}</small></div>)}</div>
             <p className="supportive-copy">Momentum describes recent activity. It is information, never a verdict.</p>
           </Panel>
         </div>
@@ -85,12 +95,9 @@ export default function DashboardPage() {
 
         <aside className="dashboard-rail">
           <Panel className="stats-mini-panel">
-            <div className="section-heading compact"><div><p className="eyebrow">Character growth</p><h2>Developing stats</h2></div><span className="section-icon"><TrendingUp size={18} /></span></div>
+            <div className="section-heading compact"><div><p className="eyebrow">Qualities in motion</p><h2>Connected stats</h2></div><span className="section-icon"><TrendingUp size={18} /></span></div>
             <div className="stats-mini-list">
-              {developedStats.map((stat) => {
-                const level = levelFromXp(stat.xp, state.settings.scoring.levelBase, state.settings.scoring.levelGrowth);
-                return <div key={stat.id}><span className="stat-mini-icon" style={{ color: stat.color, background: `${stat.color}18` }}><DynamicIcon name={stat.icon} size={16} /></span><div><span><strong>{stat.name}</strong><small>LVL {level.level}</small></span><ProgressBar value={level.percent} color={stat.color} /></div></div>;
-              })}
+              {developedStats.map(({ stat, activity, goals }) => <div key={stat.id}><span className="stat-mini-icon" style={{ color: stat.color, background: `${stat.color}18` }}><DynamicIcon name={stat.icon} size={16} /></span><div><span><strong>{stat.name}</strong><small>{activity} {activity === 1 ? "moment" : "moments"}</small></span><small>{goals} connected {goals === 1 ? "goal" : "goals"}</small></div></div>)}
             </div>
             <Link href="/stats" className="panel-link">Explore all stats <ArrowRight size={15} /></Link>
           </Panel>

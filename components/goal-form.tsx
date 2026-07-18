@@ -3,15 +3,15 @@
 import { useMemo, useState } from "react";
 import { ArrowLeft, ArrowRight, Check, Plus, Sparkles, Target } from "lucide-react";
 import { useApp } from "@/components/app-provider";
-import { Button, Field, Modal, ProgressBar } from "@/components/ui";
-import type { Goal, GoalModel, Priority, QuestDifficulty, QuestEffort, QuestImpact } from "@/lib/types";
-import { questXp, uid } from "@/lib/utils";
+import { Button, Field, Modal } from "@/components/ui";
+import type { Goal, GoalModel, Priority } from "@/lib/types";
+import { uid } from "@/lib/utils";
 
 const models: { id: GoalModel; title: string; description: string; example: string }[] = [
   { id: "numeric", title: "Numeric", description: "A measurable target with one or more real values.", example: "£650 of £2,000 saved" },
   { id: "weighted", title: "Weighted milestones", description: "Meaningful stages contribute a defined share.", example: "Portfolio 30% · CV 20%" },
   { id: "consistency", title: "Consistency", description: "Track completion rate and total investment, not streaks.", example: "8 of 12 sessions this month" },
-  { id: "open", title: "Open-ended", description: "Use evidence, check-ins, and self-assessment.", example: "Confidence · organisation · network" },
+  { id: "open", title: "Open-ended", description: "Use evidence and written check-ins when a number would be misleading.", example: "Confidence · organisation · network" },
 ];
 
 export function GoalForm({ open, onClose }: { open: boolean; onClose: () => void }) {
@@ -28,29 +28,22 @@ export function GoalForm({ open, onClose }: { open: boolean; onClose: () => void
   const [metricTarget, setMetricTarget] = useState(100);
   const [metricUnit, setMetricUnit] = useState("");
   const [milestoneText, setMilestoneText] = useState("");
-  const [openScore, setOpenScore] = useState(0);
-  const [weights, setWeights] = useState<Record<string, number>>({ [state.stats[0]?.id]: 100 });
+  const [statIds, setStatIds] = useState<string[]>(state.stats[0]?.id ? [state.stats[0].id] : []);
   const [questTitle, setQuestTitle] = useState("");
-  const [effort, setEffort] = useState<QuestEffort>("standard");
-  const [difficulty, setDifficulty] = useState<QuestDifficulty>("moderate");
-  const [impact, setImpact] = useState<QuestImpact>("meaningful");
-  const weightTotal = Object.values(weights).reduce((sum, weight) => sum + Number(weight), 0);
-  const xp = questXp({ effort, difficulty, impact }, state.settings.scoring);
-  const steps = ["Direction", "Measurement", "Stats", "First action"];
+  const steps = ["Direction", "Measurement", "Qualities", "First action"];
 
   const canContinue = useMemo(() => {
     if (step === 0) return Boolean(title.trim() && description.trim() && areaId);
     if (step === 1 && (model === "numeric" || model === "consistency")) return Boolean(metricLabel.trim() && metricTarget > 0);
     if (step === 1 && model === "weighted") return milestoneText.split("\n").filter((line) => line.trim()).length > 0;
-    if (step === 2) return weightTotal === 100;
+    if (step === 2) return statIds.length > 0 || state.stats.filter((stat) => !stat.archived).length === 0;
     return true;
-  }, [areaId, description, metricLabel, metricTarget, milestoneText, model, step, title, weightTotal]);
+  }, [areaId, description, metricLabel, metricTarget, milestoneText, model, statIds.length, state.stats, step, title]);
 
   const reset = () => {
     setStep(0); setTitle(""); setDescription(""); setPriority("medium"); setTargetDate(""); setModel("numeric");
     setMetricLabel("Progress"); setMetricCurrent(0); setMetricTarget(100); setMetricUnit(""); setMilestoneText("");
-    setOpenScore(0); setWeights({ [state.stats[0]?.id]: 100 }); setQuestTitle(""); setEffort("standard");
-    setDifficulty("moderate"); setImpact("meaningful");
+    setStatIds(state.stats[0]?.id ? [state.stats[0].id] : []); setQuestTitle("");
   };
 
   const close = () => { reset(); onClose(); };
@@ -69,10 +62,10 @@ export function GoalForm({ open, onClose }: { open: boolean; onClose: () => void
       status: "active",
       createdAt: new Date().toISOString(),
       metrics: model === "numeric" || model === "consistency" ? [{ id: metricId, label: metricLabel.trim(), current: metricCurrent, target: metricTarget, unit: metricUnit.trim(), weight: 100 }] : [],
-      milestones: lines.map((line, index) => ({ id: uid("milestone"), title: line, weight: model === "weighted" ? 100 / lines.length : 0, xp: index === lines.length - 1 ? 200 : 100, completed: false })),
-      quests: questTitle.trim() ? [{ id: uid("quest"), title: questTitle.trim(), effort, difficulty, impact, xp, repeat: "none", completed: false, metricDeltas: [] }] : [],
-      statWeights: Object.fromEntries(Object.entries(weights).filter(([, weight]) => Number(weight) > 0)),
-      checkInScore: model === "open" ? openScore : undefined,
+      milestones: lines.map((line) => ({ id: uid("milestone"), title: line, weight: model === "weighted" ? 100 / lines.length : 0, completed: false })),
+      quests: questTitle.trim() ? [{ id: uid("quest"), title: questTitle.trim(), repeat: "none", completed: false, metricDeltas: [] }] : [],
+      statIds,
+      checkIns: [],
       evidence: [],
       notes: "",
     };
@@ -94,24 +87,23 @@ export function GoalForm({ open, onClose }: { open: boolean; onClose: () => void
       </div>}
 
       {step === 1 && <div className="form-section">
-        <div className="form-intro"><span><Sparkles /></span><div><h3>Choose honest progress</h3><p>XP measures effort. This model measures the real-world outcome separately.</p></div></div>
+        <div className="form-intro"><span><Sparkles /></span><div><h3>Choose honest progress</h3><p>Use the model that best reflects the real-world outcome you care about.</p></div></div>
         <div className="model-grid">{models.map((item) => <button key={item.id} onClick={() => setModel(item.id)} className={model === item.id ? "model-card active" : "model-card"}><span className="choice-radio" /><strong>{item.title}</strong><p>{item.description}</p><small>{item.example}</small></button>)}</div>
         {(model === "numeric" || model === "consistency") && <div className="metric-builder"><div className="form-grid thirds"><Field label="What are you measuring?"><input value={metricLabel} onChange={(e) => setMetricLabel(e.target.value)} placeholder="Words learned" /></Field><Field label="Current"><input type="number" min="0" value={metricCurrent} onChange={(e) => setMetricCurrent(Number(e.target.value))} /></Field><Field label="Target"><input type="number" min="1" value={metricTarget} onChange={(e) => setMetricTarget(Number(e.target.value))} /></Field></div><Field label="Unit"><input value={metricUnit} onChange={(e) => setMetricUnit(e.target.value)} placeholder="words, £, sessions, lessons…" /></Field></div>}
         {model === "weighted" && <Field label="Milestones" hint="One milestone per line. We will split the weight evenly; you can fine-tune it later."><textarea rows={5} value={milestoneText} onChange={(e) => setMilestoneText(e.target.value)} placeholder={"Complete course material\nBuild portfolio project\nPrepare CV\nSubmit applications"} /></Field>}
-        {model === "open" && <Field label="Current self-assessment" hint="This is a check-in, not a fake completion percentage."><div className="range-field"><input type="range" min="0" max="100" value={openScore} onChange={(e) => setOpenScore(Number(e.target.value))} /><strong>{openScore}/100</strong></div></Field>}
+        {model === "open" && <div className="setting-note"><Sparkles size={17} /><p>Open-ended goals use dated reflections and evidence instead of a made-up completion percentage. Add your first check-in from the goal page.</p></div>}
       </div>}
 
       {step === 2 && <div className="form-section">
-        <div className="form-intro"><span><Sparkles /></span><div><h3>Connect character growth</h3><p>Allocate exactly 100%. XP earned through this goal will be shared across these stats.</p></div></div>
-        <div className="weight-total"><div><span>Allocated</span><strong className={weightTotal === 100 ? "valid" : ""}>{weightTotal}%</strong></div><ProgressBar value={weightTotal} color={weightTotal === 100 ? "var(--positive)" : "var(--accent)"} /></div>
-        <div className="weight-list">{state.stats.filter((stat) => !stat.archived).map((stat) => <label key={stat.id}><span><i style={{ background: stat.color }} />{stat.name}</span><div><input type="number" min="0" max="100" value={weights[stat.id] ?? 0} onChange={(e) => setWeights((current) => ({ ...current, [stat.id]: Number(e.target.value) }))} /><small>%</small></div></label>)}</div>
+        <div className="form-intro"><span><Sparkles /></span><div><h3>Connect the qualities you are developing</h3><p>Choose every quality this goal supports. These links organise your activity; they do not assign points.</p></div></div>
+        <div className="quality-list">{state.stats.filter((stat) => !stat.archived).map((stat) => { const selected = statIds.includes(stat.id); return <button type="button" key={stat.id} className={selected ? "selected" : ""} aria-pressed={selected} onClick={() => setStatIds((current) => selected ? current.filter((id) => id !== stat.id) : [...current, stat.id])}><i style={{ background: stat.color }} /><span>{stat.name}</span>{selected && <Check size={15} />}</button>; })}</div>
+        {!state.stats.some((stat) => !stat.archived) && <p className="muted-copy">You can create qualities later from Settings.</p>}
       </div>}
 
       {step === 3 && <div className="form-section">
         <div className="form-intro"><span><Check /></span><div><h3>Name the first useful action</h3><p>A goal should answer “what can I do next?” You can leave this blank and add quests later.</p></div></div>
         <Field label="First quest" hint="Optional"><input value={questTitle} onChange={(e) => setQuestTitle(e.target.value)} placeholder="Complete the first course lesson" /></Field>
-        <div className="form-grid thirds"><Field label="Effort"><select value={effort} onChange={(e) => setEffort(e.target.value as QuestEffort)}><option value="quick">Quick · 5</option><option value="standard">Standard · 15</option><option value="focused">Focused · 30</option><option value="major">Major · 50</option></select></Field><Field label="Difficulty"><select value={difficulty} onChange={(e) => setDifficulty(e.target.value as QuestDifficulty)}><option value="easy">Easy · +0</option><option value="moderate">Moderate · +5</option><option value="difficult">Difficult · +10</option></select></Field><Field label="Impact"><select value={impact} onChange={(e) => setImpact(e.target.value as QuestImpact)}><option value="supporting">Supporting · +0</option><option value="meaningful">Meaningful · +5</option><option value="important">Important · +10</option></select></Field></div>
-        <div className="xp-preview"><span>Quest score</span><strong>{xp} XP</strong><small>Editable inputs · capped at {state.settings.scoring.questCap} XP</small></div>
+        <div className="setting-note"><Check size={17} /><p>Completing an action records what happened and when. Your goal progress comes from its metrics, milestones, consistency, or reflections.</p></div>
       </div>}
 
       <footer className="wizard-footer"><Button variant="ghost" onClick={step === 0 ? close : () => setStep((current) => current - 1)}>{step === 0 ? "Cancel" : <><ArrowLeft size={16} /> Back</>}</Button>{step < steps.length - 1 ? <Button disabled={!canContinue} onClick={() => setStep((current) => current + 1)}>Continue <ArrowRight size={16} /></Button> : <Button onClick={submit}><Plus size={16} /> Create goal</Button>}</footer>

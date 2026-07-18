@@ -35,14 +35,17 @@ export default function ReviewsPage() {
   const [cadence, setCadence] = useState<ReviewCadence>("weekly");
   const [answers, setAnswers] = useState<Record<string, string>>({});
   const [saved, setSaved] = useState(false);
-  const lastSeven = new Date(); lastSeven.setDate(lastSeven.getDate() - 7);
-  const weeklyEvents = state.timeline.filter((event) => new Date(event.at) >= lastSeven);
-  const summary = useMemo(() => ({
-    xp: weeklyEvents.reduce((sum, event) => sum + (event.xp ?? 0), 0),
-    quests: weeklyEvents.filter((event) => event.type === "quest").length,
-    milestones: weeklyEvents.filter((event) => event.type === "milestone").length,
-    activeGoals: state.goals.filter((goal) => goal.status === "active").length,
-  }), [state.goals, weeklyEvents]);
+  const summary = useMemo(() => {
+    const lastSeven = new Date();
+    lastSeven.setDate(lastSeven.getDate() - 7);
+    const weeklyEvents = state.timeline.filter((event) => new Date(event.at) >= lastSeven);
+    return {
+      activeDays: new Set(weeklyEvents.map((event) => new Date(event.at).toLocaleDateString("en-CA"))).size,
+      quests: weeklyEvents.filter((event) => event.type === "quest").length,
+      milestones: weeklyEvents.filter((event) => event.type === "milestone").length,
+      activeGoals: state.goals.filter((goal) => goal.status === "active").length,
+    };
+  }, [state.goals, state.timeline]);
 
   const submit = () => {
     addReview({ id: uid("review"), cadence, createdAt: new Date().toISOString(), answers });
@@ -52,7 +55,7 @@ export default function ReviewsPage() {
 
   return <div>
     <section className="page-header"><div><p className="eyebrow">Reflection without judgement</p><h1>Reviews</h1><p className="page-lead">Turn activity into understanding. Adjust your system without treating a quiet period as failure.</p></div></section>
-    <div className="review-summary-grid">{[{ label: "XP this week", value: summary.xp }, { label: "Quests completed", value: summary.quests }, { label: "Milestones reached", value: summary.milestones }, { label: "Active goals", value: summary.activeGoals }].map((item) => <Panel key={item.label}><strong>{item.value}</strong><span>{item.label}</span></Panel>)}</div>
+    <div className="review-summary-grid">{[{ label: "Active days this week", value: summary.activeDays }, { label: "Quests completed", value: summary.quests }, { label: "Milestones reached", value: summary.milestones }, { label: "Active goals", value: summary.activeGoals }].map((item) => <Panel key={item.label}><strong>{item.value}</strong><span>{item.label}</span></Panel>)}</div>
     <div className="review-layout">
       <Panel className="review-form-panel">
         <div className="review-form-head"><div><p className="eyebrow">Guided reflection</p><h2>{cadence[0].toUpperCase() + cadence.slice(1)} review</h2></div><div className="cadence-switch">{(["daily", "weekly", "monthly"] as ReviewCadence[]).map((item) => <button key={item} className={cadence === item ? "active" : ""} onClick={() => { setCadence(item); setAnswers({}); }}>{item}</button>)}</div></div>

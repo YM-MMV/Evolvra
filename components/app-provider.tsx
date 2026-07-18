@@ -3,6 +3,7 @@
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
 import type { User } from "@supabase/supabase-js";
 import { createStarterGoals, EMPTY_STATE } from "@/lib/defaults";
+import { migrateState } from "@/lib/state-schema";
 import { getSupabase, supabaseConfigured } from "@/lib/supabase";
 import type {
   AppState,
@@ -15,10 +16,11 @@ import type {
   TimelineEvent,
   UserSettings,
 } from "@/lib/types";
-import { levelFromXp, uid } from "@/lib/utils";
+import { isQuestAvailable, nextRepeatDate, uid } from "@/lib/utils";
 
-const STORAGE_KEY = "evolvra:workspace:v1";
-const BACKUP_KEY = "evolvra:backups:v1";
+const LEGACY_STORAGE_KEY = "evolvra:workspace:v1";
+const storageKey = (accountId: string | null) => `evolvra:workspace:v2:${accountId ?? "anonymous"}`;
+const backupKey = (accountId: string | null) => `evolvra:backups:v2:${accountId ?? "anonymous"}`;
 
 type SyncStatus = "local" | "connecting" | "synced" | "saving" | "error";
 
@@ -28,6 +30,7 @@ interface AppContextValue {
   user: User | null;
   syncStatus: SyncStatus;
   cloudEnabled: boolean;
+  persistenceError: string | null;
   canUndo: boolean;
   completeOnboarding: (displayName: string, starter: boolean, birthDate?: string) => void;
   addGoal: (goal: Goal) => void;
@@ -38,6 +41,7 @@ interface AppContextValue {
   completeQuest: (goalId: string, questId: string) => void;
   toggleMilestone: (goalId: string, milestoneId: string) => void;
   updateMetric: (goalId: string, metricId: string, current: number) => void;
+  addCheckIn: (goalId: string, note: string) => void;
   addReview: (review: Review) => void;
   upsertArea: (area: Area) => void;
   removeArea: (areaId: string) => void;
@@ -45,7 +49,7 @@ interface AppContextValue {
   removeStat: (statId: string) => void;
   updateSettings: (settings: Partial<UserSettings>) => void;
   updateProfile: (patch: Partial<AppState["profile"]>) => void;
-  importState: (state: AppState) => void;
+  importState: (state: unknown) => void;
   resetWorkspace: () => void;
   undo: () => void;
   signIn: (email: string) => Promise<string>;
@@ -56,31 +60,37 @@ const AppContext = createContext<AppContextValue | null>(null);
 
 const clone = <T,>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
 
-function nextRepeatDate(repeat: Quest["repeat"], from?: string) {
-  const date = from ? new Date(from) : new Date();
-  if (repeat === "daily") date.setDate(date.getDate() + 1);
-  if (repeat === "weekly") date.setDate(date.getDate() + 7);
-  if (repeat === "monthly") date.setMonth(date.getMonth() + 1);
-  return date.toISOString().slice(0, 10);
-}
-
 export function AppProvider({ children }: { children: React.ReactNode }) {
   const [state, setState] = useState<AppState>(EMPTY_STATE);
   const [ready, setReady] = useState(false);
   const [user, setUser] = useState<User | null>(null);
   const [syncStatus, setSyncStatus] = useState<SyncStatus>(supabaseConfigured ? "connecting" : "local");
   const [canUndo, setCanUndo] = useState(false);
+  const [persistenceError, setPersistenceError] = useState<string | null>(null);
+  const [accountEpoch, setAccountEpoch] = useState(0);
   const history = useRef<AppState[]>([]);
   const skipPersist = useRef(true);
   const remoteLoaded = useRef(false);
+  const activeAccount = useRef<string | null>(null);
+  const accountSwitching = useRef(false);
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
       try {
-        const saved = localStorage.getItem(STORAGE_KEY);
-        if (saved) setState(JSON.parse(saved) as AppState);
+        const saved = localStorage.getItem(storageKey(null)) ?? localStorage.getItem(LEGACY_STORAGE_KEY);
+        if (saved) setState(migrateState(JSON.parse(saved)));
       } catch {
-        localStorage.removeItem(STORAGE_KEY);
+        const backups = localStorage.getItem(backupKey(null));
+        if (backups) {
+          try {
+            const parsed = JSON.parse(backups);
+            if (Array.isArray(parsed) && parsed.length) setState(migrateState(parsed.at(-1)));
+          } catch {
+            setPersistenceError("Saved data could not be read. A safe empty workspace was opened.");
+          }
+        } else {
+          setPersistenceError("Saved data could not be read. A safe empty workspace was opened.");
+        }
       } finally {
         setReady(true);
         skipPersist.current = false;
@@ -91,7 +101,14 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     if (!ready || skipPersist.current) return;
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+    try {
+      localStorage.setItem(storageKey(activeAccount.current), JSON.stringify(state));
+      const timer = window.setTimeout(() => setPersistenceError(null), 0);
+      return () => window.clearTimeout(timer);
+    } catch {
+      const timer = window.setTimeout(() => setPersistenceError("This change is still open in memory but could not be saved on this device. Export a backup before closing the app."), 0);
+      return () => window.clearTimeout(timer);
+    }
   }, [ready, state]);
 
   useEffect(() => {
@@ -110,8 +127,33 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   useEffect(() => {
+    if (!ready) return;
+    const nextAccount = user?.id ?? null;
+    if (activeAccount.current === nextAccount) return;
+    accountSwitching.current = true;
+    activeAccount.current = nextAccount;
+    remoteLoaded.current = false;
+    history.current = [];
+    const timer = window.setTimeout(() => {
+      setCanUndo(false);
+      try {
+        const saved = localStorage.getItem(storageKey(nextAccount));
+        if (saved) setState(migrateState(JSON.parse(saved)));
+        else if (!nextAccount) setState(clone(EMPTY_STATE));
+      } catch {
+        setState(clone(EMPTY_STATE));
+        setPersistenceError("This account's local workspace could not be read, so a safe empty copy was opened.");
+      } finally {
+        accountSwitching.current = false;
+        setAccountEpoch((value) => value + 1);
+      }
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, [ready, user?.id]);
+
+  useEffect(() => {
     const supabase = getSupabase();
-    if (!supabase || !user || remoteLoaded.current) return;
+    if (!supabase || !user || remoteLoaded.current || !ready || accountSwitching.current) return;
     supabase
       .from("workspace_snapshots")
       .select("state,updated_at")
@@ -123,13 +165,18 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           return;
         }
         if (data?.state) {
-          const remote = data.state as AppState;
+          const remote = migrateState(data.state);
           if (new Date(remote.updatedAt).getTime() > new Date(state.updatedAt).getTime()) setState(remote);
+        } else {
+          setSyncStatus("saving");
+          void supabase.from("workspace_snapshots").upsert({ user_id: user.id, state }).then(({ error: uploadError }) => {
+            setSyncStatus(uploadError ? "error" : "synced");
+          });
         }
         remoteLoaded.current = true;
-        setSyncStatus("synced");
+        if (data?.state) setSyncStatus("synced");
       });
-  }, [state.updatedAt, user]);
+  }, [accountEpoch, ready, state, user]);
 
   useEffect(() => {
     const supabase = getSupabase();
@@ -139,7 +186,6 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       const { error } = await supabase.from("workspace_snapshots").upsert({
         user_id: user.id,
         state,
-        updated_at: state.updatedAt,
       });
       setSyncStatus(error ? "error" : "synced");
     }, 900);
@@ -154,7 +200,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       recipe(draft);
       draft.updatedAt = new Date().toISOString();
       try {
-        localStorage.setItem(BACKUP_KEY, JSON.stringify(history.current.slice(-5)));
+        localStorage.setItem(backupKey(activeAccount.current), JSON.stringify(history.current.slice(-5)));
       } catch {
         // Storage may be unavailable in private browsing; the active state still works.
       }
@@ -164,48 +210,6 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
   const addTimeline = (draft: AppState, event: Omit<TimelineEvent, "id" | "at">) => {
     draft.timeline.unshift({ ...event, id: uid("event"), at: new Date().toISOString() });
-    draft.timeline = draft.timeline.slice(0, 500);
-  };
-
-  const allocateXp = (draft: AppState, goal: Goal, xp: number, label: string) => {
-    const overallBefore = levelFromXp(
-      draft.overallXp,
-      draft.settings.scoring.levelBase,
-      draft.settings.scoring.levelGrowth,
-    ).level;
-    draft.overallXp += xp;
-
-    Object.entries(goal.statWeights).forEach(([statId, weight]) => {
-      const stat = draft.stats.find((item) => item.id === statId);
-      if (!stat) return;
-      const before = levelFromXp(stat.xp, draft.settings.scoring.levelBase, draft.settings.scoring.levelGrowth).level;
-      stat.xp += (xp * weight) / 100;
-      const after = levelFromXp(stat.xp, draft.settings.scoring.levelBase, draft.settings.scoring.levelGrowth).level;
-      if (after > before) {
-        addTimeline(draft, {
-          type: "level",
-          title: `${stat.name} reached level ${after}`,
-          detail: `${label} helped develop ${stat.name}.`,
-          goalId: goal.id,
-          areaId: goal.areaId,
-        });
-      }
-    });
-
-    const overallAfter = levelFromXp(
-      draft.overallXp,
-      draft.settings.scoring.levelBase,
-      draft.settings.scoring.levelGrowth,
-    ).level;
-    if (overallAfter > overallBefore) {
-      addTimeline(draft, {
-        type: "level",
-        title: `Overall level ${overallAfter}`,
-        detail: "Your accumulated effort opened a new level.",
-        goalId: goal.id,
-        areaId: goal.areaId,
-      });
-    }
   };
 
   const value: AppContextValue = {
@@ -214,6 +218,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       user,
       syncStatus,
       cloudEnabled: supabaseConfigured,
+      persistenceError,
       canUndo,
       completeOnboarding(displayName, starter, birthDate) {
         mutate((draft) => {
@@ -260,17 +265,13 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           if (!goal || goal.status === status) return;
           const firstCompletion = status === "completed" && !goal.completedAt;
           goal.status = status;
-          if (firstCompletion) {
-            goal.completedAt = new Date().toISOString();
-            allocateXp(draft, goal, 500, `Completing ${goal.title}`);
-          }
+          if (firstCompletion) goal.completedAt = new Date().toISOString();
           addTimeline(draft, {
             type: "goal",
             title: `${goal.title} ${status}`,
-            detail: firstCompletion ? "Goal completed — 500 XP earned." : `Goal moved to ${status}.`,
+            detail: firstCompletion ? "Goal completed and added to your permanent record." : `Goal moved to ${status}.`,
             goalId,
             areaId: goal.areaId,
-            xp: firstCompletion ? 500 : undefined,
           });
         });
       },
@@ -279,10 +280,13 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           const goal = draft.goals.find((item) => item.id === goalId);
           if (!goal) return;
           draft.goals = draft.goals.filter((item) => item.id !== goalId);
+          draft.questCompletions = draft.questCompletions.filter((item) => item.goalId !== goalId);
+          draft.metricEntries = draft.metricEntries.filter((item) => item.goalId !== goalId);
+          draft.timeline = draft.timeline.filter((item) => item.goalId !== goalId);
           addTimeline(draft, {
             type: "goal",
-            title: `Archived record removed: ${goal.title}`,
-            detail: "XP already earned remains intact.",
+            title: `Removed goal: ${goal.title}`,
+            detail: "The goal and its connected activity records were removed from this workspace.",
             areaId: goal.areaId,
           });
         });
@@ -295,7 +299,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           addTimeline(draft, {
             type: "note",
             title: `New quest: ${quest.title}`,
-            detail: `${quest.xp} XP available.`,
+            detail: quest.dueDate ? `Planned for ${quest.dueDate}.` : "Ready when it is useful.",
             goalId,
             areaId: goal.areaId,
           });
@@ -305,23 +309,40 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         mutate((draft) => {
           const goal = draft.goals.find((item) => item.id === goalId);
           const quest = goal?.quests.find((item) => item.id === questId);
-          if (!goal || !quest || (quest.completed && quest.repeat === "none")) return;
+          if (!goal || !quest || !isQuestAvailable(quest)) return;
           const completedAt = new Date().toISOString();
           quest.completedAt = completedAt;
           quest.completed = quest.repeat === "none";
           if (quest.repeat !== "none") quest.dueDate = nextRepeatDate(quest.repeat, quest.dueDate);
+          draft.questCompletions.unshift({
+            id: uid("completion"),
+            goalId,
+            questId,
+            title: quest.title,
+            completedAt,
+            ...(quest.durationMinutes === undefined ? {} : { durationMinutes: quest.durationMinutes }),
+          });
           quest.metricDeltas.forEach((delta) => {
             const metric = goal.metrics.find((item) => item.id === delta.metricId);
-            if (metric) metric.current = Math.max(0, metric.current + delta.amount);
+            if (!metric) return;
+            const previousValue = metric.current;
+            metric.current = Math.max(0, metric.current + delta.amount);
+            draft.metricEntries.unshift({
+              id: uid("metric-entry"),
+              goalId,
+              metricId: metric.id,
+              previousValue,
+              value: metric.current,
+              recordedAt: completedAt,
+              source: "quest",
+            });
           });
-          allocateXp(draft, goal, quest.xp, quest.title);
           addTimeline(draft, {
             type: "quest",
             title: quest.title,
-            detail: `${quest.xp} XP earned${quest.durationMinutes ? ` · ${quest.durationMinutes} minutes invested` : ""}.`,
+            detail: `Action completed${quest.durationMinutes ? ` · ${quest.durationMinutes} minutes invested` : ""}.`,
             goalId,
             areaId: goal.areaId,
-            xp: quest.xp,
           });
         });
       },
@@ -337,14 +358,12 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           }
           milestone.completed = true;
           milestone.completedAt = new Date().toISOString();
-          allocateXp(draft, goal, milestone.xp, milestone.title);
           addTimeline(draft, {
             type: "milestone",
             title: milestone.title,
-            detail: `Milestone reached — ${milestone.xp} XP earned.`,
+            detail: "Milestone reached and recorded.",
             goalId,
             areaId: goal.areaId,
-            xp: milestone.xp,
           });
         });
       },
@@ -353,11 +372,38 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           const goal = draft.goals.find((item) => item.id === goalId);
           const metric = goal?.metrics.find((item) => item.id === metricId);
           if (!goal || !metric) return;
+          const previousValue = metric.current;
           metric.current = Math.max(0, current);
+          if (metric.current === previousValue) return;
+          draft.metricEntries.unshift({
+            id: uid("metric-entry"),
+            goalId,
+            metricId,
+            previousValue,
+            value: metric.current,
+            recordedAt: new Date().toISOString(),
+            source: "manual",
+          });
           addTimeline(draft, {
             type: "metric",
             title: `${metric.label} updated`,
             detail: `${metric.current} of ${metric.target} ${metric.unit}`,
+            goalId,
+            areaId: goal.areaId,
+          });
+        });
+      },
+      addCheckIn(goalId, note) {
+        if (!note.trim()) return;
+        mutate((draft) => {
+          const goal = draft.goals.find((item) => item.id === goalId);
+          if (!goal) return;
+          const createdAt = new Date().toISOString();
+          goal.checkIns.unshift({ id: uid("check-in"), createdAt, note: note.trim() });
+          addTimeline(draft, {
+            type: "note",
+            title: `Check-in for ${goal.title}`,
+            detail: note.trim(),
             goalId,
             areaId: goal.areaId,
           });
@@ -398,10 +444,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       },
       removeStat(statId) {
         mutate((draft) => {
-          const inUse = draft.goals.some((goal) => goal.statWeights[statId]);
+          const inUse = draft.goals.some((goal) => goal.statIds.includes(statId));
           const stat = draft.stats.find((item) => item.id === statId);
           if (!stat) return;
-          if (inUse || stat.xp > 0) stat.archived = true;
+          if (inUse) stat.archived = true;
           else draft.stats = draft.stats.filter((item) => item.id !== statId);
         });
       },
@@ -414,10 +460,11 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         mutate((draft) => Object.assign(draft.profile, patch));
       },
       importState(imported) {
-        if (!imported?.version || !imported.profile || !Array.isArray(imported.goals)) throw new Error("Invalid Evolvra export");
+        const migrated = migrateState(imported);
+        if (!migrated.profile || !Array.isArray(migrated.goals)) throw new Error("Invalid Evolvra export");
         history.current.push(clone(state));
         setCanUndo(true);
-        setState({ ...imported, updatedAt: new Date().toISOString() });
+        setState({ ...migrated, updatedAt: new Date().toISOString() });
       },
       resetWorkspace() {
         history.current.push(clone(state));
@@ -442,7 +489,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         return "Check your email for a secure sign-in link.";
       },
       async signOut() {
-        await getSupabase()?.auth.signOut();
+        const { error } = await getSupabase()?.auth.signOut() ?? { error: null };
+        if (error) throw error;
         setUser(null);
         setSyncStatus("local");
       },

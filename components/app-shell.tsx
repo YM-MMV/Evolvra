@@ -21,7 +21,6 @@ import {
 } from "lucide-react";
 import { useApp } from "@/components/app-provider";
 import { Onboarding } from "@/components/onboarding";
-import { levelFromXp } from "@/lib/utils";
 
 const nav: { href: string; label: string; termKey?: "goals" | "quests" | "stats"; icon: typeof LayoutDashboard }[] = [
   { href: "/", label: "Command centre", icon: LayoutDashboard },
@@ -52,7 +51,8 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   if (!ready) return <div className="loading-screen"><span className="brand-mark"><Sparkles /></span><p>Preparing your command centre…</p></div>;
   if (!state.profile.onboarded) return <Onboarding />;
 
-  const level = levelFromXp(state.overallXp, state.settings.scoring.levelBase, state.settings.scoring.levelGrowth);
+  const activeGoalCount = state.goals.filter((goal) => goal.status === "active").length;
+  const completedActionCount = state.questCompletions.length;
   const current = nav.find((item) => item.href === pathname) ?? nav.find((item) => item.href !== "/" && pathname.startsWith(item.href));
   const currentLabel = pathname.startsWith("/settings")
     ? "Customise"
@@ -74,9 +74,9 @@ export function AppShell({ children }: { children: React.ReactNode }) {
             return <Link key={href} href={href} className={active ? "active" : ""} aria-current={active ? "page" : undefined} onClick={() => setMobileOpen(false)}><Icon size={17} /><span>{displayLabel}</span>{active && <i />}</Link>;
           })}
         </nav>
-        <div className="level-card" aria-label={`Overall level ${level.level}, ${Math.round(level.current)} of ${level.needed} XP`}>
-          <span className="level-orb">LVL {level.level}</span>
-          <div><small>Progress</small><strong>{Math.round(level.current)} / {level.needed} XP</strong><div className="mini-track"><span style={{ width: `${level.percent}%` }} /></div></div>
+        <div className="workspace-summary" aria-label={`${activeGoalCount} active goals and ${completedActionCount} completed actions recorded`}>
+          <span className="workspace-orb"><Goal size={18} /></span>
+          <div><small>Current focus</small><strong>{activeGoalCount} active {activeGoalCount === 1 ? "goal" : "goals"}</strong><span>{completedActionCount} completed {completedActionCount === 1 ? "action" : "actions"} recorded</span></div>
         </div>
         <div className="sidebar-bottom">
           <Link href="/settings" className={pathname.startsWith("/settings") ? "active" : ""} aria-current={pathname.startsWith("/settings") ? "page" : undefined}><Settings size={17} /><span>Customise</span></Link>
@@ -96,7 +96,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         <main className="page-container">{children}</main>
         <footer className="system-footer">
           <span><i className={user ? "online" : "local"} />{user ? "PRIVATE SYNC ONLINE" : "LOCAL-FIRST MODE"}</span>
-          <span>XP {Math.round(state.overallXp).toLocaleString("en-GB")}</span>
+          <span>{completedActionCount.toLocaleString("en-GB")} COMPLETED ACTIONS</span>
           <span>EVOLVRA / V1.0</span>
         </footer>
       </div>
