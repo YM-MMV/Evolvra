@@ -232,6 +232,12 @@ begin
      or has_table_privilege('authenticated', 'public.workspace_snapshots', 'update') then
     raise exception 'authenticated workspace_snapshots privileges are not SELECT/DELETE only';
   end if;
+  if not has_table_privilege('service_role', 'public.workspace_snapshots', 'select')
+     or has_table_privilege('service_role', 'public.workspace_snapshots', 'insert')
+     or has_table_privilege('service_role', 'public.workspace_snapshots', 'update')
+     or has_table_privilege('service_role', 'public.workspace_snapshots', 'delete') then
+    raise exception 'service_role workspace_snapshots privileges are not SELECT only';
+  end if;
 
   if has_table_privilege('anon', 'public.account_lifecycle', 'select')
      or has_table_privilege('anon', 'public.account_lifecycle', 'insert')

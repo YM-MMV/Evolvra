@@ -346,9 +346,12 @@ revoke all privileges on table public.account_lifecycle from public, anon, authe
 
 -- Snapshot updates remain restricted to the compare-and-swap RPC. Revoke every
 -- legacy auto-exposure grant first so upgraded projects cannot retain anonymous
--- SELECT or DELETE access from an older Data API default.
-revoke all privileges on table public.workspace_snapshots from public, anon, authenticated;
+-- access or service-role write access from an older Data API default. The
+-- service role has read-only access for trusted operational inspection and
+-- cloud integration verification; it is never exposed to the browser.
+revoke all privileges on table public.workspace_snapshots from public, anon, authenticated, service_role;
 grant select, delete on table public.workspace_snapshots to authenticated;
+grant select on table public.workspace_snapshots to service_role;
 
 -- Security-definer CAS writes bypass table RLS, so they must take the same
 -- lifecycle lock as evidence writes. Once begin_account_deletion commits its
