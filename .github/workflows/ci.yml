@@ -92,6 +92,7 @@ jobs:
     env:
       CI: true
       DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:54322/postgres
+      EVOLVRA_CLOUD_E2E: true
       NEXT_TELEMETRY_DISABLED: 1
     steps:
       - name: Check out repository

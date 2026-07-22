@@ -1,22 +1,40 @@
 import type { NextConfig } from "next";
 
 const isProduction = process.env.NODE_ENV === "production";
+// This server-only flag is set solely by the bounded local-Supabase CI job.
+// Deployed production builds continue to require HTTPS.
+const isCloudE2e = isProduction
+  && process.env.CI === "true"
+  && process.env.EVOLVRA_CLOUD_E2E === "true";
+const loopbackHosts = new Set(["localhost", "127.0.0.1", "[::1]"]);
 
-const configuredSupabaseSources = (() => {
+const configuredSupabase = (() => {
+  const omitted = { sources: [] as string[], usesInsecureLoopback: false };
   const value = process.env.NEXT_PUBLIC_SUPABASE_URL;
-  if (!value) return [];
+  if (!value) return omitted;
   try {
     const url = new URL(value);
-    if (isProduction ? url.protocol !== "https:" : !["https:", "http:"].includes(url.protocol)) return [];
-    return [url.origin, url.origin.replace(/^http/, "ws")];
+    const isInsecureLoopback = url.protocol === "http:"
+      && !url.username
+      && !url.password
+      && loopbackHosts.has(url.hostname.toLowerCase());
+    const protocolAllowed = url.protocol === "https:"
+      || (!isProduction && url.protocol === "http:")
+      || (isCloudE2e && isInsecureLoopback);
+
+    if (!protocolAllowed) return omitted;
+    return {
+      sources: [url.origin, url.origin.replace(/^http/, "ws")],
+      usesInsecureLoopback: isProduction && isInsecureLoopback,
+    };
   } catch {
-    return [];
+    return omitted;
   }
 })();
 
 const connectSources = Array.from(new Set([
   "'self'",
-  ...configuredSupabaseSources,
+  ...configuredSupabase.sources,
   ...(!isProduction ? ["http://localhost:*", "ws://localhost:*"] : []),
 ]));
 
@@ -38,7 +56,7 @@ const contentSecurityPolicy = [
   // Private PDF evidence is rendered from a short-lived object URL. Framing
   // the app itself remains prohibited by frame-ancestors and X-Frame-Options.
   "frame-src 'self' blob:",
-  ...(isProduction ? ["upgrade-insecure-requests"] : []),
+  ...(isProduction && !configuredSupabase.usesInsecureLoopback ? ["upgrade-insecure-requests"] : []),
 ].join("; ");
 
 const securityHeaders = [
