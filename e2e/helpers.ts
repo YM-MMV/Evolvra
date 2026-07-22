@@ -7,9 +7,10 @@ export async function completeOnboarding(
     name = "Release Tester",
     starter = false,
     birthDate = "1990-01-01",
-  }: { name?: string; starter?: boolean; birthDate?: string } = {},
+    accountId = "anonymous",
+  }: { name?: string; starter?: boolean; birthDate?: string; accountId?: string } = {},
 ) {
-  await page.goto("/");
+  if (new URL(page.url()).pathname !== "/") await page.goto("/");
   await expect(page.getByRole("heading", { name: "Build a life you can see evolving." })).toBeVisible();
   await page.getByRole("button", { name: /Begin setup/ }).click();
   await page.getByLabel("Display name").fill(name);
@@ -19,11 +20,15 @@ export async function completeOnboarding(
   await page.getByRole("button", { name: /Enter command centre/ }).click();
   await expect(page.getByRole("heading", { name: "What will move your life forward?" })).toBeVisible();
   await expect(page.getByText(new RegExp(`Good (morning|afternoon|evening), ${escapeRegExp(name)}`))).toBeVisible();
-  await waitForAnonymousWorkspace(page);
+  await waitForWorkspace(page, accountId);
 }
 
 export async function waitForAnonymousWorkspace(page: Page) {
-  await expect.poll(() => page.evaluate(async () => {
+  await waitForWorkspace(page, "anonymous");
+}
+
+export async function waitForWorkspace(page: Page, accountId: string) {
+  await expect.poll(() => page.evaluate(async (expectedAccountId) => {
     return await new Promise<boolean>((resolve) => {
       const request = indexedDB.open("evolvra-persistence");
       request.onerror = () => resolve(false);
@@ -35,7 +40,7 @@ export async function waitForAnonymousWorkspace(page: Page) {
           return;
         }
         const transaction = database.transaction("workspaces", "readonly");
-        const read = transaction.objectStore("workspaces").get("anonymous");
+        const read = transaction.objectStore("workspaces").get(expectedAccountId);
         read.onerror = () => {
           database.close();
           resolve(false);
@@ -47,7 +52,9 @@ export async function waitForAnonymousWorkspace(page: Page) {
         };
       };
     });
-  }), { message: "the anonymous workspace should be persisted before navigation or reload" }).toBe(true);
+  }, accountId), {
+    message: `the ${accountId === "anonymous" ? "anonymous" : "account"} workspace should be persisted before navigation or reload`,
+  }).toBe(true);
 }
 
 export async function readAnonymousWorkspaceState(page: Page) {

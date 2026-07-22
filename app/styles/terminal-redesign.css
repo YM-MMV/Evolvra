@@ -334,7 +334,19 @@ select:focus { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent);
 .quest-board-list { border-radius: 5px; background: var(--panel); }
 .goal-table-row { min-height: 48px; padding: 11px 14px; }
 .goal-table-row:hover,
-.quest-board-row:hover { background: var(--accent-soft); }
+.goal-table-row:focus-visible,
+.quest-board-row:hover,
+.quest-board-row:focus-within { background: var(--accent-soft); }
+.goal-table-row:hover .goal-table-title small,
+.goal-table-row:hover .goal-date,
+.goal-table-row:hover > .pill,
+.goal-table-row:focus-visible .goal-table-title small,
+.goal-table-row:focus-visible .goal-date,
+.goal-table-row:focus-visible > .pill { color: var(--text-soft); }
+.quest-board-row:hover .quest-board-copy a,
+.quest-board-row:hover .pill,
+.quest-board-row:focus-within .quest-board-copy a,
+.quest-board-row:focus-within .pill { color: var(--text-soft); }
 .goal-board > section { border-radius: 5px; background: var(--panel); }
 .goal-detail-hero { padding: 19px; border-radius: 5px; }
 .goal-hero-icon,

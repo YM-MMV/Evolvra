@@ -12,7 +12,7 @@ import {
   waitForCloudProfile,
 } from "./cloud-helpers";
 
-test.describe.serial("local Supabase browser integration", () => {
+test.describe("local Supabase browser integration", () => {
   test.setTimeout(90_000);
   test.skip(!cloudE2eEnabled, "Set local Supabase URL, anon key, and service-role key to run cloud integration E2E.");
 
@@ -30,7 +30,7 @@ test.describe.serial("local Supabase browser integration", () => {
     accountIds.add(accountB.id);
 
     await signInCloudTestAccount(page, accountA, baseURL);
-    await completeOnboarding(page, { name: "Account Alpha", starter: true });
+    await completeOnboarding(page, { name: "Account Alpha", starter: true, accountId: accountA.id });
     await waitForCloudProfile(accountA.id, "Account Alpha");
 
     await page.goto("/settings");
@@ -39,7 +39,7 @@ test.describe.serial("local Supabase browser integration", () => {
     await expect(page.getByRole("heading", { name: "Build a life you can see evolving." })).toBeVisible();
 
     await signInCloudTestAccount(page, accountB, baseURL);
-    await completeOnboarding(page, { name: "Account Beta", starter: false });
+    await completeOnboarding(page, { name: "Account Beta", starter: false, accountId: accountB.id });
     await expect(page.getByText("Build dependable cardiovascular fitness")).toHaveCount(0);
     await waitForCloudProfile(accountB.id, "Account Beta");
 
@@ -58,7 +58,7 @@ test.describe.serial("local Supabase browser integration", () => {
     accountIds.add(account.id);
 
     await signInCloudTestAccount(page, account, baseURL);
-    await completeOnboarding(page, { name: "Cloud Original", starter: true });
+    await completeOnboarding(page, { name: "Cloud Original", starter: true, accountId: account.id });
     await waitForCloudProfile(account.id, "Cloud Original");
     await page.goto("/settings");
     await page.getByRole("button", { name: "Appearance" }).click();
@@ -168,7 +168,7 @@ test.describe.serial("local Supabase browser integration", () => {
     const account = await createCloudTestAccount("revision");
     accountIds.add(account.id);
     await signInCloudTestAccount(page, account, baseURL);
-    await completeOnboarding(page, { name: "Revision Base", starter: false });
+    await completeOnboarding(page, { name: "Revision Base", starter: false, accountId: account.id });
     await waitForCloudProfile(account.id, "Revision Base");
 
     const secondContext = await browser.newContext({ serviceWorkers: "allow" });
@@ -230,7 +230,7 @@ test.describe.serial("local Supabase browser integration", () => {
     const account = await createCloudTestAccount("evidence");
     accountIds.add(account.id);
     await signInCloudTestAccount(page, account, baseURL);
-    await completeOnboarding(page, { name: "Evidence Owner", starter: true });
+    await completeOnboarding(page, { name: "Evidence Owner", starter: true, accountId: account.id });
     await waitForCloudProfile(account.id, "Evidence Owner");
 
     await page.goto("/goals");

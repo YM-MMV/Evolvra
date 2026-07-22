@@ -48,17 +48,34 @@ export async function signInCloudTestAccount(page: Page, account: CloudTestAccou
   });
   const actionLink = data.properties?.action_link;
   if (error || !actionLink) throw error ?? new Error("A local magic link was not generated.");
+  const workspaceReady = page.waitForResponse((response) => {
+    const url = new URL(response.url());
+    return url.origin === new URL(guardedApiUrl!).origin
+      && url.pathname === "/rest/v1/workspace_snapshots"
+      && url.searchParams.get("user_id") === `eq.${account.id}`
+      && response.request().method() === "GET";
+  }, { timeout: 20_000 }).then((response) => {
+    if (!response.ok()) {
+      throw new Error(`The signed-in workspace request failed with HTTP ${response.status()}.`);
+    }
+  });
+  const handoffReady = page
+    .getByRole("dialog", { name: "Choose which private workspace to open" })
+    .waitFor({ state: "visible", timeout: 20_000 });
+  const accountWorkspaceReady = Promise.race([workspaceReady, handoffReady]);
   await page.goto(actionLink);
   await page.waitForURL((url) => url.origin === new URL(baseURL).origin, { timeout: 20_000 });
+  await accountWorkspaceReady;
 }
 
 export async function waitForCloudProfile(accountId: string, displayName: string) {
   await expect.poll(async () => {
-    const { data } = await cloudAdmin()
+    const { data, error } = await cloudAdmin()
       .from("workspace_snapshots")
       .select("state")
       .eq("user_id", accountId)
       .maybeSingle();
+    if (error) return `Cloud profile query failed: ${error.message}`;
     return data?.state?.profile?.displayName;
   }, { message: `cloud workspace ${accountId} should contain the expected profile`, timeout: 20_000 }).toBe(displayName);
 }
