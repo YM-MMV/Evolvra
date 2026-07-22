@@ -1,21 +1,39 @@
 "use client";
 
 import Link from "next/link";
-import { ArrowUpRight, CalendarDays, Flag, PauseCircle } from "lucide-react";
+import { ArrowUpRight, CalendarDays, Flag } from "lucide-react";
+import { useApp } from "@/components/app-provider";
 import { DynamicIcon } from "@/components/icons";
 import { ProgressBar, Pill } from "@/components/ui";
 import type { Area, Goal } from "@/lib/types";
-import { goalProgress, shortDate } from "@/lib/utils";
+import { goalProgress, isQuestAvailable, shortDate, singularizeTerm } from "@/lib/utils";
 
 export function GoalCard({ goal, area }: { goal: Goal; area?: Area }) {
+  const { state } = useApp();
+  const terms = state.settings.terminology;
+  const goalTerm = singularizeTerm(terms.goals);
+  const milestoneTerm = singularizeTerm(terms.milestones);
   const progress = goalProgress(goal);
-  const nextMilestone = goal.milestones.find((milestone) => !milestone.completed);
-  const nextQuest = goal.quests.find((quest) => !quest.completed);
+  const active = goal.status === "active";
+  const nextMilestone = active ? goal.milestones.find((milestone) => !milestone.completed) : undefined;
+  const nextQuest = active ? goal.quests.find((quest) => isQuestAvailable(quest)) : undefined;
+  const nextScheduledQuest = active ? goal.quests
+    .filter((quest) => quest.repeat !== "none" || !quest.completed)
+    .filter((quest) => !isQuestAvailable(quest))
+    .sort((a, b) => (a.dueDate ?? "9999-12-31").localeCompare(b.dueDate ?? "9999-12-31"))[0] : undefined;
+  const nextLabel = nextMilestone ? `Next ${milestoneTerm.toLowerCase()}` : nextQuest ? "Next action" : nextScheduledQuest ? "Next scheduled action" : `${goalTerm} status`;
+  const nextValue = goal.status === "completed"
+    ? `Completed${goal.completedAt ? ` ${shortDate(goal.completedAt)}` : ""}`
+    : goal.status === "archived"
+      ? "Archived for reference"
+      : goal.status === "paused"
+        ? "Paused until you are ready"
+        : nextMilestone?.title ?? nextQuest?.title ?? nextScheduledQuest?.title ?? "Ready for review";
   return (
-    <Link href={`/goals/${goal.id}`} className="goal-card panel">
+    <Link href={`/goals/${goal.id}`} className="goal-card panel" aria-label={`Open ${goalTerm.toLowerCase()}: ${goal.title}`}>
       <div className="goal-card-top">
-        <span className="area-icon" style={{ color: area?.color, background: `${area?.color}18` }}><DynamicIcon name={area?.icon ?? "Target"} /></span>
-        <span className="goal-arrow"><ArrowUpRight size={18} /></span>
+        <span className="area-icon" style={{ color: area?.color, background: `${area?.color}18` }} aria-hidden="true"><DynamicIcon name={area?.icon ?? "Target"} /></span>
+        <span className="goal-arrow" aria-hidden="true"><ArrowUpRight size={18} /></span>
       </div>
       <div className="goal-card-copy">
         <span className="area-label" style={{ color: area?.color }}>{area?.name ?? "Unassigned"}</span>
@@ -27,13 +45,13 @@ export function GoalCard({ goal, area }: { goal: Goal; area?: Area }) {
         {progress === null ? <div className="reflection-line"><span /> <span /> <span /></div> : <ProgressBar value={progress} color={area?.color} />}
       </div>
       <div className="goal-next">
-        <small>{nextMilestone ? "Next milestone" : nextQuest ? "Next action" : "Goal state"}</small>
-        <span>{nextMilestone?.title ?? nextQuest?.title ?? "Ready for review"}</span>
+        <small>{nextLabel}</small>
+        <span>{nextValue}</span>
       </div>
       <div className="goal-card-meta">
-        <Pill color={goal.priority === "critical" ? "#df4444" : goal.priority === "high" ? "#ffc15c" : undefined}><Flag size={12} /> {goal.priority}</Pill>
-        {goal.status === "paused" && <Pill><PauseCircle size={12} /> Paused</Pill>}
-        {goal.targetDate && <span><CalendarDays size={13} /> {shortDate(goal.targetDate)}</span>}
+        <Pill color={goal.priority === "critical" ? "#df4444" : goal.priority === "high" ? "#ffc15c" : undefined}><Flag size={12} aria-hidden="true" /> {goal.priority}</Pill>
+        {goal.status !== "active" && <Pill>{goal.status}</Pill>}
+        {goal.targetDate && <span><CalendarDays size={13} aria-hidden="true" /> <time dateTime={goal.targetDate}>{shortDate(goal.targetDate)}</time></span>}
       </div>
     </Link>
   );

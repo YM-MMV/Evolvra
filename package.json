@@ -2,35 +2,52 @@
   "name": "evolvra",
   "version": "1.0.0",
   "private": true,
+  "packageManager": "npm@11.6.2",
+  "engines": {
+    "node": "24.x",
+    "npm": "11.x"
+  },
   "scripts": {
     "dev": "next dev --turbopack",
     "build": "next build",
+    "audit:dependencies": "npm audit --audit-level=high",
+    "check:bundle": "node scripts/check-bundle-budget.mjs",
+    "check:no-ai": "node scripts/check-no-ai-integration.mjs",
+    "check:gamification": "node scripts/check-no-gamification.mjs",
+    "check:sql-fixtures": "node scripts/check-state-v3-fixtures.mjs",
+    "check:sw": "node scripts/check-service-worker.mjs",
     "start": "next start",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:e2e": "npm run build && playwright test",
+    "test:e2e:cloud": "playwright test e2e/cloud-integration.spec.ts",
+    "test:e2e:run": "playwright test",
+    "test:e2e:debug": "playwright test --debug",
+    "test:watch": "vitest",
+    "check": "npm run check:gamification && npm run check:no-ai && npm run check:sql-fixtures && npm run typecheck && npm run lint && npm test && npm run check:sw && npm run build && npm run check:bundle && npm run test:e2e:run"
   },
   "dependencies": {
-    "@supabase/supabase-js": "latest",
-    "date-fns": "latest",
-    "lucide-react": "latest",
-    "next": "latest",
-    "react": "latest",
-    "react-dom": "latest",
-    "recharts": "latest"
+    "@supabase/supabase-js": "2.110.6",
+    "lucide-react": "1.24.0",
+    "next": "16.2.11",
+    "react": "19.2.7",
+    "react-dom": "19.2.7"
   },
   "devDependencies": {
-    "@eslint/eslintrc": "latest",
-    "@types/node": "latest",
-    "@types/react": "latest",
-    "@types/react-dom": "latest",
-    "eslint": "latest",
-    "eslint-config-next": "latest",
-    "typescript": "latest",
-    "vitest": "latest"
+    "@eslint/eslintrc": "3.3.6",
+    "@playwright/test": "1.61.1",
+    "@types/node": "24.13.3",
+    "@types/react": "19.2.17",
+    "@types/react-dom": "19.2.3",
+    "axe-core": "4.12.1",
+    "eslint": "9.39.5",
+    "eslint-config-next": "16.2.10",
+    "typescript": "6.0.3",
+    "vitest": "4.1.10"
   },
   "overrides": {
-    "postcss": ">=8.5.10"
+    "postcss": "8.5.19",
+    "sharp": "0.35.3"
   }
 }
