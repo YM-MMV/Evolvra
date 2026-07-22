@@ -418,7 +418,11 @@ insert into storage.objects (id, bucket_id, name)
 values ('70000000-0000-0000-0000-0000000000a3', 'evidence', '00000000-0000-0000-0000-0000000000a1/allowed.txt');
 select pg_temp.expect_denied('evidence cross-owner upload', $sql$insert into storage.objects (id, bucket_id, name) values ('70000000-0000-0000-0000-0000000000f1', 'evidence', '00000000-0000-0000-0000-0000000000b2/forged.txt')$sql$);
 select pg_temp.expect_denied('evidence cross-owner move', $sql$update storage.objects set name = '00000000-0000-0000-0000-0000000000b2/moved.txt' where id = '70000000-0000-0000-0000-0000000000a3'$sql$);
-delete from storage.objects where id = '70000000-0000-0000-0000-0000000000a3';
+select pg_temp.expect_sqlstate(
+  'direct evidence metadata delete requires Storage API marker',
+  $sql$delete from storage.objects where id = '70000000-0000-0000-0000-0000000000a3'$sql$,
+  '42501'
+);
 insert into storage.objects (id, bucket_id, name)
 values ('70000000-0000-0000-0000-0000000000a4', 'evidence', '00000000-0000-0000-0000-0000000000a1/delete-with-account.txt');
 
@@ -473,11 +477,16 @@ select pg_temp.expect_sqlstate(
 );
 
 -- The application removes evidence through the Storage API after the lifecycle
--- fence is committed. This authenticated SQL DELETE models only that API's
--- metadata step for the RLS regression; production SQL never deletes objects.
+-- fence is committed. Supabase's Storage API sets this transaction-local marker
+-- before its authenticated metadata DELETE; scope the same marker narrowly here
+-- so the test still exercises the delete RLS policy without orphaning a real
+-- object. The deliberately broad predicate also targets B's fixture; the final
+-- assertions prove that RLS limits the delete to A. Production application SQL
+-- never deletes Storage rows directly.
+select set_config('storage.allow_delete_query', 'true', true);
 delete from storage.objects
-where bucket_id = 'evidence'
-  and name like '00000000-0000-0000-0000-0000000000a1/%';
+where bucket_id = 'evidence';
+select set_config('storage.allow_delete_query', 'false', true);
 
 -- Phase two checks the prefix is empty, then removes only A's auth row and
 -- cascaded application/lifecycle rows. The expected UUID is checked against
