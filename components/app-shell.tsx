@@ -371,19 +371,21 @@ export function AppShell({ children }: { children: React.ReactNode }) {
       : current?.label ?? "Evolvra";
   const syncLabel = !user
     ? "Private on this device"
-    : syncStatus === "offline"
-      ? "Offline — changes stay on this device"
-      : syncStatus === "unsaved"
-        ? "Changes waiting to sync"
-        : syncStatus === "saving"
-          ? "Saving changes…"
-          : syncStatus === "connecting"
-            ? "Connecting to private sync…"
-            : syncStatus === "conflict"
-              ? "Sync choice required"
-              : syncStatus === "error"
-                ? "Sync needs attention"
-                : "Private sync up to date";
+    : syncStatus === "persisting"
+      ? "Saving to this device…"
+      : syncStatus === "offline"
+        ? "Offline — saved on this device"
+        : syncStatus === "unsaved"
+          ? "Changes waiting to sync"
+          : syncStatus === "saving"
+            ? "Saving changes…"
+            : syncStatus === "connecting"
+              ? "Connecting to private sync…"
+              : syncStatus === "conflict"
+                ? "Sync choice required"
+                : syncStatus === "error"
+                  ? "Sync needs attention"
+                  : "Private sync up to date";
 
   return (
     <div className="app-layout">
@@ -405,7 +407,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         </div>
         <div className="sidebar-bottom">
           <Link href="/settings" aria-label="Customise settings" className={pathname.startsWith("/settings") ? "active" : ""} aria-current={pathname.startsWith("/settings") ? "page" : undefined} onClick={() => setMobileOpen(false)}><Settings size={17} /><span>Customise</span></Link>
-          <div className={`sync-indicator sync-${syncStatus}`} role="status" aria-live="polite">{user && syncStatus !== "error" && syncStatus !== "offline" ? <Cloud size={16} /> : <CloudOff size={16} />}<span>{syncLabel}</span></div>
+          <div className={`sync-indicator sync-${syncStatus}`} role="status" aria-live="polite">{user && syncStatus !== "error" && syncStatus !== "offline" && syncStatus !== "persisting" ? <Cloud size={16} /> : <CloudOff size={16} />}<span>{syncLabel}</span></div>
         </div>
       </aside>
       {mobileOpen && <button className="mobile-scrim" onClick={() => setMobileOpen(false)} aria-label="Close navigation" />}

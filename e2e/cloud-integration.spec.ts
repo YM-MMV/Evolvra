@@ -107,6 +107,7 @@ test.describe("local Supabase browser integration", () => {
     await expect(page.getByText(/Good (morning|afternoon|evening), Cloud Original/)).toBeVisible();
     await page.goto("/goals");
     await expect(page.getByRole("dialog", { name: "Choose which private workspace to open" })).toBeHidden();
+    await expect(page.getByText("Private sync up to date", { exact: true })).toBeVisible();
     await expect(page.getByRole("link", { name: "Open goal: Build dependable cardiovascular fitness" })).toHaveCount(2);
 
     const mergedAccount = await page.evaluate(async (accountId) => {
@@ -153,7 +154,7 @@ test.describe("local Supabase browser integration", () => {
     await expect.poll(async () => {
       const cloud = await cloudWorkspaceState(account.id);
       return (cloud.state.goals as unknown[]).length;
-    }, { timeout: 25_000 }).toBe(2);
+    }, { timeout: 25_000 }).toBe(mergedAccount.goals.length);
 
     await page.goto("/settings");
     await page.getByRole("button", { name: "Sync & privacy" }).click();
@@ -211,7 +212,7 @@ test.describe("local Supabase browser integration", () => {
       const chapter = conflictPage.getByLabel("Current chapter");
       await chapter.fill("Edited safely while offline");
       await chapter.press("Tab");
-      await expect(conflictPage.getByText("Offline — changes stay on this device", { exact: true })).toBeVisible();
+      await expect(conflictPage.getByText("Offline — saved on this device", { exact: true })).toBeVisible();
       await conflictPage.reload({ waitUntil: "domcontentloaded" });
       await expect(conflictPage.getByLabel("Current chapter")).toHaveValue("Edited safely while offline");
       await conflictPage.context().setOffline(false);

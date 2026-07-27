@@ -138,7 +138,7 @@ import {
   type WorkspaceFileEvidenceCopy,
 } from "@/lib/workspace-merge";
 
-type SyncStatus = "local" | "offline" | "unsaved" | "connecting" | "synced" | "saving" | "conflict" | "error";
+type SyncStatus = "local" | "persisting" | "offline" | "unsaved" | "connecting" | "synced" | "saving" | "conflict" | "error";
 
 interface SyncConflict {
   remoteUpdatedAt: string;
@@ -399,6 +399,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const [cloudWriteAllowed, setCloudWriteAllowed] = useState(false);
   const [accountEpoch, setAccountEpoch] = useState(0);
   const [metadataEpoch, setMetadataEpoch] = useState(0);
+  const [localPersistenceEpoch, setLocalPersistenceEpoch] = useState(0);
   const [workspaceOperations] = useState(createWorkspaceOperationCoordinator);
   const history = useRef<AppState[]>([]);
   const authenticatedUserId = useRef<string | null>(null);
@@ -416,6 +417,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const revision = useRef(0);
   const serverUpdatedAt = useRef<string | undefined>(undefined);
   const dirty = useRef(false);
+  const localPersistencePending = useRef<{
+    accountId: string;
+    changeVersion: number;
+  } | null>(null);
   const remoteConflict = useRef<RemoteSnapshot | null>(null);
   const pendingAccountHandoff = useRef<PendingAnonymousHandoff | null>(null);
   const quarantinedAccounts = useRef(new Set<string>());
@@ -447,6 +452,13 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     setPersistenceError(message);
   }, []);
 
+  const localPersistenceIsPending = useCallback(() => {
+    const pending = localPersistencePending.current;
+    return pending !== null
+      && pending.accountId === persistenceAccountId(activeAccount.current)
+      && pending.changeVersion === localChangeVersion.current;
+  }, []);
+
   const markCloudChangesPending = useCallback(() => {
     if (
       authenticatedUserId.current === null
@@ -454,12 +466,13 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       || pendingAccountHandoff.current
       || terminalErasureAccount.current !== null
     ) return;
-    setSyncStatus((current) => {
-      if (current === "error" || current === "conflict") return current;
-      return typeof navigator !== "undefined" && navigator.onLine === false
-        ? "offline"
-        : "unsaved";
-    });
+    localPersistencePending.current = {
+      accountId: persistenceAccountId(activeAccount.current),
+      changeVersion: localChangeVersion.current,
+    };
+    setSyncStatus((current) => (
+      current === "error" || current === "conflict" ? current : "persisting"
+    ));
   }, []);
 
   const accountIsQuarantined = useCallback((accountId: string) =>
@@ -778,6 +791,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       serverUpdatedAt: serverUpdatedAt.current,
       savedAt: new Date().toISOString(),
     };
+    const persistedChangeVersion = localChangeVersion.current;
     void persistWorkspace(envelope)
       .then(() => {
         try {
@@ -786,9 +800,45 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           // IndexedDB is now authoritative; an inaccessible legacy key is harmless.
         }
         if (!recoveryNotice.current) setPersistenceError(null);
+        if (
+          localChangeVersion.current === persistedChangeVersion
+          && persistenceAccountId(activeAccount.current) === accountId
+        ) {
+          const pending = localPersistencePending.current;
+          if (
+            pending?.accountId !== accountId
+            || pending.changeVersion !== persistedChangeVersion
+          ) return;
+          localPersistencePending.current = null;
+          setLocalPersistenceEpoch((value) => value + 1);
+          if (authenticatedUserId.current === activeAccount.current) {
+            setSyncStatus((current) => {
+              if (current === "error" || current === "conflict") return current;
+              if (typeof navigator !== "undefined" && navigator.onLine === false) {
+                return "offline";
+              }
+              return dirty.current ? "unsaved" : "synced";
+            });
+          }
+        }
       })
       .catch((error: unknown) => {
         if (error instanceof LocalWorkspaceConflictError) return;
+        if (
+          localChangeVersion.current === persistedChangeVersion
+          && persistenceAccountId(activeAccount.current) === accountId
+        ) {
+          const pending = localPersistencePending.current;
+          if (
+            pending?.accountId === accountId
+            && pending.changeVersion === persistedChangeVersion
+          ) {
+            localPersistencePending.current = null;
+            if (authenticatedUserId.current === activeAccount.current) {
+              setSyncStatus("error");
+            }
+          }
+        }
         setPersistenceError(error instanceof Error ? error.message : "This change is still open in memory but could not be saved on this device.");
       });
   }, [accountIsQuarantined, authResolved, metadataEpoch, persistWorkspace, ready, state]);
@@ -1250,6 +1300,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           remoteRevision: remote.revision,
           localRevision: revision.current,
           localDirty: dirty.current,
+          localMatchesRemote: workspaceStatesEqual(latestState.current, remote.state),
         });
 
         if (decision.action === "invalid-revision") {
@@ -1277,6 +1328,44 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           const saveVersion = localChangeVersion.current;
           const saved = await saveSnapshot(latestState.current, decision.expectedRevision);
           finishSave(saved, saveVersion);
+          return;
+        }
+        if (decision.action === "acknowledge-remote") {
+          let acknowledgedRemote = remote;
+          if (remote.needsSave) {
+            setSyncStatus("saving");
+            const saveVersion = localChangeVersion.current;
+            const saved = await saveSnapshot(remote.state, remote.revision);
+            if (!isCurrentAccount()) return;
+            acknowledgedRemote = {
+              ...saved,
+              createdEvidence: remote.createdEvidence,
+            };
+            if (
+              decideRemoteMigrationCompletion(saveVersion, localChangeVersion.current)
+              === "conflict"
+            ) {
+              retainRemoteEvidence = true;
+              remoteLoaded.current = false;
+              reconciledAccount.current = null;
+              remoteConflict.current = acknowledgedRemote;
+              setCloudWriteAllowed(false);
+              setSyncConflict({
+                remoteUpdatedAt: acknowledgedRemote.updatedAt,
+                localUpdatedAt: latestState.current.updatedAt,
+              });
+              setSyncStatus("conflict");
+              return;
+            }
+          }
+          revision.current = acknowledgedRemote.revision;
+          serverUpdatedAt.current = acknowledgedRemote.updatedAt;
+          remoteLoaded.current = true;
+          reconciledAccount.current = syncAccountId;
+          dirty.current = false;
+          retainRemoteEvidence = true;
+          setMetadataEpoch((value) => value + 1);
+          setSyncStatus("synced");
           return;
         }
         if (decision.action === "use-remote" && remote.needsSave) {
@@ -1384,6 +1473,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       || !ready
       || !authResolved
       || !dirty.current
+      || localPersistenceIsPending()
       || !canWriteCloud({
         authenticatedAccountId,
         activeAccountId: activeAccount.current,
@@ -1407,6 +1497,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       generation === workspaceGeneration.current
       && cloudSaveScopeKey === workspaceScopeKeyRef.current
       && cloudSaveAccount.current !== syncAccountId
+      && !localPersistenceIsPending()
       && canWriteCloud({
         authenticatedAccountId: syncAccountId,
         activeAccountId: activeAccount.current,
@@ -1499,7 +1590,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       });
     }, 900);
     return () => window.clearTimeout(timer);
-  }, [accountIsQuarantined, authResolved, metadataEpoch, ready, state, syncConflict, user, workspaceOperations]);
+  }, [accountIsQuarantined, authResolved, localPersistenceEpoch, localPersistenceIsPending, metadataEpoch, ready, state, syncConflict, user, workspaceOperations]);
 
   useEffect(() => {
     if (!user) return;
@@ -1520,6 +1611,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       if (!dirty.current) requestReconciliation();
     };
     const reconnect = () => {
+      if (localPersistenceIsPending()) {
+        setSyncStatus("persisting");
+        return;
+      }
       setSyncStatus("connecting");
       requestReconciliation();
     };
@@ -1529,7 +1624,13 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         && !pendingAccountHandoff.current
         && !remoteConflict.current
         && terminalErasureAccount.current === null
-      ) setSyncStatus("offline");
+      ) {
+        setSyncStatus((current) => (
+          localPersistenceIsPending() || current === "persisting"
+            ? "persisting"
+            : "offline"
+        ));
+      }
     };
     window.addEventListener("focus", refreshCleanWorkspace);
     window.addEventListener("online", reconnect);
@@ -1540,7 +1641,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       window.removeEventListener("online", reconnect);
       window.removeEventListener("offline", disconnect);
     };
-  }, [user]);
+  }, [localPersistenceIsPending, user]);
 
   const mutate = useCallback((recipe: (draft: AppState) => void) => {
     if (terminalErasureAccount.current !== null) {

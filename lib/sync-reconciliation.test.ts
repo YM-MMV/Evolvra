@@ -255,6 +255,33 @@ describe("sync reconciliation", () => {
     })).toEqual({ action: "conflict", remoteRevision: 9 });
   });
 
+  it("acknowledges a newer remote revision when its validated state exactly matches dirty local", () => {
+    expect(decideSyncReconciliation({
+      remoteExists: true,
+      remoteRevision: 9,
+      localRevision: 8,
+      localDirty: true,
+      localMatchesRemote: true,
+    })).toEqual({ action: "acknowledge-remote", remoteRevision: 9 });
+  });
+
+  it("does not acknowledge an equal or older remote revision as a lost save response", () => {
+    expect(decideSyncReconciliation({
+      remoteExists: true,
+      remoteRevision: 8,
+      localRevision: 8,
+      localDirty: true,
+      localMatchesRemote: true,
+    })).toEqual({ action: "upload-local", expectedRevision: 8 });
+    expect(decideSyncReconciliation({
+      remoteExists: true,
+      remoteRevision: 7,
+      localRevision: 8,
+      localDirty: true,
+      localMatchesRemote: true,
+    })).toEqual({ action: "conflict", remoteRevision: 7 });
+  });
+
   it("uses the remote snapshot when local state is clean", () => {
     expect(decideSyncReconciliation({
       remoteExists: true,

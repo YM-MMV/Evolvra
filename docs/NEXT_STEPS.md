@@ -10,8 +10,8 @@ Local release evidence on the current worktree:
 
 - Clean `npm ci` and production dependency audit with no known high or critical vulnerabilities.
 - Typecheck, lint, state-v3 fixture guard, retired-gamification guard, AI-exclusion guard, and service-worker safety guard pass.
-- 381 unit tests across 27 files pass.
-- The production build passes on Next.js 16.2.11; 22 JavaScript chunks total 1,386,363 bytes.
+- 383 unit tests across 27 files pass.
+- The production build passes on Next.js 16.2.11; 22 JavaScript chunks total 1,387,757 bytes.
 - 28 local browser tests pass, including accessibility, keyboard, mobile, PWA/offline, recovery, erasure, evidence, and workflow coverage. Four cloud tests are intentionally skipped without a local Supabase stack.
 - Manual desktop and 390 px mobile review passed after correcting dashboard and header horizontal overflow.
 

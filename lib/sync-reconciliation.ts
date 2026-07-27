@@ -32,6 +32,7 @@ export type AccountHandoffSourceDecision =
 export type SyncReconciliationDecision =
   | { action: "upload-initial"; expectedRevision: 0 }
   | { action: "upload-local"; expectedRevision: number }
+  | { action: "acknowledge-remote"; remoteRevision: number }
   | { action: "use-remote"; remoteRevision: number }
   | { action: "conflict"; remoteRevision: number }
   | { action: "invalid-revision"; source: "local" | "remote" };
@@ -187,11 +188,17 @@ export function decideSyncReconciliation({
   remoteRevision,
   localRevision,
   localDirty,
+  localMatchesRemote = false,
 }: {
   remoteExists: boolean;
   remoteRevision?: unknown;
   localRevision: unknown;
   localDirty: boolean;
+  /**
+   * Set only after both snapshots have passed migration/validation and their
+   * complete AppState values compare equal.
+   */
+  localMatchesRemote?: boolean;
 }): SyncReconciliationDecision {
   if (!remoteExists) return { action: "upload-initial", expectedRevision: 0 };
 
@@ -209,6 +216,12 @@ export function decideSyncReconciliation({
   }
   if (parsedLocalRevision === parsedRemoteRevision) {
     return { action: "upload-local", expectedRevision: parsedRemoteRevision };
+  }
+  // A committed CAS response can be lost to reload, offline transition, or a
+  // transport failure. A newer, byte-equivalent validated remote is therefore
+  // the acknowledgement of that exact local state, not a divergent edit.
+  if (parsedRemoteRevision > parsedLocalRevision && localMatchesRemote) {
+    return { action: "acknowledge-remote", remoteRevision: parsedRemoteRevision };
   }
   return { action: "conflict", remoteRevision: parsedRemoteRevision };
 }
