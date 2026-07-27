@@ -95,13 +95,20 @@ export function decideAccountSwitch({
   nextAccountId,
   nextWorkspaceExists,
   anonymousWorkspaceMeaningful,
+  anonymousHandoffAcknowledged = false,
 }: {
   previousAccountId: string | null;
   nextAccountId: string | null;
   nextWorkspaceExists: boolean;
   anonymousWorkspaceMeaningful: boolean;
+  anonymousHandoffAcknowledged?: boolean;
 }): AccountSwitchDecision {
-  if (nextAccountId && previousAccountId === null && anonymousWorkspaceMeaningful) {
+  if (
+    nextAccountId
+    && previousAccountId === null
+    && anonymousWorkspaceMeaningful
+    && !anonymousHandoffAcknowledged
+  ) {
     return { action: "request-anonymous-consent", sourceAccountId: ANONYMOUS_ACCOUNT_ID };
   }
   if (nextWorkspaceExists) return { action: "load-existing" };

@@ -888,11 +888,13 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         };
         const persistOutgoingEnvelope = (envelope: Omit<WorkspaceEnvelope, "localRevision">) =>
           settleOutgoingWorkspaceWrite(envelope.accountId, () => persistWorkspace(envelope));
+        let outgoingWorkspaceConflicted = false;
         if (
           (previousEnvelope.state.profile.onboarded || previousEnvelope.dirty)
           && canPersistWorkspaceAutomatically(accountIsQuarantined(previousEnvelope.accountId))
         ) {
-          await persistOutgoingEnvelope(previousEnvelope);
+          outgoingWorkspaceConflicted = await persistOutgoingEnvelope(previousEnvelope)
+            === "conflicted";
         }
         if (cancelled || generation !== workspaceGeneration.current) return;
         const nextPersistenceAccountId = persistenceAccountId(nextAccount);
@@ -926,6 +928,13 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           nextWorkspaceExists: Boolean(envelope),
           anonymousWorkspaceMeaningful: previousAccountId === null
             && hasMeaningfulWorkspace(latestState.current, EMPTY_STATE),
+          anonymousHandoffAcknowledged: previousAccountId === null
+            && !outgoingWorkspaceConflicted
+            && envelope?.anonymousHandoff !== undefined
+            && envelope.anonymousHandoff.generation
+              === persistenceScopeGenerations.current.get(persistenceAccountId(null))
+            && envelope.anonymousHandoff.localRevision
+              === (expectedLocalRevisions.current.get(persistenceAccountId(null)) ?? 0),
         });
         if (decision.action === "request-anonymous-consent" && nextAccount) {
           if (
@@ -2540,8 +2549,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             let frozenAnonymousRevision = revision.current;
             let frozenAnonymousServerUpdatedAt = serverUpdatedAt.current;
             let frozenAnonymousVersion = localChangeVersion.current;
+            let frozenAnonymousLocalRevision = expectedLocalRevisions.current.get(sourceAccountId) ?? 0;
             for (let attempt = 0; attempt < 3; attempt += 1) {
-              await persistWorkspace({
+              const savedAnonymous = await persistWorkspace({
                 accountId: sourceAccountId,
                 state: frozenAnonymousState,
                 history: frozenAnonymousHistory,
@@ -2550,6 +2560,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
                 serverUpdatedAt: frozenAnonymousServerUpdatedAt,
                 savedAt: new Date().toISOString(),
               });
+              frozenAnonymousLocalRevision = savedAnonymous.localRevision;
               requireCurrentHandoff("The signed-in account changed before the anonymous workspace was secured.");
               if (localChangeVersion.current === frozenAnonymousVersion) break;
               if (attempt === 2) {
@@ -2797,6 +2808,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
               revision: accountBaseRevision,
               serverUpdatedAt: accountBaseServerUpdatedAt,
               savedAt,
+              anonymousHandoff: {
+                generation: sourceGeneration,
+                localRevision: frozenAnonymousLocalRevision,
+              },
             };
             const saved = targetWasQuarantined
               ? await replaceWorkspaceAfterRecoveryChoice(

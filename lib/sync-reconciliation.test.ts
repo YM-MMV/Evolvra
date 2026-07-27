@@ -87,6 +87,16 @@ describe("account-switch isolation", () => {
     })).toEqual({ action: "request-anonymous-consent", sourceAccountId: "anonymous" });
   });
 
+  it("does not repeat consent for the exact anonymous revision already handled by this account", () => {
+    expect(decideAccountSwitch({
+      previousAccountId: null,
+      nextAccountId: "user-a",
+      nextWorkspaceExists: true,
+      anonymousWorkspaceMeaningful: true,
+      anonymousHandoffAcknowledged: true,
+    })).toEqual({ action: "load-existing" });
+  });
+
   it("loads an existing account workspace when there is no meaningful anonymous copy", () => {
     expect(decideAccountSwitch({
       previousAccountId: null,

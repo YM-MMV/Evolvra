@@ -354,6 +354,21 @@ describe("workspace envelope validation", () => {
     })).toBe(false);
   });
 
+  it("validates the exact anonymous revision already handled by an account", () => {
+    expect(isWorkspaceEnvelope({
+      ...envelope,
+      anonymousHandoff: { generation: 2, localRevision: 7 },
+    })).toBe(true);
+    expect(isWorkspaceEnvelope({
+      ...envelope,
+      anonymousHandoff: { generation: -1, localRevision: 7 },
+    })).toBe(false);
+    expect(isWorkspaceEnvelope({
+      ...envelope,
+      anonymousHandoff: { generation: 2, localRevision: 1.5 },
+    })).toBe(false);
+  });
+
   it("accepts the exact undo-count boundary and rejects boundary plus one", () => {
     const history = Array.from({ length: MAX_UNDO_HISTORY_ITEMS }, (_, index) => ({
       ...state,
@@ -482,6 +497,14 @@ describe("workspace recovery", () => {
   it("never recovers data from a different account", () => {
     expect(() => recoverWorkspaceEnvelope(envelope, "account-2")).toThrow(/belongs to another account/i);
   });
+
+  it("preserves a durable anonymous handoff acknowledgement during recovery", () => {
+    const anonymousHandoff = { generation: 3, localRevision: 11 };
+    expect(recoverWorkspaceEnvelope({
+      ...envelope,
+      anonymousHandoff,
+    }, "account-1").anonymousHandoff).toEqual(anonymousHandoff);
+  });
 });
 
 describe("workspace local compare-and-swap semantics", () => {
@@ -508,6 +531,13 @@ describe("workspace local compare-and-swap semantics", () => {
     })).toBe(false);
   });
 
+  it("treats a different anonymous handoff revision as persisted meaning", () => {
+    expect(workspaceEnvelopeContentsEqual(
+      { ...envelope, anonymousHandoff: { generation: 1, localRevision: 2 } },
+      { ...envelope, anonymousHandoff: { generation: 1, localRevision: 3 } },
+    )).toBe(false);
+  });
+
   it("increments a matching revision and returns the stored copy for a same-content no-op", () => {
     const first = prepareWorkspaceWrite(null, { ...envelope, localRevision: 0 });
     expect(first).toMatchObject({ action: "write", envelope: { localRevision: 1 } });
@@ -518,6 +548,28 @@ describe("workspace local compare-and-swap semantics", () => {
       savedAt: "2026-07-18T14:00:00.000Z",
     });
     expect(noOp).toEqual({ action: "no-op", envelope });
+  });
+
+  it("preserves the acknowledgement when an ordinary workspace save omits it", () => {
+    const current = {
+      ...envelope,
+      anonymousHandoff: { generation: 2, localRevision: 8 },
+    };
+    const next = prepareWorkspaceWrite(current, {
+      ...envelope,
+      state: {
+        ...envelope.state,
+        profile: { ...envelope.state.profile, displayName: "Changed safely" },
+      },
+    });
+
+    expect(next).toMatchObject({
+      action: "write",
+      envelope: {
+        localRevision: envelope.localRevision + 1,
+        anonymousHandoff: current.anonymousHandoff,
+      },
+    });
   });
 
   it("rejects stale changed content with the typed local conflict", () => {

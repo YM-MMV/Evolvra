@@ -35,8 +35,15 @@ export interface WorkspaceEnvelope {
   revision: number;
   serverUpdatedAt?: string;
   savedAt: string;
+  /** Exact anonymous device revision this account has already handled. */
+  anonymousHandoff?: AnonymousWorkspaceHandoffAcknowledgement;
   /** Transient read metadata. New writes should omit this after surfacing it to the user. */
   recovery?: WorkspaceRecovery;
+}
+
+export interface AnonymousWorkspaceHandoffAcknowledgement {
+  generation: PersistenceScopeGeneration;
+  localRevision: number;
 }
 
 export interface WorkspaceRecovery {
@@ -260,6 +267,15 @@ function isWorkspaceRecovery(value: unknown): value is WorkspaceRecovery {
     && Boolean(value.message.trim());
 }
 
+function isAnonymousWorkspaceHandoffAcknowledgement(
+  value: unknown,
+): value is AnonymousWorkspaceHandoffAcknowledgement {
+  if (!isRecord(value)) return false;
+  return Number.isSafeInteger(value.generation)
+    && Number(value.generation) >= 0
+    && isLocalRevision(value.localRevision);
+}
+
 function hasWorkspaceMetadata(value: UnknownRecord): boolean {
   return isPersistenceId(value.accountId)
     && typeof value.dirty === "boolean"
@@ -268,6 +284,8 @@ function hasWorkspaceMetadata(value: UnknownRecord): boolean {
     && Number(value.revision) >= 0
     && (value.serverUpdatedAt === undefined || isIsoDate(value.serverUpdatedAt))
     && isIsoDate(value.savedAt)
+    && (value.anonymousHandoff === undefined
+      || isAnonymousWorkspaceHandoffAcknowledgement(value.anonymousHandoff))
     && (value.recovery === undefined || isWorkspaceRecovery(value.recovery));
 }
 
@@ -1312,6 +1330,9 @@ export function recoverWorkspaceEnvelope(
     revision: value.revision as number,
     ...(value.serverUpdatedAt === undefined ? {} : { serverUpdatedAt: value.serverUpdatedAt as string }),
     savedAt: value.savedAt as string,
+    ...(value.anonymousHandoff === undefined
+      ? {}
+      : { anonymousHandoff: value.anonymousHandoff as AnonymousWorkspaceHandoffAcknowledgement }),
     ...(value.recovery === undefined ? {} : { recovery: value.recovery as WorkspaceRecovery }),
   } satisfies WorkspaceEnvelope;
 
@@ -1432,6 +1453,7 @@ export function workspaceEnvelopeContentsEqual(
     && left.dirty === right.dirty
     && left.revision === right.revision
     && left.serverUpdatedAt === right.serverUpdatedAt
+    && jsonValuesEqual(left.anonymousHandoff, right.anonymousHandoff)
     && jsonValuesEqual(left.state, right.state)
     && jsonValuesEqual(left.history, right.history);
 }
@@ -1445,15 +1467,18 @@ export function prepareWorkspaceWrite(
   current: WorkspaceEnvelope | null,
   requested: WorkspaceEnvelope,
 ): WorkspaceWriteDecision {
-  if (current && workspaceEnvelopeContentsEqual(current, requested)) {
+  const effectiveRequested = current?.anonymousHandoff && !requested.anonymousHandoff
+    ? { ...requested, anonymousHandoff: current.anonymousHandoff }
+    : requested;
+  if (current && workspaceEnvelopeContentsEqual(current, effectiveRequested)) {
     return { action: "no-op", envelope: current };
   }
 
   const actualLocalRevision = current?.localRevision ?? 0;
-  if (actualLocalRevision !== requested.localRevision) {
+  if (actualLocalRevision !== effectiveRequested.localRevision) {
     throw new LocalWorkspaceConflictError(
-      requested.accountId,
-      requested.localRevision,
+      effectiveRequested.accountId,
+      effectiveRequested.localRevision,
       actualLocalRevision,
     );
   }
@@ -1468,7 +1493,7 @@ export function prepareWorkspaceWrite(
   return {
     action: "write",
     envelope: {
-      ...requested,
+      ...effectiveRequested,
       localRevision: actualLocalRevision + 1,
     },
   };
