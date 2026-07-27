@@ -62,7 +62,7 @@ test.describe("local Supabase browser integration", () => {
     await waitForCloudProfile(account.id, "Cloud Original");
     await page.goto("/settings");
     await page.getByRole("button", { name: "Appearance" }).click();
-    await page.getByRole("button", { name: "Light" }).click();
+    await page.getByRole("button", { name: "Light", exact: true }).click();
     await page.getByRole("button", { name: "Sync & privacy" }).click();
     await page.getByRole("button", { name: "Sign out" }).click();
 

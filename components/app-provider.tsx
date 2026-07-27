@@ -1451,7 +1451,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           if (localUnchanged) dirty.current = false;
           setMetadataEpoch((value) => value + 1);
           setSyncStatus(localUnchanged ? "synced" : "saving");
-        } catch (error) {
+        } catch {
           const accountStillCurrent = generation === workspaceGeneration.current
             && cloudSaveScopeKey === workspaceScopeKeyRef.current
             && activeAccount.current === syncAccountId
@@ -1462,10 +1462,13 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             remoteLoaded.current = false;
             reconciledAccount.current = null;
             setCloudWriteAllowed(false);
-            setPersistenceError(error instanceof Error
-              ? `Private sync could not finish: ${error.message}`
-              : "Private sync could not finish. Your device copy remains available.");
-            setSyncStatus("error");
+            // A lost RPC response is ambiguous: the server may have committed
+            // the snapshot even though the browser never received a response.
+            // Re-read the remote revision once so a concurrent write becomes
+            // an explicit conflict and a transient transport failure can
+            // recover without waiting for another local mutation.
+            setSyncStatus("connecting");
+            setAccountEpoch((value) => value + 1);
           }
         } finally {
           if (cloudSaveAccount.current === syncAccountId) {
