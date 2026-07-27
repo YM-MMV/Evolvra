@@ -7,7 +7,7 @@ Evolvra remains labelled beta until every applicable item is verified for the re
 - [ ] `npm ci` succeeds from a clean checkout.
 - [ ] `npm run check` passes: retired-mechanics and state-v3 SQL-fixture guards, typecheck, lint, unit tests, service-worker checks, production build, bundle budget, and the Playwright browser release gate.
 - [ ] Both GitHub Actions jobs pass on the exact release commit.
-- [ ] Dependency audit has no known high or critical vulnerability.
+- [ ] Production dependency audit has no known high or critical vulnerability.
 - [ ] Supabase CLI `2.109.1` applies the immutable migration chain to a fresh database and a seeded legacy database; post-upgrade preservation/backfill assertions pass.
 - [ ] Two-user RLS regression tests pass.
 

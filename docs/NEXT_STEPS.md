@@ -1,6 +1,6 @@
 # Project audit and next-step plan
 
-Audit date: 22 July 2026
+Audit date: 27 July 2026
 
 ## Current position
 
@@ -8,9 +8,9 @@ The state-v3 product work is feature-complete for the agreed beta scope. XP, lev
 
 Local release evidence on the current worktree:
 
-- Clean `npm ci` and dependency audit with no known vulnerabilities.
+- Clean `npm ci` and production dependency audit with no known high or critical vulnerabilities.
 - Typecheck, lint, state-v3 fixture guard, retired-gamification guard, AI-exclusion guard, and service-worker safety guard pass.
-- 366 unit tests across 26 files pass.
+- 372 unit tests across 27 files pass.
 - The production build passes on Next.js 16.2.11; 22 JavaScript chunks total 1,385,611 bytes.
 - 28 local browser tests pass, including accessibility, keyboard, mobile, PWA/offline, recovery, erasure, evidence, and workflow coverage. Four cloud tests are intentionally skipped without a local Supabase stack.
 - Manual desktop and 390 px mobile review passed after correcting dashboard and header horizontal overflow.
@@ -80,6 +80,7 @@ Complete these in order; do not promote `main` early.
 - Add scheduled background push only if reminders must work while Evolvra is closed; the beta reminder is intentionally local and runs while a tab or installed window is open.
 - Add production synthetic checks for security headers, manifest/icons, service-worker MIME behaviour, telemetry rejection, and auth callback exclusions.
 - Run periodic restore and account-erasure drills against a disposable Supabase project and record recovery time and evidence-object cleanup results.
+- Track the development-only `minimatch`/`brace-expansion` denial-of-service advisory until the ESLint plugin chain accepts a patched major. Production dependencies are clear; do not force an API-incompatible transitive override merely to silence the audit.
 
 ## Decisions needed from the owner
 
