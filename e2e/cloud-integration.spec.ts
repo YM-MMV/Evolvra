@@ -159,6 +159,9 @@ test.describe("local Supabase browser integration", () => {
     await page.goto("/settings");
     await page.getByRole("button", { name: "Sync & privacy" }).click();
     await page.getByRole("button", { name: "Sign out" }).click();
+    await expect(page.getByText("Private on this device", { exact: true })).toBeVisible();
+    await expect(page.getByLabel("Display name")).toHaveValue("Device Original");
+    await page.goto("/");
     await expect(page.getByText(/Good (morning|afternoon|evening), Device Original/)).toBeVisible();
     await expect(page.getByRole("link", { name: "Open goal: Build dependable cardiovascular fitness" })).toBeVisible();
     const anonymousAfter = await readAnonymousWorkspaceState(page) as typeof anonymousBefore;
