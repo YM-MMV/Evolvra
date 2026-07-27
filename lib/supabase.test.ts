@@ -6,6 +6,7 @@ import {
   createLazySupabaseFacade,
   eraseConnectedAccount,
   erasePrivateEvidence,
+  saveWorkspaceSnapshotWithDeadline,
 } from "@/lib/supabase";
 
 type Entry = { id: string | null; name: string };
@@ -69,6 +70,44 @@ describe("lazy Supabase boundary", () => {
     await expect(facade.rpc("save_workspace_snapshot", { p_expected_revision: 1 }))
       .resolves.toEqual(response);
     expect(rpc).toHaveBeenCalledWith("save_workspace_snapshot", { p_expected_revision: 1 });
+  });
+
+  it("keeps fluent RPC abort signals available through the lazy facade", async () => {
+    const response = { data: [{ revision: 3 }], error: null };
+    const abortSignal = vi.fn(async (signal: AbortSignal) => {
+      void signal;
+      return response;
+    });
+    const rpc = vi.fn(() => ({ abortSignal }));
+    const facade = createLazySupabaseFacade(async () => ({ rpc }) as unknown as SupabaseClient);
+    const controller = new AbortController();
+
+    await expect(facade
+      .rpc("save_workspace_snapshot", { p_expected_revision: 2 })
+      .abortSignal(controller.signal))
+      .resolves.toEqual(response);
+    expect(rpc).toHaveBeenCalledWith("save_workspace_snapshot", { p_expected_revision: 2 });
+    expect(abortSignal).toHaveBeenCalledWith(controller.signal);
+  });
+});
+
+describe("workspace snapshot deadline", () => {
+  it("submits the expected revision through an abortable RPC", async () => {
+    const response = { data: [{ revision: 4 }], error: null };
+    const abortSignal = vi.fn(async (signal: AbortSignal) => {
+      void signal;
+      return response;
+    });
+    const rpc = vi.fn(() => ({ abortSignal }));
+    const client = { rpc } as unknown as SupabaseClient;
+
+    await expect(saveWorkspaceSnapshotWithDeadline(client, { version: 3 }, 3))
+      .resolves.toEqual(response);
+    expect(rpc).toHaveBeenCalledWith("save_workspace_snapshot", {
+      p_state: { version: 3 },
+      p_expected_revision: 3,
+    });
+    expect(abortSignal.mock.calls[0]?.[0]).toBeInstanceOf(AbortSignal);
   });
 });
 

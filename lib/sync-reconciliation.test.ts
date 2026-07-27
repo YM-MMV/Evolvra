@@ -9,6 +9,7 @@ import {
   decideRemoteMigrationCompletion,
   decideSyncReconciliation,
   hasMeaningfulWorkspace,
+  isWorkspaceRevisionConflict,
   nextWorkspaceScopeKey,
   parseWorkspaceRevision,
 } from "@/lib/sync-reconciliation";
@@ -204,6 +205,19 @@ describe("revision parsing", () => {
     for (const value of [undefined, null, "", " 2", "02", "2.5", -1, 1.5, "9007199254740992"]) {
       expect(parseWorkspaceRevision(value)).toBeNull();
     }
+  });
+});
+
+describe("workspace revision errors", () => {
+  it("recognises the explicit PostgREST conflict and the pre-cutover legacy code", () => {
+    expect(isWorkspaceRevisionConflict({ code: "PT409" })).toBe(true);
+    expect(isWorkspaceRevisionConflict({ code: "40001" })).toBe(true);
+  });
+
+  it("does not turn unrelated database or transport errors into conflicts", () => {
+    expect(isWorkspaceRevisionConflict({ code: "42501" })).toBe(false);
+    expect(isWorkspaceRevisionConflict(new Error("network unavailable"))).toBe(false);
+    expect(isWorkspaceRevisionConflict(null)).toBe(false);
   });
 });
 

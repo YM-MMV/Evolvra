@@ -79,6 +79,17 @@ export function parseWorkspaceRevision(value: unknown): number | null {
   return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : null;
 }
 
+/**
+ * Migration 009 returns a non-retryable HTTP 409 through PostgREST. Continue
+ * recognising the earlier PostgreSQL serialization code while a compatible
+ * client is prepared ahead of the coordinated database cutover.
+ */
+export function isWorkspaceRevisionConflict(error: unknown): boolean {
+  if (!error || typeof error !== "object" || !("code" in error)) return false;
+  const code = String(error.code);
+  return code === "PT409" || code === "40001";
+}
+
 export function decideAccountSwitch({
   previousAccountId,
   nextAccountId,

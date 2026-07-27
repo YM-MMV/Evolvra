@@ -39,6 +39,8 @@ export const supabaseConfigured = Boolean(
   process.env.NEXT_PUBLIC_SUPABASE_URL && process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY,
 );
 
+export const WORKSPACE_SNAPSHOT_RPC_TIMEOUT_MS = 10_000;
+
 function configuredClient(): Promise<SupabaseClient> {
   if (!supabaseConfigured) {
     return Promise.reject(new Error("Add Supabase environment variables first."));
@@ -101,8 +103,10 @@ export function createLazySupabaseFacade(
     operation: (client: SupabaseClient) => PromiseLike<T> | T,
   ): Promise<T> => loadClient().then(operation);
   const facade = {
-    rpc: (...args: unknown[]) => invokeClient((client) =>
-      Reflect.apply(client.rpc, client, args)),
+    rpc: (...args: unknown[]) => deferredBuilder(async () => {
+      const client = await loadClient();
+      return { value: Reflect.apply(client.rpc, client, args) };
+    }),
     from: (...args: unknown[]) => deferredBuilder(async () => {
       const client = await loadClient();
       return { value: Reflect.apply(client.from, client, args) };
@@ -151,6 +155,31 @@ export function getSupabase(): SupabaseClient | null {
   if (!supabaseConfigured) return null;
   lazyClient ??= createLazySupabaseFacade(configuredClient);
   return lazyClient;
+}
+
+/**
+ * Bounds a compare-and-swap round trip without pretending an aborted response
+ * means the database did not commit. Callers reconcile the remote revision
+ * after any thrown transport outcome.
+ */
+export async function saveWorkspaceSnapshotWithDeadline(
+  supabase: SupabaseClient,
+  state: unknown,
+  expectedRevision: number,
+  timeoutMs = WORKSPACE_SNAPSHOT_RPC_TIMEOUT_MS,
+) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await supabase
+      .rpc("save_workspace_snapshot", {
+        p_state: state,
+        p_expected_revision: expectedRevision,
+      })
+      .abortSignal(controller.signal);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 async function listPrivateEvidencePaths(supabase: SupabaseClient, accountId: string) {

@@ -105,6 +105,7 @@ test.describe("local Supabase browser integration", () => {
     await expect(secondHandoff.getByRole("button", { name: "Merge device data into account" })).toBeVisible();
     await secondHandoff.getByRole("button", { name: "Merge device data into account" }).click();
     await expect(page.getByText(/Good (morning|afternoon|evening), Cloud Original/)).toBeVisible();
+    await page.goto("/goals");
     await expect(page.getByRole("link", { name: "Open goal: Build dependable cardiovascular fitness" })).toHaveCount(2);
 
     const mergedAccount = await page.evaluate(async (accountId) => {

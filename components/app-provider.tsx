@@ -85,7 +85,12 @@ import {
   UnsupportedStoredWorkspaceVersionError,
   WorkspaceImportError,
 } from "@/lib/state-schema";
-import { getSupabase, supabaseConfigured, type CloudUser } from "@/lib/supabase";
+import {
+  getSupabase,
+  saveWorkspaceSnapshotWithDeadline,
+  supabaseConfigured,
+  type CloudUser,
+} from "@/lib/supabase";
 import {
   canWriteCloud,
   canPersistWorkspaceAutomatically,
@@ -96,6 +101,7 @@ import {
   decideRemoteMigrationCompletion,
   decideSyncReconciliation,
   hasMeaningfulWorkspace,
+  isWorkspaceRevisionConflict,
   nextWorkspaceScopeKey,
   parseWorkspaceRevision,
   persistenceAccountId,
@@ -1107,10 +1113,11 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       && !accountSwitching.current
       && !localConflictAccounts.current.has(persistenceAccountId(syncAccountId));
     const saveSnapshot = async (snapshot: AppState, expectedRevision: number) => {
-      const { data, error } = await supabase.rpc("save_workspace_snapshot", {
-        p_state: snapshot,
-        p_expected_revision: expectedRevision,
-      });
+      const { data, error } = await saveWorkspaceSnapshotWithDeadline(
+        supabase,
+        snapshot,
+        expectedRevision,
+      );
       if (error) throw error;
       const row = Array.isArray(data) ? data[0] : data;
       const savedRevision = parseWorkspaceRevision(row?.revision);
@@ -1319,10 +1326,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           setSyncStatus("error");
           return;
         }
-        const code = typeof error === "object" && error && "code" in error
-          ? String(error.code)
-          : undefined;
-        if (code === "40001") {
+        if (isWorkspaceRevisionConflict(error)) {
           setAccountEpoch((value) => value + 1);
           setSyncStatus("connecting");
         } else {
@@ -1416,10 +1420,11 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         const expectedRevision = revision.current;
         setSyncStatus("saving");
         try {
-          const { data, error } = await supabase.rpc("save_workspace_snapshot", {
-            p_state: state,
-            p_expected_revision: expectedRevision,
-          });
+          const { data, error } = await saveWorkspaceSnapshotWithDeadline(
+            supabase,
+            state,
+            expectedRevision,
+          );
           const accountStillCurrent = generation === workspaceGeneration.current
             && cloudSaveScopeKey === workspaceScopeKeyRef.current
             && activeAccount.current === syncAccountId
@@ -1431,7 +1436,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             remoteLoaded.current = false;
             reconciledAccount.current = null;
             setCloudWriteAllowed(false);
-            setSyncStatus(error.code === "40001" ? "conflict" : "error");
+            setSyncStatus(isWorkspaceRevisionConflict(error) ? "conflict" : "error");
             setAccountEpoch((value) => value + 1);
             return;
           }
@@ -1610,10 +1615,11 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       const supabase = getSupabase();
       if (!supabase) throw new Error("Cloud storage is unavailable.");
       setSyncStatus("saving");
-      const { data, error } = await supabase.rpc("save_workspace_snapshot", {
-        p_state: snapshot,
-        p_expected_revision: revision.current,
-      });
+      const { data, error } = await saveWorkspaceSnapshotWithDeadline(
+        supabase,
+        snapshot,
+        revision.current,
+      );
       if (error) throw error;
       const row = Array.isArray(data) ? data[0] : data;
       const savedRevision = parseWorkspaceRevision(row?.revision);

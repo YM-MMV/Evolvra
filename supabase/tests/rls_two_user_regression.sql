@@ -415,7 +415,7 @@ $$;
 select pg_temp.expect_sqlstate(
   'stale workspace revision',
   $sql$select * from public.save_workspace_snapshot('{"version":3,"owner":"a","stale":true}'::jsonb, 0)$sql$,
-  '40001'
+  'PT409'
 );
 
 -- Evidence paths are private on select/insert/delete and cannot be moved into
