@@ -1,0 +1,173 @@
+name: CI
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CI: true
+      NEXT_TELEMETRY_DISABLED: 1
+      TZ: Europe/London
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Audit production dependencies
+        run: npm run audit:dependencies
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Prevent retired gamification from returning
+        run: npm run check:gamification
+
+      - name: Prevent AI integration from entering this release
+        run: npm run check:no-ai
+
+      - name: Require current state-v3 database fixtures
+        run: npm run check:sql-fixtures
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Test
+        run: npm test
+
+      - name: Check service-worker safety
+        run: npm run check:sw
+
+      - name: Build production application
+        run: npm run build
+
+      - name: Enforce JavaScript bundle budget
+        run: npm run check:bundle
+
+      - name: Install browser for end-to-end tests
+        run: npx playwright install --with-deps chromium
+
+      - name: Run browser release gate
+        run: npm run test:e2e:run
+
+      - name: Upload browser test artifacts
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: playwright-report
+          path: |
+            playwright-report
+            test-results
+          if-no-files-found: ignore
+          retention-days: 7
+
+  database:
+    name: Database, RLS, and cloud browser integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CI: true
+      DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:54322/postgres
+      EVOLVRA_CLOUD_E2E: true
+      NEXT_TELEMETRY_DISABLED: 1
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Supabase CLI
+        uses: supabase/setup-cli@3c2f5e2ae34c34e428e8e206e2c4d21fa2d20fbf # v2
+        with:
+          version: 2.109.1
+
+      - name: Start bounded local Supabase stack
+        run: supabase start
+
+      - name: Verify fresh migration chain
+        run: |
+          supabase db reset --no-seed
+          supabase db lint --local --schema public,private --level error --fail-on error
+          psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 -f supabase/tests/rls_two_user_regression.sql
+
+      - name: Verify legacy upgrade path
+        run: |
+          supabase db reset --no-seed --version 202607150001
+          psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 -f supabase/tests/legacy_upgrade_fixture.sql
+          supabase migration up --local
+          psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 -f supabase/tests/legacy_upgrade_assertions.sql
+          supabase db lint --local --schema public,private --level error --fail-on error
+          psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 -f supabase/tests/rls_two_user_regression.sql
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install application dependencies
+        run: npm ci
+
+      - name: Export bounded local Supabase credentials
+        shell: bash
+        run: |
+          source <(supabase status -o env)
+          : "${API_URL:?Local Supabase API URL was not reported}"
+          : "${ANON_KEY:?Local Supabase anonymous key was not reported}"
+          : "${SERVICE_ROLE_KEY:?Local Supabase service-role key was not reported}"
+          case "$API_URL" in
+            http://127.0.0.1:*|http://localhost:*) ;;
+            *) echo "Refusing to run destructive cloud browser tests against non-local URL: $API_URL" >&2; exit 1 ;;
+          esac
+          echo "::add-mask::$SERVICE_ROLE_KEY"
+          echo "NEXT_PUBLIC_SUPABASE_URL=$API_URL" >> "$GITHUB_ENV"
+          echo "NEXT_PUBLIC_SUPABASE_ANON_KEY=$ANON_KEY" >> "$GITHUB_ENV"
+          echo "SUPABASE_SERVICE_ROLE_KEY=$SERVICE_ROLE_KEY" >> "$GITHUB_ENV"
+
+      - name: Build cloud-enabled production application
+        run: npm run build
+
+      - name: Install browser for cloud integration tests
+        run: npx playwright install --with-deps chromium
+
+      - name: Run account, revision, evidence, and erasure integration tests
+        run: npm run test:e2e:cloud
+
+      - name: Upload cloud browser test artifacts
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: cloud-playwright-report
+          path: |
+            playwright-report
+            test-results
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Stop local Supabase stack
+        if: always()
+        run: supabase stop --no-backup

@@ -1,10 +1,10 @@
 export type GoalStatus = "active" | "paused" | "completed" | "archived";
 export type GoalModel = "numeric" | "weighted" | "consistency" | "open";
 export type Priority = "low" | "medium" | "high" | "critical";
-export type QuestEffort = "quick" | "standard" | "focused" | "major";
-export type QuestDifficulty = "easy" | "moderate" | "difficult";
-export type QuestImpact = "supporting" | "meaningful" | "important";
 export type ReviewCadence = "daily" | "weekly" | "monthly";
+export type ConsistencyPeriod = "week" | "month" | "quarter" | "year";
+export type QuestKind = "task" | "session" | "challenge" | "milestone";
+export type DashboardSectionId = "life-map" | "momentum" | "goals" | "qualities" | "review";
 
 export interface Area {
   id: string;
@@ -21,7 +21,6 @@ export interface LifeStat {
   name: string;
   color: string;
   icon: string;
-  xp: number;
   archived?: boolean;
 }
 
@@ -32,6 +31,8 @@ export interface ProgressMetric {
   target: number;
   unit: string;
   weight: number;
+  period?: ConsistencyPeriod;
+  periodKey?: string;
 }
 
 export interface MetricDelta {
@@ -39,30 +40,72 @@ export interface MetricDelta {
   amount: number;
 }
 
+/** Immutable context used by historic analytics after a goal is reorganised. */
+export interface AttributionSnapshot {
+  areaId: string;
+  statIds: string[];
+}
+
+export interface GoalAttributionSnapshot extends AttributionSnapshot {
+  goalId: string;
+}
+
 export interface Milestone {
   id: string;
   title: string;
   weight: number;
-  xp: number;
   completed: boolean;
   completedAt?: string;
+  attribution?: AttributionSnapshot;
 }
 
 export interface Quest {
   id: string;
+  kind: QuestKind;
+  /** Additional goals this action supports; the containing goal remains primary. */
+  linkedGoalIds: string[];
   title: string;
   description?: string;
   dueDate?: string;
-  effort: QuestEffort;
-  difficulty: QuestDifficulty;
-  impact: QuestImpact;
-  xp: number;
   repeat: "none" | "daily" | "weekly" | "monthly";
   completed: boolean;
   completedAt?: string;
   durationMinutes?: number;
   metricDeltas: MetricDelta[];
 }
+
+export interface GoalCheckIn {
+  id: string;
+  createdAt: string;
+  note: string;
+  attribution?: AttributionSnapshot;
+}
+
+interface GoalEvidenceBase {
+  /** Stable UUID used to coordinate metadata with account-scoped blob storage. */
+  id: string;
+}
+
+export interface GoalNoteEvidence extends GoalEvidenceBase {
+  type: "note";
+  text: string;
+}
+
+export interface GoalLinkEvidence extends GoalEvidenceBase {
+  type: "link";
+  url: string;
+}
+
+export interface GoalFileEvidence extends GoalEvidenceBase {
+  type: "file";
+  name: string;
+  mimeType: string;
+  size: number;
+  /** Private Storage object path. File bytes remain in Storage or IndexedDB. */
+  remotePath?: string;
+}
+
+export type GoalEvidence = GoalNoteEvidence | GoalLinkEvidence | GoalFileEvidence;
 
 export interface Goal {
   id: string;
@@ -78,10 +121,50 @@ export interface Goal {
   metrics: ProgressMetric[];
   milestones: Milestone[];
   quests: Quest[];
-  statWeights: Record<string, number>;
-  checkInScore?: number;
-  evidence: string[];
+  statIds: string[];
+  checkIns: GoalCheckIn[];
+  evidence: GoalEvidence[];
   notes: string;
+}
+
+export interface QuestCompletion {
+  id: string;
+  goalId: string;
+  /** Immutable snapshot of the action's additional goal connections. */
+  linkedGoalIds: string[];
+  /** Goal, area, and quality links as they existed when the action happened. */
+  goalSnapshots?: GoalAttributionSnapshot[];
+  questId: string;
+  title: string;
+  completedAt: string;
+  durationMinutes?: number;
+  note?: string;
+  evidence: string[];
+  metricDeltas: MetricDelta[];
+}
+
+export interface QuestCompletionInput {
+  durationMinutes?: number;
+  note?: string;
+  evidence?: string[];
+  metricDeltas?: MetricDelta[];
+}
+
+export interface MetricEntry {
+  id: string;
+  goalId: string;
+  metricId: string;
+  label?: string;
+  unit?: string;
+  value: number;
+  previousValue: number;
+  recordedAt: string;
+  source: "manual" | "quest";
+  /** Explicit causal link; present for measurement changes created by an action. */
+  sourceCompletionId?: string;
+  periodKey?: string;
+  /** Goal organisation as it existed when this measurement was recorded. */
+  attribution?: AttributionSnapshot;
 }
 
 export interface Review {
@@ -93,13 +176,16 @@ export interface Review {
 
 export interface TimelineEvent {
   id: string;
-  type: "quest" | "milestone" | "goal" | "level" | "review" | "note" | "metric";
+  type: "quest" | "milestone" | "goal" | "review" | "note" | "metric";
   title: string;
   detail: string;
   at: string;
   goalId?: string;
   areaId?: string;
-  xp?: number;
+  /** Immutable organisation links captured when this structural event was written. */
+  relatedGoalIds?: string[];
+  relatedAreaIds?: string[];
+  relatedStatIds?: string[];
 }
 
 export interface Terminology {
@@ -110,22 +196,15 @@ export interface Terminology {
   stats: string;
 }
 
-export interface ScoringSettings {
-  effort: Record<QuestEffort, number>;
-  difficulty: Record<QuestDifficulty, number>;
-  impact: Record<QuestImpact, number>;
-  questCap: number;
-  levelBase: number;
-  levelGrowth: number;
-}
-
 export interface UserSettings {
   theme: "dark" | "light" | "system";
-  gameIntensity: "minimal" | "balanced" | "immersive";
+  interfaceIntensity: "minimal" | "balanced" | "immersive";
   birthDate?: string;
   notifications: boolean;
+  reminderTime?: string;
+  dashboardOrder: DashboardSectionId[];
+  hiddenDashboardSections: DashboardSectionId[];
   terminology: Terminology;
-  scoring: ScoringSettings;
 }
 
 export interface Profile {
@@ -136,14 +215,15 @@ export interface Profile {
 }
 
 export interface AppState {
-  version: number;
+  version: 3;
   updatedAt: string;
   profile: Profile;
   settings: UserSettings;
   areas: Area[];
   stats: LifeStat[];
   goals: Goal[];
+  questCompletions: QuestCompletion[];
+  metricEntries: MetricEntry[];
   reviews: Review[];
   timeline: TimelineEvent[];
-  overallXp: number;
 }
