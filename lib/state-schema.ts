@@ -11,6 +11,11 @@ import {
   MAX_GOAL_EVIDENCE_ITEMS,
   sanitizeGoalEvidenceList,
 } from "@/lib/goal-evidence";
+import {
+  goalProgressConfigurationIssue,
+  hasConsistencyPeriodMetadata,
+  hasPositiveWeightedMetric,
+} from "@/lib/goal-progress";
 import type {
   AppState,
   Area,
@@ -37,6 +42,7 @@ import type {
   UserSettings,
 } from "@/lib/types";
 import { isPeriodKey } from "@/lib/utils";
+import { profileJsonValue } from "@/lib/workspace-json-profile";
 
 export const CURRENT_STATE_VERSION = 3 as const;
 export const MAX_WORKSPACE_SERIALIZED_BYTES = 5 * 1024 * 1024;
@@ -293,6 +299,40 @@ function legacyStatIds(value: UnknownRecord) {
     .map(([statId]) => statId);
 }
 
+function repairMigratedGoalProgress(goal: Goal) {
+  if (goal.model !== "numeric" && goal.model !== "consistency") return;
+
+  // A legacy measured goal without a measurement cannot be assigned an honest
+  // target. Preserve all of its content as an open reflection instead.
+  if (!goal.metrics.length) {
+    goal.model = "open";
+    return;
+  }
+
+  // Older workspaces could persist every relative weight as zero. Retain every
+  // metric and give them a neutral equal share rather than discarding history.
+  if (!hasPositiveWeightedMetric(goal.metrics)) {
+    const equalWeight = 100 / goal.metrics.length;
+    goal.metrics = goal.metrics.map((metric) => ({ ...metric, weight: equalWeight }));
+  }
+
+  if (
+    goal.model === "consistency"
+    && goal.metrics.some((metric) => !hasConsistencyPeriodMetadata(metric))
+  ) {
+    // Legacy consistency counters were all-time current/target values. Guessing
+    // a calendar window would silently reset that progress later, so retain the
+    // measurement as an honest all-time numeric model instead.
+    goal.model = "numeric";
+    goal.metrics = goal.metrics.map((metric) => {
+      const { period: _period, periodKey: _periodKey, ...unscopedMetric } = metric;
+      void _period;
+      void _periodKey;
+      return unscopedMetric;
+    });
+  }
+}
+
 function sanitizeGoal(value: unknown, index: number, fallbackAt: string): Goal | null {
   if (!isRecord(value)) return null;
   const id = stringValue(value.id, `goal-migrated-${index + 1}`);
@@ -336,6 +376,7 @@ function sanitizeGoal(value: unknown, index: number, fallbackAt: string): Goal |
       weight: (milestone.weight / milestoneWeight) * 100,
     }));
   }
+  repairMigratedGoalProgress(goal);
   const targetDate = optionalValidDate(value.targetDate);
   const completedAt = optionalValidDate(value.completedAt);
   if (targetDate) goal.targetDate = targetDate;
@@ -1051,12 +1092,24 @@ function validateGoalStructure(goal: UnknownRecord, goalIndex: number, version: 
       importFailure(`${metricPath}.periodKey is not valid for ${metric.period}.`);
     }
   });
-  if (
-    (goal.model === "numeric" || goal.model === "consistency")
-    && metrics.length > 0
-    && !metrics.some((metric) => Number(metric.weight) > 0)
-  ) {
-    importFailure(`${path}.metrics must include at least one positive relative weight.`);
+  if (version >= CURRENT_STATE_VERSION && (goal.model === "numeric" || goal.model === "consistency")) {
+    if (!metrics.length) {
+      importFailure(`${path}.metrics must include at least one metric for the ${goal.model} model.`);
+    }
+    if (!metrics.some((metric) => Number(metric.weight) > 0)) {
+      importFailure(`${path}.metrics must include at least one positive relative weight.`);
+    }
+    if (goal.model === "consistency") {
+      metrics.forEach((metric, index) => {
+        const metricPath = `${path}.metrics[${index}]`;
+        if (!("period" in metric)) {
+          importFailure(`${metricPath}.period is required for a consistency metric.`);
+        }
+        if (!("periodKey" in metric)) {
+          importFailure(`${metricPath}.periodKey is required for a consistency metric.`);
+        }
+      });
+    }
   }
 
   let milestoneWeight = 0;
@@ -1171,6 +1224,8 @@ function assertCoherentWorkspace(state: AppState, version: number) {
 
   state.goals.forEach((goal) => {
     if (!areaIds.has(goal.areaId)) importFailure(`goal "${goal.id}" references missing area "${goal.areaId}".`);
+    const progressIssue = goalProgressConfigurationIssue(goal);
+    if (progressIssue) importFailure(`goal "${goal.id}" is inconsistent: ${progressIssue}`);
     goal.statIds.forEach((statId) => {
       if (!statIds.has(statId)) importFailure(`goal "${goal.id}" references missing quality "${statId}".`);
     });
@@ -1179,6 +1234,14 @@ function assertCoherentWorkspace(state: AppState, version: number) {
       quest.metricDeltas.forEach((delta) => {
         if (!metricIds.has(delta.metricId)) {
           importFailure(`action "${quest.id}" references missing metric "${delta.metricId}".`);
+        }
+      });
+      quest.linkedGoalIds.forEach((linkedGoalId) => {
+        if (linkedGoalId === goal.id) {
+          importFailure(`action "${quest.id}" cannot link primary goal "${goal.id}" as an additional goal.`);
+        }
+        if (!goals.has(linkedGoalId)) {
+          importFailure(`action "${quest.id}" references missing linked goal "${linkedGoalId}".`);
         }
       });
     });
@@ -1197,6 +1260,14 @@ function assertCoherentWorkspace(state: AppState, version: number) {
       if (!goals.has(completion.goalId)) {
         importFailure(`action history "${completion.id}" references missing goal "${completion.goalId}".`);
       }
+      completion.linkedGoalIds.forEach((linkedGoalId) => {
+        if (linkedGoalId === completion.goalId) {
+          importFailure(`action history "${completion.id}" cannot link primary goal "${completion.goalId}" as an additional goal.`);
+        }
+        if (!goals.has(linkedGoalId)) {
+          importFailure(`action history "${completion.id}" references missing linked goal "${linkedGoalId}".`);
+        }
+      });
       completion.goalSnapshots?.forEach((snapshot) => {
         if (!goals.has(snapshot.goalId)) importFailure(`action history "${completion.id}" attribution references missing goal "${snapshot.goalId}".`);
         assertAttributionReferences(snapshot, `action history "${completion.id}" attribution`);
@@ -1446,5 +1517,530 @@ export function parseImportedState(value: unknown, now = new Date().toISOString(
 
   const migrated = migrateState(value, now);
   assertCoherentWorkspace(migrated, version);
+  // Prime exact resource profiles at the untrusted boundary. Later internal
+  // copy-on-write commands can reuse every untouched subtree instead of
+  // serialising or walking the full workspace again.
+  profileJsonValue(migrated);
   return migrated;
+}
+
+const changedCollectionItems = <T extends object>(
+  previous: readonly T[],
+  next: readonly T[],
+) => {
+  const previousReferences = new Set<object>(previous);
+  return next.filter((item) => !previousReferences.has(item));
+};
+
+const removedCollectionIds = <T extends { id: string }>(
+  previous: readonly T[],
+  next: readonly T[],
+) => {
+  const nextIds = new Set(next.map((item) => item.id));
+  return previous.some((item) => !nextIds.has(item.id));
+};
+
+function validateCurrentSettingsStructure(settings: UnknownRecord) {
+  assertEnumField(settings, "theme", "workspace.settings", SETTINGS_THEMES, true);
+  assertEnumField(
+    settings,
+    "interfaceIntensity",
+    "workspace.settings",
+    INTERFACE_INTENSITIES,
+    true,
+  );
+  assertBooleanField(settings, "notifications", "workspace.settings", true);
+  const terminology = requiredRecord(settings, "terminology", "workspace.settings");
+  ["goals", "quests", "areas", "milestones", "stats"].forEach((key) =>
+    assertStringField(
+      terminology,
+      key,
+      "workspace.settings.terminology",
+      false,
+      WORKSPACE_TEXT_LIMITS.terminology,
+    ));
+  assertDateField(settings, "birthDate", "workspace.settings");
+  if (
+    "reminderTime" in settings
+    && (
+      typeof settings.reminderTime !== "string"
+      || !/^([01]\d|2[0-3]):[0-5]\d$/.test(settings.reminderTime)
+    )
+  ) {
+    importFailure("workspace.settings.reminderTime must use 24-hour HH:MM format.");
+  }
+  for (const key of ["dashboardOrder", "hiddenDashboardSections"] as const) {
+    const items = requiredArray(settings, key, "workspace.settings");
+    assertStringItems(items, `workspace.settings.${key}`);
+    if (new Set(items).size !== items.length) {
+      importFailure(`workspace.settings.${key} contains duplicate entries.`);
+    }
+    if (items.some((item) => !DASHBOARD_SECTIONS.includes(item as DashboardSectionId))) {
+      importFailure(`workspace.settings.${key} contains an unsupported section.`);
+    }
+  }
+}
+
+function validateCurrentReviewStructure(review: UnknownRecord, index: number) {
+  const path = `workspace.reviews[${index}]`;
+  assertEnumField(review, "cadence", path, REVIEW_CADENCES, true);
+  assertDateField(review, "createdAt", path, true);
+  if (!isRecord(review.answers)) importFailure(`${path}.answers must be an object.`);
+  if (Object.keys(review.answers).length > COLLECTION_LIMITS.reviewAnswers) {
+    importFailure(`${path}.answers cannot contain more than ${COLLECTION_LIMITS.reviewAnswers} entries.`);
+  }
+  Object.entries(review.answers).forEach(([key, answer]) => {
+    if (!key.trim() || key.length > WORKSPACE_TEXT_LIMITS.reviewAnswerKey) {
+      importFailure(`${path}.answers contains an invalid or overlong key.`);
+    }
+    if (typeof answer !== "string" || answer.length > WORKSPACE_TEXT_LIMITS.reviewAnswer) {
+      importFailure(`${path}.answers.${key} must be a string no longer than ${WORKSPACE_TEXT_LIMITS.reviewAnswer.toLocaleString()} characters.`);
+    }
+  });
+}
+
+function validateCurrentTimelineStructure(event: UnknownRecord, index: number) {
+  const path = `workspace.timeline[${index}]`;
+  assertStringField(event, "title", path, false, WORKSPACE_TEXT_LIMITS.timelineTitle);
+  assertStringField(event, "detail", path, true, WORKSPACE_TEXT_LIMITS.timelineDetail);
+  assertDateField(event, "at", path, true);
+  assertEnumField(event, "type", path, TIMELINE_TYPES, true);
+  if ("goalId" in event) assertStringField(event, "goalId", path, false);
+  if ("areaId" in event) assertStringField(event, "areaId", path, false);
+  for (const key of ["relatedGoalIds", "relatedAreaIds", "relatedStatIds"] as const) {
+    if (!(key in event)) continue;
+    const ids = requiredArray(event, key, path);
+    assertCollectionLimit(ids, `${path}.${key}`, COLLECTION_LIMITS.goalChildren);
+    assertStringItems(ids, `${path}.${key}`);
+    if (new Set(ids).size !== ids.length) {
+      importFailure(`${path}.${key} contains duplicate ids.`);
+    }
+  }
+}
+
+function validateCurrentCompletionStructure(
+  completion: UnknownRecord,
+  index: number,
+) {
+  const path = `workspace.questCompletions[${index}]`;
+  assertStringField(completion, "goalId", path, false);
+  assertStringField(completion, "questId", path, false);
+  assertStringField(completion, "title", path, false, WORKSPACE_TEXT_LIMITS.actionTitle);
+  const linkedGoalIds = validateLinkedGoalIds(completion, path);
+  if ("goalSnapshots" in completion) {
+    const snapshots = objectItems(
+      requiredArray(completion, "goalSnapshots", path),
+      `${path}.goalSnapshots`,
+    );
+    const snapshotGoalIds = snapshots.map((snapshot, snapshotIndex) => {
+      validateAttributionSnapshot(
+        snapshot,
+        `${path}.goalSnapshots[${snapshotIndex}]`,
+        true,
+      );
+      return snapshot.goalId as string;
+    });
+    if (new Set(snapshotGoalIds).size !== snapshotGoalIds.length) {
+      importFailure(`${path}.goalSnapshots contains duplicate goal ids.`);
+    }
+    const expectedGoalIds = new Set([
+      completion.goalId as string,
+      ...linkedGoalIds,
+    ]);
+    if (
+      snapshotGoalIds.length !== expectedGoalIds.size
+      || snapshotGoalIds.some((goalId) => !expectedGoalIds.has(goalId))
+    ) {
+      importFailure(`${path}.goalSnapshots must match the completion's primary and linked goals.`);
+    }
+  }
+  assertDateField(completion, "completedAt", path, true);
+  assertNumberField(completion, "durationMinutes", path, {
+    required: false,
+    minimum: 0,
+  });
+  if ("note" in completion) {
+    assertStringField(
+      completion,
+      "note",
+      path,
+      false,
+      WORKSPACE_TEXT_LIMITS.completionNote,
+    );
+  }
+  const evidence = requiredArray(completion, "evidence", path);
+  assertCollectionLimit(evidence, `${path}.evidence`, MAX_GOAL_EVIDENCE_ITEMS);
+  assertStringItems(evidence, `${path}.evidence`);
+  evidence.forEach((item, evidenceIndex) => {
+    if ((item as string).length > WORKSPACE_TEXT_LIMITS.completionEvidenceItem) {
+      importFailure(`${path}.evidence[${evidenceIndex}] cannot exceed ${WORKSPACE_TEXT_LIMITS.completionEvidenceItem.toLocaleString()} characters.`);
+    }
+  });
+  validateMetricDeltas(
+    requiredArray(completion, "metricDeltas", path),
+    `${path}.metricDeltas`,
+  );
+}
+
+function validateCurrentMetricEntryStructure(entry: UnknownRecord, index: number) {
+  const path = `workspace.metricEntries[${index}]`;
+  assertStringField(entry, "goalId", path, false);
+  assertStringField(entry, "metricId", path, false);
+  assertDateField(entry, "recordedAt", path, true);
+  assertNumberField(entry, "value", path, { minimum: 0 });
+  assertNumberField(entry, "previousValue", path, { minimum: 0 });
+  assertEnumField(entry, "source", path, METRIC_ENTRY_SOURCES, true);
+  assertOptionalBoundedString(entry, "label", path, 120);
+  assertOptionalBoundedString(entry, "unit", path, 32);
+  if ("sourceCompletionId" in entry) {
+    assertStringField(entry, "sourceCompletionId", path, false);
+  }
+  if ("periodKey" in entry) {
+    if (
+      typeof entry.periodKey !== "string"
+      || !CONSISTENCY_PERIODS.some((period) => isPeriodKey(period, entry.periodKey as string))
+    ) {
+      importFailure(`${path}.periodKey is not valid.`);
+    }
+  }
+  if ("attribution" in entry) {
+    validateAttributionSnapshot(entry.attribution, `${path}.attribution`);
+  }
+}
+
+/**
+ * Validates a trusted in-memory command result without migrating, cloning, or
+ * serialising the complete workspace. Only newly allocated records need full
+ * structural validation because provider transactions preserve references for
+ * every untouched record. Collection limits, identifiers, and affected
+ * cross-record invariants are still checked before the state can reach React.
+ */
+export function assertInternalWorkspaceTransition(
+  previous: AppState,
+  next: AppState,
+) {
+  const nextRecord = next as unknown as UnknownRecord;
+  if (next.version !== CURRENT_STATE_VERSION) {
+    importFailure(`workspace.version must remain ${CURRENT_STATE_VERSION}.`);
+  }
+  assertDateField(nextRecord, "updatedAt", "workspace", true);
+
+  if (next.profile !== previous.profile) {
+    const profile = requiredRecord(nextRecord, "profile");
+    assertStringField(
+      profile,
+      "displayName",
+      "workspace.profile",
+      true,
+      WORKSPACE_TEXT_LIMITS.profileName,
+    );
+    assertStringField(
+      profile,
+      "chapter",
+      "workspace.profile",
+      true,
+      WORKSPACE_TEXT_LIMITS.profileChapter,
+    );
+    assertBooleanField(profile, "onboarded", "workspace.profile", true);
+    assertDateField(profile, "createdAt", "workspace.profile", true);
+  }
+  if (next.settings !== previous.settings) {
+    validateCurrentSettingsStructure(requiredRecord(nextRecord, "settings"));
+  }
+  if (
+    next.areas === previous.areas
+    && next.stats === previous.stats
+    && next.goals === previous.goals
+    && next.questCompletions === previous.questCompletions
+    && next.metricEntries === previous.metricEntries
+    && next.reviews === previous.reviews
+    && next.timeline === previous.timeline
+  ) {
+    return;
+  }
+
+  const changedAreas = next.areas !== previous.areas;
+  if (changedAreas) {
+    const areas = objectItems(requiredArray(nextRecord, "areas"), "workspace.areas");
+    assertCollectionLimit(areas, "workspace.areas", COLLECTION_LIMITS.areas);
+    assertUniqueIds(areas, "workspace.areas");
+    const changed = changedCollectionItems(previous.areas, next.areas);
+    changed.forEach((area) => {
+      const index = next.areas.indexOf(area);
+      const path = `workspace.areas[${index}]`;
+      const record = area as unknown as UnknownRecord;
+      assertStringField(record, "name", path, false, WORKSPACE_TEXT_LIMITS.areaOrQualityName);
+      assertStringField(record, "color", path, false, WORKSPACE_TEXT_LIMITS.color);
+      assertStringField(record, "icon", path, false, WORKSPACE_TEXT_LIMITS.icon);
+      assertNumberField(record, "order", path, { minimum: 0, integer: true });
+      assertBooleanField(record, "hidden", path);
+      assertBooleanField(record, "archived", path);
+    });
+  }
+
+  const changedStats = next.stats !== previous.stats;
+  if (changedStats) {
+    const stats = objectItems(requiredArray(nextRecord, "stats"), "workspace.stats");
+    assertCollectionLimit(stats, "workspace.stats", COLLECTION_LIMITS.stats);
+    assertUniqueIds(stats, "workspace.stats");
+    const changed = changedCollectionItems(previous.stats, next.stats);
+    changed.forEach((stat) => {
+      const index = next.stats.indexOf(stat);
+      const path = `workspace.stats[${index}]`;
+      const record = stat as unknown as UnknownRecord;
+      assertStringField(record, "name", path, false, WORKSPACE_TEXT_LIMITS.areaOrQualityName);
+      assertStringField(record, "color", path, false, WORKSPACE_TEXT_LIMITS.color);
+      assertStringField(record, "icon", path, false, WORKSPACE_TEXT_LIMITS.icon);
+      assertBooleanField(record, "archived", path);
+    });
+  }
+
+  const changedGoals = next.goals === previous.goals
+    ? []
+    : changedCollectionItems(previous.goals, next.goals);
+  if (next.goals !== previous.goals) {
+    const goals = objectItems(requiredArray(nextRecord, "goals"), "workspace.goals");
+    assertCollectionLimit(goals, "workspace.goals", COLLECTION_LIMITS.goals);
+    assertUniqueIds(goals, "workspace.goals");
+    changedGoals.forEach((goal) => {
+      validateGoalStructure(
+        goal as unknown as UnknownRecord,
+        next.goals.indexOf(goal),
+        CURRENT_STATE_VERSION,
+      );
+    });
+  }
+
+  const changedReviews = next.reviews === previous.reviews
+    ? []
+    : changedCollectionItems(previous.reviews, next.reviews);
+  if (next.reviews !== previous.reviews) {
+    const reviews = objectItems(requiredArray(nextRecord, "reviews"), "workspace.reviews");
+    assertCollectionLimit(reviews, "workspace.reviews", COLLECTION_LIMITS.reviews);
+    assertUniqueIds(reviews, "workspace.reviews");
+    changedReviews.forEach((review) =>
+      validateCurrentReviewStructure(
+        review as unknown as UnknownRecord,
+        next.reviews.indexOf(review),
+      ));
+  }
+
+  const changedTimeline = next.timeline === previous.timeline
+    ? []
+    : changedCollectionItems(previous.timeline, next.timeline);
+  if (next.timeline !== previous.timeline) {
+    const timeline = objectItems(requiredArray(nextRecord, "timeline"), "workspace.timeline");
+    assertCollectionLimit(timeline, "workspace.timeline", COLLECTION_LIMITS.timeline);
+    assertUniqueIds(timeline, "workspace.timeline");
+    changedTimeline.forEach((event) =>
+      validateCurrentTimelineStructure(
+        event as unknown as UnknownRecord,
+        next.timeline.indexOf(event),
+      ));
+  }
+
+  const changedCompletions = next.questCompletions === previous.questCompletions
+    ? []
+    : changedCollectionItems(previous.questCompletions, next.questCompletions);
+  if (next.questCompletions !== previous.questCompletions) {
+    const completions = objectItems(
+      requiredArray(nextRecord, "questCompletions"),
+      "workspace.questCompletions",
+    );
+    assertCollectionLimit(
+      completions,
+      "workspace.questCompletions",
+      COLLECTION_LIMITS.questCompletions,
+    );
+    assertUniqueIds(completions, "workspace.questCompletions");
+    changedCompletions.forEach((completion) =>
+      validateCurrentCompletionStructure(
+        completion as unknown as UnknownRecord,
+        next.questCompletions.indexOf(completion),
+      ));
+  }
+
+  const changedMetricEntries = next.metricEntries === previous.metricEntries
+    ? []
+    : changedCollectionItems(previous.metricEntries, next.metricEntries);
+  if (next.metricEntries !== previous.metricEntries) {
+    const entries = objectItems(
+      requiredArray(nextRecord, "metricEntries"),
+      "workspace.metricEntries",
+    );
+    assertCollectionLimit(
+      entries,
+      "workspace.metricEntries",
+      COLLECTION_LIMITS.metricEntries,
+    );
+    assertUniqueIds(entries, "workspace.metricEntries");
+    changedMetricEntries.forEach((entry) =>
+      validateCurrentMetricEntryStructure(
+        entry as unknown as UnknownRecord,
+        next.metricEntries.indexOf(entry),
+      ));
+  }
+
+  const removedReferenceTarget = removedCollectionIds(previous.areas, next.areas)
+    || removedCollectionIds(previous.stats, next.stats)
+    || removedCollectionIds(previous.goals, next.goals)
+    || removedCollectionIds(previous.questCompletions, next.questCompletions);
+  if (removedReferenceTarget) {
+    assertCoherentWorkspace(next, CURRENT_STATE_VERSION);
+    return;
+  }
+
+  const areaIds = new Set(next.areas.map((area) => area.id));
+  const statIds = new Set(next.stats.map((stat) => stat.id));
+  const goals = new Map(next.goals.map((goal) => [goal.id, goal]));
+  const completions = new Map(
+    next.questCompletions.map((completion) => [completion.id, completion]),
+  );
+  const assertAttribution = (attribution: AttributionSnapshot, label: string) => {
+    if (!areaIds.has(attribution.areaId)) {
+      importFailure(`${label} references missing area "${attribution.areaId}".`);
+    }
+    attribution.statIds.forEach((statId) => {
+      if (!statIds.has(statId)) {
+        importFailure(`${label} references missing quality "${statId}".`);
+      }
+    });
+  };
+
+  changedGoals.forEach((goal) => {
+    if (!areaIds.has(goal.areaId)) {
+      importFailure(`goal "${goal.id}" references missing area "${goal.areaId}".`);
+    }
+    const issue = goalProgressConfigurationIssue(goal);
+    if (issue) importFailure(`goal "${goal.id}" is inconsistent: ${issue}`);
+    goal.statIds.forEach((statId) => {
+      if (!statIds.has(statId)) {
+        importFailure(`goal "${goal.id}" references missing quality "${statId}".`);
+      }
+    });
+    const metricIds = new Set(goal.metrics.map((metric) => metric.id));
+    goal.quests.forEach((quest) => {
+      quest.metricDeltas.forEach((delta) => {
+        if (!metricIds.has(delta.metricId)) {
+          importFailure(`action "${quest.id}" references missing metric "${delta.metricId}".`);
+        }
+      });
+      quest.linkedGoalIds.forEach((linkedGoalId) => {
+        if (linkedGoalId === goal.id) {
+          importFailure(`action "${quest.id}" cannot link primary goal "${goal.id}" as an additional goal.`);
+        }
+        if (!goals.has(linkedGoalId)) {
+          importFailure(`action "${quest.id}" references missing linked goal "${linkedGoalId}".`);
+        }
+      });
+    });
+    goal.milestones.forEach((milestone) => {
+      if (milestone.attribution) {
+        assertAttribution(
+          milestone.attribution,
+          `milestone "${milestone.id}" attribution`,
+        );
+      }
+    });
+    goal.checkIns.forEach((checkIn) => {
+      if (checkIn.attribution) {
+        assertAttribution(
+          checkIn.attribution,
+          `check-in "${checkIn.id}" attribution`,
+        );
+      }
+    });
+  });
+
+  changedCompletions.forEach((completion) => {
+    if (!goals.has(completion.goalId)) {
+      importFailure(`action history "${completion.id}" references missing goal "${completion.goalId}".`);
+    }
+    completion.linkedGoalIds.forEach((linkedGoalId) => {
+      if (linkedGoalId === completion.goalId) {
+        importFailure(`action history "${completion.id}" cannot link primary goal "${completion.goalId}" as an additional goal.`);
+      }
+      if (!goals.has(linkedGoalId)) {
+        importFailure(`action history "${completion.id}" references missing linked goal "${linkedGoalId}".`);
+      }
+    });
+    completion.goalSnapshots?.forEach((snapshot) => {
+      if (!goals.has(snapshot.goalId)) {
+        importFailure(`action history "${completion.id}" attribution references missing goal "${snapshot.goalId}".`);
+      }
+      assertAttribution(snapshot, `action history "${completion.id}" attribution`);
+    });
+  });
+
+  const completionIdsRequiringMetricChecks = new Set(
+    changedCompletions.map((completion) => completion.id),
+  );
+  const entriesRequiringCoherence = new Set<MetricEntry>(changedMetricEntries);
+  if (completionIdsRequiringMetricChecks.size) {
+    next.metricEntries.forEach((entry) => {
+      if (
+        entry.sourceCompletionId
+        && completionIdsRequiringMetricChecks.has(entry.sourceCompletionId)
+      ) {
+        entriesRequiringCoherence.add(entry);
+      }
+    });
+  }
+  const linkedMetricSources = new Set<string>();
+  next.metricEntries.forEach((entry) => {
+    if (!entry.sourceCompletionId) return;
+    const key = `${entry.sourceCompletionId}\u0000${entry.metricId}`;
+    if (linkedMetricSources.has(key)) {
+      importFailure("metric history contains a duplicate source completion and metric link.");
+    }
+    linkedMetricSources.add(key);
+  });
+  entriesRequiringCoherence.forEach((entry) => {
+    if (!goals.has(entry.goalId)) {
+      importFailure(`metric history "${entry.id}" references missing goal "${entry.goalId}".`);
+    }
+    if (entry.sourceCompletionId) {
+      const completion = completions.get(entry.sourceCompletionId);
+      if (
+        !completion
+        || completion.goalId !== entry.goalId
+        || entry.source !== "quest"
+      ) {
+        importFailure(`metric history "${entry.id}" has an invalid source completion link.`);
+      }
+      const sourceDelta = completion.metricDeltas.find(
+        (delta) => delta.metricId === entry.metricId,
+      );
+      if (!sourceDelta || sourceDelta.amount !== entry.value - entry.previousValue) {
+        importFailure(`metric history "${entry.id}" does not match its source completion delta.`);
+      }
+    }
+    if (entry.attribution) {
+      assertAttribution(entry.attribution, `metric history "${entry.id}" attribution`);
+    }
+  });
+
+  changedTimeline.forEach((event) => {
+    if (event.goalId && !goals.has(event.goalId)) {
+      importFailure(`timeline event "${event.id}" references missing goal "${event.goalId}".`);
+    }
+    if (event.areaId && !areaIds.has(event.areaId)) {
+      importFailure(`timeline event "${event.id}" references missing area "${event.areaId}".`);
+    }
+    event.relatedGoalIds?.forEach((goalId) => {
+      if (!goals.has(goalId)) {
+        importFailure(`timeline event "${event.id}" attribution references missing goal "${goalId}".`);
+      }
+    });
+    event.relatedAreaIds?.forEach((areaId) => {
+      if (!areaIds.has(areaId)) {
+        importFailure(`timeline event "${event.id}" attribution references missing area "${areaId}".`);
+      }
+    });
+    event.relatedStatIds?.forEach((statId) => {
+      if (!statIds.has(statId)) {
+        importFailure(`timeline event "${event.id}" attribution references missing quality "${statId}".`);
+      }
+    });
+  });
 }

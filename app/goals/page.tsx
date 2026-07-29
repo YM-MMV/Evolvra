@@ -8,8 +8,9 @@ import { useApp } from "@/components/app-provider";
 import { GoalForm } from "@/components/goal-form";
 import { GoalCard } from "@/components/goal-card";
 import { Button, EmptyState, Pill, ProgressBar } from "@/components/ui";
+import { terminologyForms } from "@/lib/terminology";
 import type { GoalStatus } from "@/lib/types";
-import { getArea, goalProgress, shortDate, singularizeTerm } from "@/lib/utils";
+import { getArea, goalProgress, shortDate } from "@/lib/utils";
 
 type View = "cards" | "list" | "board";
 
@@ -24,9 +25,7 @@ function GoalsContent() {
   const [status, setStatus] = useState<GoalStatus | "all">("active");
   const [area, setArea] = useState("all");
   const [query, setQuery] = useState("");
-  const terms = state.settings.terminology;
-  const goalTerm = singularizeTerm(terms.goals);
-  const areaTerm = singularizeTerm(terms.areas);
+  const terms = terminologyForms(state.settings.terminology);
   const formRequestedByUrl = searchParams.get("new") === "true";
 
   const closeGoalForm = () => {
@@ -56,20 +55,20 @@ function GoalsContent() {
       <section className="page-header">
         <div>
           <p className="eyebrow">Outcomes over activity</p>
-          <h1>Your {state.settings.terminology.goals.toLowerCase()}</h1>
+          <h1>Your {terms.goals.pluralLower}</h1>
           <p className="page-lead">Define what matters, choose an honest measurement, and always know the next useful action.</p>
         </div>
-        <Button type="button" onClick={() => setFormOpen(true)}><Plus size={17} aria-hidden="true" /> New {goalTerm.toLowerCase()}</Button>
+        <Button type="button" onClick={() => setFormOpen(true)}><Plus size={17} aria-hidden="true" /> New {terms.goals.singularLower}</Button>
       </section>
 
       <div className="toolbar panel">
-        <div className="search-box"><Search size={17} aria-hidden="true" /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder={`Search ${terms.goals.toLowerCase()}…`} aria-label={`Search ${terms.goals.toLowerCase()}`} /></div>
+        <div className="search-box"><Search size={17} aria-hidden="true" /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder={`Search ${terms.goals.pluralLower}…`} aria-label={`Search ${terms.goals.pluralLower}`} /></div>
         <select
           value={view === "board" ? "all" : status}
           onChange={(event) => setStatus(event.target.value as GoalStatus | "all")}
           disabled={view === "board"}
-          aria-label={`Filter ${terms.goals.toLowerCase()} by status`}
-          title={view === "board" ? `Board view shows every ${goalTerm.toLowerCase()} status` : `Filter ${terms.goals.toLowerCase()} by status`}
+          aria-label={`Filter ${terms.goals.pluralLower} by status`}
+          title={view === "board" ? `Board view shows every ${terms.goals.singularLower} status` : `Filter ${terms.goals.pluralLower} by status`}
         >
           <option value="all">Every status</option>
           <option value="active">Active</option>
@@ -77,11 +76,11 @@ function GoalsContent() {
           <option value="completed">Completed</option>
           <option value="archived">Archived</option>
         </select>
-        <select value={area} onChange={(event) => setArea(event.target.value)} aria-label={`Filter ${terms.goals.toLowerCase()} by ${areaTerm.toLowerCase()}`}>
-          <option value="all">Every {areaTerm.toLowerCase()}</option>
+        <select value={area} onChange={(event) => setArea(event.target.value)} aria-label={`Filter ${terms.goals.pluralLower} by ${terms.areas.singularLower}`}>
+          <option value="all">Every {terms.areas.singularLower}</option>
           {state.areas.filter((item) => !item.archived).map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
         </select>
-        <div className="view-switcher" role="group" aria-label={`${goalTerm} layout`}>
+        <div className="view-switcher" role="group" aria-label={`${terms.goals.singular} layout`}>
           <button type="button" className={view === "cards" ? "active" : ""} onClick={() => setView("cards")} aria-label="Card view" aria-pressed={view === "cards"}><LayoutGrid size={17} aria-hidden="true" /></button>
           <button type="button" className={view === "list" ? "active" : ""} onClick={() => setView("list")} aria-label="List view" aria-pressed={view === "list"}><List size={18} aria-hidden="true" /></button>
           <button type="button" className={view === "board" ? "active" : ""} onClick={() => setView("board")} aria-label="Board view" aria-pressed={view === "board"}><Columns3 size={17} aria-hidden="true" /></button>
@@ -89,16 +88,16 @@ function GoalsContent() {
       </div>
 
       {view === "board" ? (
-        <div className="goal-board" aria-label={`${terms.goals} grouped by workflow status`}>
+        <div className="goal-board" aria-label={`${terms.goals.plural} grouped by workflow status`}>
           {boardColumns.map((column) => {
             const columnGoals = matchingGoals.filter((goal) => goal.status === column);
             const headingId = `goal-column-${column}`;
             return (
               <section key={column} aria-labelledby={headingId}>
-                <header><h3 id={headingId}>{column}</h3><span aria-label={`${columnGoals.length} ${column} ${terms.goals.toLowerCase()}`}>{columnGoals.length}</span></header>
+                <header><h3 id={headingId}>{column}</h3><span aria-label={`${columnGoals.length} ${column} ${terms.goals.pluralLower}`}>{columnGoals.length}</span></header>
                 <div>
                   {columnGoals.map((goal) => <GoalCard key={goal.id} goal={goal} area={getArea(state, goal.areaId)} />)}
-                  {!columnGoals.length && <p className="supportive-copy">No {column} {terms.goals.toLowerCase()} match these filters.</p>}
+                  {!columnGoals.length && <p className="supportive-copy">No {column} {terms.goals.pluralLower} match these filters.</p>}
                 </div>
               </section>
             );
@@ -107,19 +106,19 @@ function GoalsContent() {
       ) : !filteredGoals.length ? (
         <EmptyState
           icon={<GoalIcon />}
-          title={`No ${terms.goals.toLowerCase()} in this view`}
+          title={`No ${terms.goals.pluralLower} in this view`}
           body="Adjust the filters or create an outcome that deserves your attention."
-          action={<Button type="button" onClick={() => setFormOpen(true)}>Create a {goalTerm.toLowerCase()}</Button>}
+          action={<Button type="button" onClick={() => setFormOpen(true)}>Create a {terms.goals.singularLower}</Button>}
         />
       ) : view === "cards" ? (
         <div className="goal-grid goals-page-grid">{filteredGoals.map((goal) => <GoalCard key={goal.id} goal={goal} area={getArea(state, goal.areaId)} />)}</div>
       ) : (
-        <div className="goal-table panel" aria-label={`${terms.goals} list`}>
+        <div className="goal-table panel" aria-label={`${terms.goals.plural} list`}>
           {filteredGoals.map((goal) => {
             const goalArea = getArea(state, goal.areaId);
             const progress = goalProgress(goal);
             return (
-              <Link href={`/goals/${goal.id}`} key={goal.id} className="goal-table-row" aria-label={`Open ${goalTerm.toLowerCase()}: ${goal.title}`}>
+              <Link href={`/goals/${goal.id}`} key={goal.id} className="goal-table-row" aria-label={`Open ${terms.goals.singularLower}: ${goal.title}`}>
                 <span className="area-dot" style={{ background: goalArea?.color }} aria-hidden="true" />
                 <div className="goal-table-title"><strong>{goal.title}</strong><small>{goalArea?.name ?? "Unassigned"} · {goal.status}</small></div>
                 <Pill>{goal.priority}</Pill>

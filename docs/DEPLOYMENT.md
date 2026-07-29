@@ -11,8 +11,8 @@ Use Supabase CLI `2.109.1` for this release. The CI workflow and operator comman
 1. Use Node 24 and npm 11 (`.nvmrc` and `packageManager` are authoritative).
 2. From a clean checkout of the release commit, run `npm ci` and `npm run check`.
 3. Require both hosted GitHub Actions jobs to pass on that exact commit.
-4. Build a protected Vercel release deployment, but do not promote or open its sync flows yet.
-5. Configure `NEXT_PUBLIC_SUPABASE_URL` and `NEXT_PUBLIC_SUPABASE_ANON_KEY` for the target environment. Never expose a service-role key. In hosted Supabase Auth, verify the production Site URL and every callback URL used for the release deployment. Leave `NEXT_PUBLIC_EVOLVRA_TELEMETRY_ENABLED` unset or `false` unless the release owner has intentionally approved the privacy-safe hosting-log sink, retention policy, and infrastructure-wide traffic controls; the beta default is off.
+4. Use the protected Preview deployment for visual review, then prepare a **staged Production deployment** from the exact release commit with automatic production-domain assignment disabled. A normal Preview → Production promotion performs a fresh build with Production environment variables, so the Preview artifact is not the cutover artifact. A staged Production deployment can be inspected with Production variables and promoted without rebuilding; follow Vercel's [staged Production deployment procedure](https://vercel.com/docs/deployments/promoting-a-deployment#staging-and-promoting-a-production-deployment).
+5. Configure `NEXT_PUBLIC_SUPABASE_URL` and `NEXT_PUBLIC_SUPABASE_ANON_KEY` for the target environment before building the staged Production deployment. Never expose a service-role key. In hosted Supabase Auth, verify the production Site URL and every callback URL used for the release deployment. The stable release-branch preview alias is `https://evolvra-git-agent-remove-xp-levels-ym-mmv1.vercel.app`; immutable Vercel deployment URLs change on every build and should not be used as the long-lived callback. The local `supabase/config.toml` documents the intended allow-list, but `db push` applies migrations only—verify or update hosted Auth configuration separately. Leave `NEXT_PUBLIC_EVOLVRA_TELEMETRY_ENABLED` unset or `false` unless the release owner has intentionally approved the privacy-safe hosting-log sink, retention policy, and infrastructure-wide traffic controls; the beta default is off.
 6. Link the intended Supabase project and inspect its migration history with `npx supabase@2.109.1 migration list --linked`. Stop if the project, Postgres major version, or applied migration list is unexpected.
 7. Create and record a current provider-supported database backup. Record the deployment/rollback owner and how private evidence objects are protected; a workspace JSON export contains evidence metadata, not device-only file bytes.
 8. Review the pending database change with `npx supabase@2.109.1 db push --dry-run`.
@@ -24,7 +24,7 @@ This release cannot safely mix the old client and new database contract. Migrati
 When production Supabase sync is enabled:
 
 1. Set a short cutover window and stop active signed-in editing on the old client. Close or reload old Evolvra tabs so they cannot attempt a stale direct save during the transition.
-2. Confirm the protected state-v3 deployment is built and ready to promote.
+2. Confirm the staged Production deployment was built from the exact release commit with the reviewed Production environment variables and is ready to promote without rebuilding.
 3. Apply the full pending chain with `npx supabase@2.109.1 db push`.
 4. Immediately promote the prepared state-v3 deployment.
 5. Re-run `npx supabase@2.109.1 migration list --linked` and record the result.

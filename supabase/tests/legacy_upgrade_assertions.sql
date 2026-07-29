@@ -34,6 +34,7 @@ begin
       or (table_name = 'quests' and column_name in ('effort', 'difficulty', 'impact', 'xp'))
       or (table_name = 'quest_completions' and column_name = 'xp_awarded')
       or (table_name = 'user_settings' and column_name = 'scoring')
+      or (table_name = 'user_settings' and column_name = 'game_intensity')
     );
 
   if unexpected_retired_columns <> 0 then
@@ -55,6 +56,7 @@ begin
       ('quest_completions', 'title'),
       ('quest_completions', 'metric_deltas'),
       ('quest_completions', 'linked_goal_ids'),
+      ('user_settings', 'interface_intensity'),
       ('workspace_snapshots', 'revision')
   ) as expected(table_name, column_name)
   where not exists (
@@ -223,7 +225,7 @@ begin
     from public.user_settings
     where user_id = '90000000-0000-0000-0000-000000000001'
       and theme = 'light'
-      and game_intensity = 'minimal'
+      and interface_intensity = 'minimal'
       and terminology ->> 'goals' = 'Outcomes'
       and dashboard_preferences -> 'order' = '["goals"]'::jsonb
       and notifications

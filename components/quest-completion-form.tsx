@@ -5,8 +5,9 @@ import { CheckCircle2 } from "lucide-react";
 import { useApp } from "@/components/app-provider";
 import { Button, Field, Modal } from "@/components/ui";
 import { WORKSPACE_TEXT_LIMITS } from "@/lib/state-schema";
+import { terminologyForms } from "@/lib/terminology";
 import type { Quest } from "@/lib/types";
-import { isFiniteWorkspaceNumber, MAX_WORKSPACE_NUMBER, singularizeTerm } from "@/lib/utils";
+import { isFiniteWorkspaceNumber, MAX_WORKSPACE_NUMBER } from "@/lib/utils";
 
 export function QuestCompletionForm({
   goalId,
@@ -21,7 +22,7 @@ export function QuestCompletionForm({
 }) {
   const { state, completeQuest } = useApp();
   const goal = state.goals.find((item) => item.id === goalId);
-  const goalTerm = singularizeTerm(state.settings.terminology.goals);
+  const terms = terminologyForms(state.settings.terminology);
   const [duration, setDuration] = useState(quest.durationMinutes === undefined ? "" : String(quest.durationMinutes));
   const [note, setNote] = useState("");
   const [evidence, setEvidence] = useState("");
@@ -89,7 +90,7 @@ export function QuestCompletionForm({
             </div>
           </div>
         ) : null}
-        <Field label="Evidence notes or links" hint={`Optional — one item per line. File evidence can still be attached from the ${goalTerm.toLowerCase()} page.`}>
+        <Field label="Evidence notes or links" hint={`Optional — one item per line. File evidence can still be attached from the ${terms.goals.singularLower} page.`}>
           <textarea rows={3} maxLength={WORKSPACE_TEXT_LIMITS.completionEvidenceItem * 100} value={evidence} onChange={(event) => setEvidence(event.target.value.split("\n").slice(0, 100).map((item) => item.slice(0, WORKSPACE_TEXT_LIMITS.completionEvidenceItem)).join("\n"))} placeholder="https://…\nShort note about the result" />
         </Field>
         {(!durationValid || !deltasValid) && <p className="evidence-message" role="alert">Use finite numbers within the supported range before recording this completion.</p>}

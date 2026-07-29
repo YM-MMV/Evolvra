@@ -2,13 +2,13 @@ import { describe, expect, it, vi } from "vitest";
 import {
   adoptExistingAccountErasureFence,
   prepareAnonymousHandoffEvidenceCopies,
-  remoteEvidencePath,
   settleOutgoingWorkspaceWrite,
   workspaceNoticeForActiveAccount,
-  workspaceStatesEqual,
-} from "@/components/app-provider";
+} from "@/lib/provider-account-boundaries";
 import { EMPTY_STATE } from "@/lib/defaults";
+import { remoteEvidencePath } from "@/lib/provider-evidence";
 import { LocalWorkspaceConflictError, PersistenceError } from "@/lib/persistence";
+import { workspaceStatesEqual } from "@/lib/provider-state";
 import type { GoalFileEvidence } from "@/lib/types";
 import type { WorkspaceFileEvidenceCopy } from "@/lib/workspace-merge";
 

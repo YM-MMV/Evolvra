@@ -4,7 +4,7 @@ import { completeOnboarding } from "./helpers";
 test("dashboard aggregates link to their source records", async ({ page }) => {
   await completeOnboarding(page, { name: "Trace Tester", starter: true });
 
-  await expect(page.getByRole("link", { name: /Inspect \d+ completed actions/ })).toHaveAttribute("href", "/timeline?type=quest");
+  await expect(page.getByRole("link", { name: /Inspect \d+ completed quests/ })).toHaveAttribute("href", "/timeline?type=quest");
   await expect(page.getByRole("link", { name: /Inspect \d+ reached milestones/ })).toHaveAttribute("href", "/timeline?type=milestone");
   await expect(page.getByRole("link", { name: /^Inspect \d+ active days$/ })).toHaveAttribute("href", "/timeline?type=activity");
 
@@ -55,13 +55,14 @@ test("mobile layouts wrap metadata instead of removing it", async ({ page }) => 
   await expect(statRow.locator(".pill")).toBeVisible();
 });
 
-test("review copy follows configured terminology", async ({ page }) => {
+test("configured terminology follows every primary route", async ({ page }) => {
   await completeOnboarding(page, { name: "Terms Tester", starter: true });
   await page.goto("/settings");
   await page.getByRole("button", { name: "Terminology" }).click();
 
   for (const [label, value] of [
     ["Default: Goals", "Missions"],
+    ["Default: Quests", "Rituals"],
     ["Default: Areas", "Realms"],
     ["Default: Milestones", "Chapters"],
     ["Default: Stats", "Attributes"],
@@ -71,11 +72,61 @@ test("review copy follows configured terminology", async ({ page }) => {
     await input.press("Tab");
   }
   await expect(page.getByRole("link", { name: "Missions" })).toBeVisible();
+  await expect(page.getByRole("link", { name: "Rituals" })).toBeVisible();
   await expect(page.getByRole("link", { name: "Attributes" })).toBeVisible();
+  await expect(page.locator(".sync-indicator")).toContainText("Private on this device");
+
+  await page.goto("/");
+  await expect(page.getByRole("heading", { name: "Your current missions" })).toBeVisible();
+  await expect(page.getByText("Rituals completed", { exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Connected attributes" })).toBeVisible();
+  await expect(page.locator('[role="status"]').filter({
+    hasText: "Offline support is ready for 3 current missions.",
+  })).toBeAttached();
+
+  await page.goto("/goals");
+  await expect(page.getByRole("heading", { name: "Your missions" })).toBeVisible();
+  await expect(page.getByPlaceholder("Search missions…")).toBeVisible();
+  await page.getByRole("link", { name: /Open mission: Build my personal command centre/ }).click();
+  await page.getByRole("button", { name: "More mission actions" }).click();
+  await page.getByRole("button", { name: "Edit mission" }).click();
+  const editMission = page.getByRole("dialog", { name: "Edit mission" });
+  await editMission.getByLabel("Progress model").selectOption("numeric");
+  await expect(editMission.getByRole("alert")).toContainText(
+    "A numeric or consistency mission needs at least one metric.",
+  );
+  await editMission.getByRole("button", { name: "Cancel" }).click();
+
+  await page.goto("/goals");
+  await page.getByRole("link", { name: /Open mission: Build dependable cardiovascular fitness/ }).click();
+  await expect(page.getByRole("heading", { name: "Chapter path" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Ritual board" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Connected attributes" })).toBeVisible();
+
+  await page.goto("/quests");
+  await expect(page.getByRole("heading", { name: "Rituals board" })).toBeVisible();
+  await expect(page.getByPlaceholder("Search rituals…")).toBeVisible();
+
+  await page.goto("/stats");
+  await expect(page.getByRole("heading", { name: "Your attributes" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Recorded moments by attribute" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Attribute history" })).toBeVisible();
+
+  await page.goto("/timeline");
+  await expect(page.getByRole("option", { name: "Completed rituals" })).toBeAttached();
+  await expect(page.getByRole("option", { name: "Chapters" })).toBeAttached();
+  await expect(page.getByRole("option", { name: "Mission changes" })).toBeAttached();
+
+  await page.goto("/settings");
+  await page.getByRole("button", { name: "Realms & Attributes" }).click();
+  await expect(page.getByRole("heading", { name: "Realms" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Attributes" })).toBeVisible();
+  await expect(page.getByText("Use attributes to group the missions and rituals that develop different parts of your life.")).toBeVisible();
 
   await page.getByRole("link", { name: "Reviews" }).click();
   await expect(page.getByLabel("1. Where did my missions move?")).toBeVisible();
   await expect(page.getByLabel("2. Which attributes did I develop?")).toBeVisible();
+  await expect(page.getByText("Rituals completed", { exact: true })).toBeVisible();
   await expect(page.getByRole("heading", { name: "Dates and quiet missions" })).toBeVisible();
   await expect(page.getByRole("heading", { name: "How missions changed this week" })).toBeVisible();
   await page.getByRole("button", { name: "monthly" }).click();

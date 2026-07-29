@@ -7,8 +7,9 @@ import { useApp } from "@/components/app-provider";
 import { QuestCompletionForm } from "@/components/quest-completion-form";
 import { EmptyState, Panel, Pill } from "@/components/ui";
 import { completionAttribution, completionGoalIds } from "@/lib/activity-attribution";
+import { terminologyForms } from "@/lib/terminology";
 import type { Goal } from "@/lib/types";
-import { formatDate, getArea, isQuestAvailable, localDateKey, singularizeTerm } from "@/lib/utils";
+import { formatDate, getArea, isQuestAvailable, localDateKey } from "@/lib/utils";
 
 type QuestView = "available" | "completed" | "all";
 type CompletionTarget = { goalId: string; questId: string };
@@ -33,10 +34,7 @@ export default function QuestsPage() {
   const [completionTarget, setCompletionTarget] = useState<CompletionTarget | null>(null);
   const [visibleCompletions, setVisibleCompletions] = useState(50);
   const today = localDateKey();
-  const terms = state.settings.terminology;
-  const questTerm = singularizeTerm(terms.quests);
-  const goalTerm = singularizeTerm(terms.goals);
-  const areaTerm = singularizeTerm(terms.areas);
+  const terms = terminologyForms(state.settings.terminology);
   const goalsById = useMemo(() => new Map(state.goals.map((goal) => [goal.id, goal])), [state.goals]);
 
   const quests = useMemo(() => {
@@ -107,29 +105,29 @@ export default function QuestsPage() {
     <div>
       <section className="page-header">
         <div>
-          <p className="eyebrow">Actions with purpose</p>
-          <h1>{state.settings.terminology.quests} board</h1>
-          <p className="page-lead">Choose actions that move a real {goalTerm.toLowerCase()}. Missing a day never destroys your progress.</p>
+          <p className="eyebrow">{terms.quests.plural} with purpose</p>
+          <h1>{terms.quests.plural} board</h1>
+          <p className="page-lead">Choose {terms.quests.pluralLower} that move a real {terms.goals.singularLower}. Missing a day never destroys your progress.</p>
         </div>
-        <Link href="/goals" className="button button-primary"><Plus size={17} aria-hidden="true" /> Add through a {goalTerm.toLowerCase()}</Link>
+        <Link href="/goals" className="button button-primary"><Plus size={17} aria-hidden="true" /> Add through a {terms.goals.singularLower}</Link>
       </section>
 
       <div className="toolbar panel">
-        <div className="search-box"><Search size={17} aria-hidden="true" /><input value={query} onChange={(event) => { setQuery(event.target.value); setVisibleCompletions(50); }} placeholder={`Search ${terms.quests.toLowerCase()}…`} aria-label={`Search ${terms.quests.toLowerCase()} and completion history`} /></div>
-        <div className="filter-tabs" role="group" aria-label={`${questTerm} view`}>
+        <div className="search-box"><Search size={17} aria-hidden="true" /><input value={query} onChange={(event) => { setQuery(event.target.value); setVisibleCompletions(50); }} placeholder={`Search ${terms.quests.pluralLower}…`} aria-label={`Search ${terms.quests.pluralLower} and completion history`} /></div>
+        <div className="filter-tabs" role="group" aria-label={`${terms.quests.singular} view`}>
           <button type="button" className={view === "available" ? "active" : ""} onClick={() => { setView("available"); setVisibleCompletions(50); }} aria-pressed={view === "available"}>Available</button>
           <button type="button" className={view === "completed" ? "active" : ""} onClick={() => { setView("completed"); setVisibleCompletions(50); }} aria-pressed={view === "completed"}>Completed</button>
           <button type="button" className={view === "all" ? "active" : ""} onClick={() => { setView("all"); setVisibleCompletions(50); }} aria-pressed={view === "all"}>All</button>
         </div>
-        <label className="select-with-icon"><Filter size={15} aria-hidden="true" /><select value={areaId} onChange={(event) => { setAreaId(event.target.value); setVisibleCompletions(50); }} aria-label={`Filter ${terms.quests.toLowerCase()} by ${areaTerm.toLowerCase()}`}><option value="all">Every {areaTerm.toLowerCase()}</option>{state.areas.map((area) => <option key={area.id} value={area.id}>{area.name}</option>)}</select></label>
+        <label className="select-with-icon"><Filter size={15} aria-hidden="true" /><select value={areaId} onChange={(event) => { setAreaId(event.target.value); setVisibleCompletions(50); }} aria-label={`Filter ${terms.quests.pluralLower} by ${terms.areas.singularLower}`}><option value="all">Every {terms.areas.singularLower}</option>{state.areas.map((area) => <option key={area.id} value={area.id}>{area.name}</option>)}</select></label>
       </div>
 
       {view === "completed" ? (
         !completionHistory.length ? (
-          <EmptyState icon={<CheckCircle2 />} title="No recorded actions yet" body={`Completed one-off and repeating ${terms.quests.toLowerCase()} will appear here as a dated history.`} />
+          <EmptyState icon={<CheckCircle2 />} title={`No recorded ${terms.quests.pluralLower} yet`} body={`Completed one-off and repeating ${terms.quests.pluralLower} will appear here as a dated history.`} />
         ) : (
           <section aria-labelledby="completion-history-heading">
-            <div className="section-heading compact"><div><p className="eyebrow">Completion history</p><h2 id="completion-history-heading">Recorded actions</h2></div><span className="count-badge">{completionHistory.length}</span></div>
+            <div className="section-heading compact"><div><p className="eyebrow">Completion history</p><h2 id="completion-history-heading">Recorded {terms.quests.pluralLower}</h2></div><span className="count-badge">{completionHistory.length}</span></div>
             <Panel className="quest-board-list">
               {completionHistory.slice(0, visibleCompletions).map(({ completion, goal, connectedGoals, attribution }) => {
                 if (!goal) return null;
@@ -141,7 +139,7 @@ export default function QuestsPage() {
                       <strong>{completion.title}</strong>
                       {completion.note && <small title={completion.note}>{completion.note}</small>}
                       {evidencePreview && <small title={completion.evidence.join(" · ")}>Evidence: {evidencePreview}</small>}
-                      {connectedGoals.map((connectedGoal) => { const connectedArea = getArea(state, connectedGoal.areaId); return <Link key={connectedGoal.id} href={`/goals/${connectedGoal.id}`} aria-label={`Open connected ${goalTerm.toLowerCase()} ${connectedGoal.title}`}><i style={{ background: connectedArea?.color }} aria-hidden="true" />{connectedGoal.title}</Link>; })}
+                      {connectedGoals.map((connectedGoal) => { const connectedArea = getArea(state, connectedGoal.areaId); return <Link key={connectedGoal.id} href={`/goals/${connectedGoal.id}`} aria-label={`Open connected ${terms.goals.singularLower} ${connectedGoal.title}`}><i style={{ background: connectedArea?.color }} aria-hidden="true" />{connectedGoal.title}</Link>; })}
                     </div>
                     <div className="quest-tags">
                       <Pill><CalendarDays size={12} aria-hidden="true" /> <time dateTime={completion.completedAt}>{formatDate(completion.completedAt)}</time></Pill>
@@ -163,15 +161,15 @@ export default function QuestsPage() {
       ) : !quests.length ? (
         <EmptyState
           icon={<CheckCircle2 />}
-          title={view === "available" ? "No actions are due" : `No ${terms.quests.toLowerCase()} in this view`}
-          body={view === "available" ? "A clear list is allowed. Add the next useful action when you are ready." : `Adjust the filters or add an action through one of your ${terms.goals.toLowerCase()}.`}
+          title={view === "available" ? `No ${terms.quests.pluralLower} are due` : `No ${terms.quests.pluralLower} in this view`}
+          body={view === "available" ? `A clear list is allowed. Add the next useful ${terms.quests.singularLower} when you are ready.` : `Adjust the filters or add a ${terms.quests.singularLower} through one of your ${terms.goals.pluralLower}.`}
         />
       ) : (
         <div className="quest-groups">
           {groupOrder.filter((group) => grouped[group]).map((group) => (
             <section key={group} aria-labelledby={`quest-group-${group.replaceAll(" ", "-").toLowerCase()}`}>
               <div className="section-heading compact">
-                <div><p className="eyebrow">{group}</p><h2 id={`quest-group-${group.replaceAll(" ", "-").toLowerCase()}`}>{group === "Completed" ? "Completed definitions" : group === "Paused or inactive" ? "Unavailable actions" : `${group} ${terms.quests.toLowerCase()}`}</h2></div>
+                <div><p className="eyebrow">{group}</p><h2 id={`quest-group-${group.replaceAll(" ", "-").toLowerCase()}`}>{group === "Completed" ? `Completed ${terms.quests.pluralLower}` : group === "Paused or inactive" ? `Unavailable ${terms.quests.pluralLower}` : `${group} ${terms.quests.pluralLower}`}</h2></div>
                 <span className="count-badge">{grouped[group].length}</span>
               </div>
               <Panel className="quest-board-list">
@@ -199,10 +197,10 @@ export default function QuestsPage() {
                       <div className="quest-board-copy">
                         <strong>{quest.title}</strong>
                         {quest.description && <small title={quest.description}>{quest.description}</small>}
-                        {connectedGoals.map((connectedGoal) => { const connectedArea = getArea(state, connectedGoal.areaId); return <Link key={connectedGoal.id} href={`/goals/${connectedGoal.id}`} aria-label={`Open connected ${goalTerm.toLowerCase()} ${connectedGoal.title}`}><i style={{ background: connectedArea?.color }} aria-hidden="true" />{connectedGoal.title}</Link>; })}
+                        {connectedGoals.map((connectedGoal) => { const connectedArea = getArea(state, connectedGoal.areaId); return <Link key={connectedGoal.id} href={`/goals/${connectedGoal.id}`} aria-label={`Open connected ${terms.goals.singularLower} ${connectedGoal.title}`}><i style={{ background: connectedArea?.color }} aria-hidden="true" />{connectedGoal.title}</Link>; })}
                       </div>
                       <div className="quest-tags">
-                        {goal.status !== "active" && <Pill>{goal.status} {goalTerm.toLowerCase()}</Pill>}
+                        {goal.status !== "active" && <Pill>{goal.status} {terms.goals.singularLower}</Pill>}
                         <Pill>{quest.kind}</Pill>
                         {quest.repeat !== "none" && <Pill><Repeat2 size={12} aria-hidden="true" /> {quest.repeat}</Pill>}
                         {quest.dueDate && <Pill><CalendarDays size={12} aria-hidden="true" /> <time dateTime={quest.dueDate}>{dueLabel}</time></Pill>}

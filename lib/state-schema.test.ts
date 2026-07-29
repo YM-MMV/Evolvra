@@ -1456,7 +1456,113 @@ describe("strict backup imports", () => {
     expect(() => parseImportedState(timeline)).toThrow(/detail cannot exceed 5,000 characters/i);
   });
 
-  it("preserves valid consistency windows and removes invalid window fields during tolerant recovery", () => {
+  it("enforces measured-goal and consistency-period invariants at the state-v3 boundary", () => {
+    const current = parseImportedState(validV2Backup(), NOW);
+
+    const missingMetric = structuredClone(current);
+    missingMetric.goals[0].metrics = [];
+    expect(() => parseImportedState(missingMetric, NOW)).toThrow(
+      /metrics must include at least one metric/i,
+    );
+
+    const zeroWeights = structuredClone(current);
+    zeroWeights.goals[0].metrics = zeroWeights.goals[0].metrics
+      .map((metric) => ({ ...metric, weight: 0 }));
+    expect(() => parseImportedState(zeroWeights, NOW)).toThrow(
+      /at least one positive relative weight/i,
+    );
+
+    const missingPeriod = structuredClone(current);
+    delete missingPeriod.goals[0].metrics[0].period;
+    delete missingPeriod.goals[0].metrics[0].periodKey;
+    expect(() => parseImportedState(missingPeriod, NOW)).toThrow(
+      /period is required for a consistency metric/i,
+    );
+
+    const missingPeriodKey = structuredClone(current);
+    delete missingPeriodKey.goals[0].metrics[0].periodKey;
+    expect(() => parseImportedState(missingPeriodKey, NOW)).toThrow(
+      /periodKey is required for a consistency metric/i,
+    );
+  });
+
+  it("repairs supported legacy measured goals without dropping their metrics or history", () => {
+    const legacy = validV2Backup();
+    const legacyMetrics = legacy.goals[0].metrics as unknown as Array<{
+      id: string;
+      label: string;
+      current: number;
+      target: number;
+      unit: string;
+      weight: number;
+      period?: string;
+      periodKey?: string;
+    }>;
+    const firstMetric = legacyMetrics[0];
+    firstMetric.weight = 0;
+    delete firstMetric.period;
+    delete firstMetric.periodKey;
+    legacyMetrics.push({
+      id: "metric-minutes",
+      label: "Minutes",
+      current: 90,
+      target: 240,
+      unit: "minutes",
+      weight: 0,
+    });
+    legacy.metricEntries.push({
+      id: "entry-minutes",
+      goalId: legacy.goals[0].id,
+      metricId: "metric-minutes",
+      label: "Minutes",
+      unit: "minutes",
+      value: 90,
+      previousValue: 60,
+      recordedAt: NOW,
+      source: "manual",
+    });
+
+    const migrated = migrateStoredState(legacy, NOW);
+    expect(migrated.goals[0]).toMatchObject({ model: "numeric" });
+    expect(migrated.goals[0].metrics).toEqual([
+      expect.objectContaining({
+        id: "metric-runs",
+        current: 3,
+        weight: 50,
+      }),
+      expect.objectContaining({
+        id: "metric-minutes",
+        current: 90,
+        weight: 50,
+      }),
+    ]);
+    expect(migrated.goals[0].metrics[0]).not.toHaveProperty("period");
+    expect(migrated.goals[0].metrics[0]).not.toHaveProperty("periodKey");
+    expect(migrated.goals[0].metrics[1]).not.toHaveProperty("period");
+    expect(migrated.goals[0].metrics[1]).not.toHaveProperty("periodKey");
+    expect(migrated.metricEntries).toEqual([
+      expect.objectContaining({
+        id: "entry-minutes",
+        metricId: "metric-minutes",
+        value: 90,
+        previousValue: 60,
+      }),
+    ]);
+
+    const measurementFree = validV2Backup();
+    measurementFree.goals[0].metrics = [];
+    measurementFree.goals[0].quests[0].metricDeltas = [];
+    const safelyMigrated = migrateStoredState(measurementFree, NOW);
+    expect(safelyMigrated.goals[0]).toMatchObject({
+      id: "goal-run",
+      model: "open",
+      metrics: [],
+      title: "Run comfortably",
+      notes: "Consistency over intensity.",
+    });
+  });
+
+  it("preserves valid consistency windows and converts ambiguous legacy counters to all-time numeric progress", () => {
     const valid = validV2Backup();
     expect(migrateState(valid, NOW).goals[0].metrics[0]).toMatchObject({
       period: "month",
@@ -1467,13 +1573,17 @@ describe("strict backup imports", () => {
     const invalidPeriodMetric = invalidPeriod.goals[0].metrics[0] as unknown as Record<string, unknown>;
     invalidPeriodMetric.period = "fortnight";
     invalidPeriodMetric.periodKey = "fortnight:2026-14";
-    expect(migrateState(invalidPeriod, NOW).goals[0].metrics[0]).not.toHaveProperty("period");
-    expect(migrateState(invalidPeriod, NOW).goals[0].metrics[0]).not.toHaveProperty("periodKey");
+    const migratedInvalidPeriod = migrateState(invalidPeriod, NOW).goals[0];
+    expect(migratedInvalidPeriod.model).toBe("numeric");
+    expect(migratedInvalidPeriod.metrics[0]).not.toHaveProperty("period");
+    expect(migratedInvalidPeriod.metrics[0]).not.toHaveProperty("periodKey");
 
     const invalidKey = validV2Backup();
     invalidKey.goals[0].metrics[0].periodKey = "month:2026-13";
-    expect(migrateState(invalidKey, NOW).goals[0].metrics[0]).toMatchObject({ period: "month" });
-    expect(migrateState(invalidKey, NOW).goals[0].metrics[0]).not.toHaveProperty("periodKey");
+    const migratedInvalidKey = migrateState(invalidKey, NOW).goals[0];
+    expect(migratedInvalidKey.model).toBe("numeric");
+    expect(migratedInvalidKey.metrics[0]).not.toHaveProperty("period");
+    expect(migratedInvalidKey.metrics[0]).not.toHaveProperty("periodKey");
   });
 
   it("rejects invalid consistency period fields at the strict import boundary", () => {

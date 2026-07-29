@@ -9,15 +9,14 @@ import { GoalCard } from "@/components/goal-card";
 import { collectActivityMoments, LifeCalendar } from "@/components/life-calendar";
 import { QuestCompletionForm } from "@/components/quest-completion-form";
 import { EmptyState, Panel } from "@/components/ui";
+import { terminologyForms } from "@/lib/terminology";
 import { timelineHref } from "@/lib/timeline";
 import type { DashboardSectionId } from "@/lib/types";
-import { getArea, isQuestAvailable, isQuestDue, localDateKey, singularizeTerm } from "@/lib/utils";
+import { getArea, isQuestAvailable, isQuestDue, localDateKey } from "@/lib/utils";
 
 export default function DashboardPage() {
   const { state } = useApp();
-  const terms = state.settings.terminology;
-  const goalTerm = singularizeTerm(terms.goals);
-  const questTerm = singularizeTerm(terms.quests);
+  const terms = terminologyForms(state.settings.terminology);
   const [completionTarget, setCompletionTarget] = useState<{ goalId: string; questId: string } | null>(null);
   const activeGoals = state.goals.filter((goal) => goal.status === "active");
   const todayQuests = activeGoals.flatMap((goal) => goal.quests.filter((quest) => isQuestDue(quest)).map((quest) => ({ quest, goal })));
@@ -70,19 +69,19 @@ export default function DashboardPage() {
     ),
     goals: (
       <section id="dashboard-goals">
-        <div className="section-heading"><div><p className="eyebrow">Active objectives</p><h2>Your current {terms.goals.toLowerCase()}</h2></div><Link href="/goals">View all <ChevronRight size={16} aria-hidden="true" /></Link></div>
-        {activeGoals.length ? <div className="goal-grid">{activeGoals.slice(0, 4).map((goal) => <GoalCard key={goal.id} goal={goal} area={getArea(state, goal.areaId)} />)}</div> : <EmptyState icon={<Sparkles />} title="A clear field" body={`Create your first ${goalTerm.toLowerCase()} and define what genuine progress looks like.`} action={<Link href="/goals?new=true" className="button button-primary">Create a {goalTerm.toLowerCase()}</Link>} />}
+        <div className="section-heading"><div><p className="eyebrow">Active objectives</p><h2>Your current {terms.goals.pluralLower}</h2></div><Link href="/goals">View all <ChevronRight size={16} aria-hidden="true" /></Link></div>
+        {activeGoals.length ? <div className="goal-grid">{activeGoals.slice(0, 4).map((goal) => <GoalCard key={goal.id} goal={goal} area={getArea(state, goal.areaId)} />)}</div> : <EmptyState icon={<Sparkles />} title="A clear field" body={`Create your first ${terms.goals.singularLower} and define what genuine progress looks like.`} action={<Link href="/goals?new=true" className="button button-primary">Create a {terms.goals.singularLower}</Link>} />}
       </section>
     ),
     qualities: (
       <Panel id="dashboard-qualities" className="stats-mini-panel">
-        <div className="section-heading compact"><div><p className="eyebrow">Qualities in motion</p><h2>Connected {terms.stats.toLowerCase()}</h2></div><span className="section-icon" aria-hidden="true"><TrendingUp size={18} /></span></div>
+        <div className="section-heading compact"><div><p className="eyebrow">{terms.stats.plural} in motion</p><h2>Connected {terms.stats.pluralLower}</h2></div><span className="section-icon" aria-hidden="true"><TrendingUp size={18} /></span></div>
         {developedStats.length ? (
           <div className="stats-mini-list">
-            {developedStats.map(({ stat, activity, goals }) => <div key={stat.id}><span className="stat-mini-icon" style={{ color: stat.color, background: `${stat.color}18` }} aria-hidden="true"><DynamicIcon name={stat.icon} size={16} /></span><Link className="quality-trace trace-link" href={timelineHref({ type: "activity", statId: stat.id })} aria-label={`Inspect source records connected to ${stat.name}`}><span><strong>{stat.name}</strong><small>{activity} {activity === 1 ? "moment" : "moments"}</small></span><small>{goals} connected {goals === 1 ? goalTerm.toLowerCase() : terms.goals.toLowerCase()}</small></Link></div>)}
+            {developedStats.map(({ stat, activity, goals }) => <div key={stat.id}><span className="stat-mini-icon" style={{ color: stat.color, background: `${stat.color}18` }} aria-hidden="true"><DynamicIcon name={stat.icon} size={16} /></span><Link className="quality-trace trace-link" href={timelineHref({ type: "activity", statId: stat.id })} aria-label={`Inspect source records connected to ${stat.name}`}><span><strong>{stat.name}</strong><small>{activity} {activity === 1 ? "moment" : "moments"}</small></span><small>{goals} connected {goals === 1 ? terms.goals.singularLower : terms.goals.pluralLower}</small></Link></div>)}
           </div>
-        ) : <div className="calm-empty"><TrendingUp size={20} aria-hidden="true" /><strong>No connected qualities yet</strong><p>Connect a quality to a {goalTerm.toLowerCase()} when that relationship is useful.</p></div>}
-        <Link href="/stats" className="panel-link">Explore all {terms.stats.toLowerCase()} <ArrowRight size={15} aria-hidden="true" /></Link>
+        ) : <div className="calm-empty"><TrendingUp size={20} aria-hidden="true" /><strong>No connected {terms.stats.pluralLower} yet</strong><p>Connect a {terms.stats.singularLower} to a {terms.goals.singularLower} when that relationship is useful.</p></div>}
+        <Link href="/stats" className="panel-link">Explore all {terms.stats.pluralLower} <ArrowRight size={15} aria-hidden="true" /></Link>
       </Panel>
     ),
     review: (
@@ -106,13 +105,13 @@ export default function DashboardPage() {
           <h1>What will move your life forward?</h1>
           <p className="page-lead">Choose the next meaningful action. Quiet progress still counts.</p>
         </div>
-        <div className="hero-actions"><Link href="/quests" className="button button-secondary">View today <ArrowRight size={17} aria-hidden="true" /></Link><Link href="/goals?new=true" className="button button-primary"><Plus size={17} aria-hidden="true" /> New {goalTerm.toLowerCase()}</Link></div>
+        <div className="hero-actions"><Link href="/quests" className="button button-secondary">View today <ArrowRight size={17} aria-hidden="true" /></Link><Link href="/goals?new=true" className="button button-primary"><Plus size={17} aria-hidden="true" /> New {terms.goals.singularLower}</Link></div>
       </section>
 
       <section className="dashboard-kpis" aria-label="Progress overview">
-        <Link className="dashboard-kpi" href="/goals" aria-label={`Open current objectives: ${activeGoals.length} active`}><span>Active {terms.goals.toLowerCase()}</span><strong>{activeGoals.length}</strong><small>Open current objectives</small></Link>
-        <Link className="dashboard-kpi" href={timelineHref({ type: "quest" })} aria-label={`Inspect ${state.questCompletions.length} completed actions`}><span>Actions completed</span><strong>{state.questCompletions.length}</strong><small>Inspect source records</small></Link>
-        <Link className="dashboard-kpi" href={timelineHref({ type: "milestone" })} aria-label={`Inspect ${milestoneCount} reached ${terms.milestones.toLowerCase()}`}><span>{terms.milestones} reached</span><strong>{milestoneCount}</strong><small>Inspect source records</small></Link>
+        <Link className="dashboard-kpi" href="/goals" aria-label={`Open current objectives: ${activeGoals.length} active`}><span>Active {terms.goals.pluralLower}</span><strong>{activeGoals.length}</strong><small>Open current objectives</small></Link>
+        <Link className="dashboard-kpi" href={timelineHref({ type: "quest" })} aria-label={`Inspect ${state.questCompletions.length} completed ${state.questCompletions.length === 1 ? terms.quests.singularLower : terms.quests.pluralLower}`}><span>{terms.quests.plural} completed</span><strong>{state.questCompletions.length}</strong><small>Inspect source records</small></Link>
+        <Link className="dashboard-kpi" href={timelineHref({ type: "milestone" })} aria-label={`Inspect ${milestoneCount} reached ${terms.milestones.pluralLower}`}><span>{terms.milestones.plural} reached</span><strong>{milestoneCount}</strong><small>Inspect source records</small></Link>
         <Link className="dashboard-kpi" href={timelineHref({ type: "activity" })} aria-label={`Inspect ${activityDays} active days`}><span>Active days</span><strong>{activityDays}</strong><small>Inspect recorded moments</small></Link>
       </section>
 
@@ -125,9 +124,9 @@ export default function DashboardPage() {
                 const area = getArea(state, goal.areaId);
                 return <div className="quest-mini" key={`${goal.id}:${quest.id}`}><button type="button" onClick={() => setCompletionTarget({ goalId: goal.id, questId: quest.id })} aria-label={`Record completion of ${quest.title}`}><Check size={15} aria-hidden="true" /></button><div><strong>{quest.title}</strong><span><i style={{ background: area?.color }} aria-hidden="true" />{goal.title}</span></div><small>{quest.durationMinutes !== undefined ? `${quest.durationMinutes} planned min` : "Ready"}</small></div>;
               })}
-              {!todayQuests.length && <div className="calm-empty"><Check size={20} aria-hidden="true" /><strong>Nothing due now</strong><p>Undated actions stay in Anytime on the {terms.quests.toLowerCase()} board.</p></div>}
+              {!todayQuests.length && <div className="calm-empty"><Check size={20} aria-hidden="true" /><strong>Nothing due now</strong><p>Undated {terms.quests.pluralLower} stay in Anytime on the {terms.quests.pluralLower} board.</p></div>}
             </div>
-            <Link href="/quests" className="panel-link">Open {questTerm.toLowerCase()} board <ArrowRight size={15} aria-hidden="true" /></Link>
+            <Link href="/quests" className="panel-link">Open {terms.quests.singularLower} board <ArrowRight size={15} aria-hidden="true" /></Link>
           </Panel>
         </aside>
 

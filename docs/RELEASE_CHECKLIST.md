@@ -4,10 +4,10 @@ Evolvra remains labelled beta until every applicable item is verified for the re
 
 ## Automated gate
 
-- [ ] `npm ci` succeeds from a clean checkout.
-- [ ] `npm run check` passes: retired-mechanics and state-v3 SQL-fixture guards, typecheck, lint, unit tests, service-worker checks, production build, bundle budget, and the Playwright browser release gate.
+- [x] `npm ci` succeeds from a clean checkout.
+- [x] `npm run check` passes: retired-mechanics and state-v3 SQL-fixture guards, typecheck, lint, unit tests, service-worker checks, production build, bundle budget, and the Playwright browser release gate.
 - [ ] Both GitHub Actions jobs pass on the exact release commit.
-- [ ] Production dependency audit has no known high or critical vulnerability.
+- [x] Production dependency audit has no known high or critical vulnerability.
 - [ ] Supabase CLI `2.109.1` applies the immutable migration chain to a fresh database and a seeded legacy database; post-upgrade preservation/backfill assertions pass.
 - [ ] Two-user RLS regression tests pass.
 
@@ -16,7 +16,7 @@ Evolvra remains labelled beta until every applicable item is verified for the re
 - [ ] Keyboard-only onboarding, goal creation/editing, quest completion, review, settings, export/import, and delete flows pass.
 - [ ] Desktop and mobile layouts have no blocked or unreachable controls.
 - [ ] Anonymous → account local/account/merge selection is explicit, merge preserves both sources, and account A → account B never leaks data.
-- [ ] Offline reload, visited goal navigation, queued mutation recovery, explicit offline/unsynced status, update prompt, and missing-asset MIME behavior pass.
+- [ ] Offline reload, known-but-unvisited goal navigation, multi-tab manifest isolation, activation carry-forward, acknowledged partial/retry states, arbitrary-route exclusion, queued mutation recovery, explicit offline/unsynced status, update prompt, and missing-asset MIME behavior pass.
 - [ ] Recurring actions cannot be completed before their next occurrence.
 - [ ] Open goals never display fabricated percentages; completed measured goals retain their real measurement.
 - [ ] Evidence upload, retry, download, rename, and deletion pass locally and with private storage.
@@ -30,7 +30,7 @@ Evolvra remains labelled beta until every applicable item is verified for the re
 - [ ] No private data appears in logs, web-vital events, notifications, or error monitoring.
 - [ ] The linked Supabase project, Postgres major version, migration list, and `db push --dry-run` output were reviewed with CLI `2.109.1`.
 - [ ] A current database backup, evidence-protection plan, and deployment/rollback owner are recorded.
-- [ ] A protected state-v3 deployment is ready before the database cutover; active old-client sync is stopped until it is promoted.
+- [ ] A staged state-v3 Production deployment, built with reviewed Production variables and no automatic domain assignment, is ready before the database cutover; active old-client sync is stopped until it is promoted without rebuilding.
 - [ ] The rollback target is a state-v3-compatible forward hotfix, never `ca81723` or another pre-v3 build.
 - [ ] Release notes describe migrations, offline-cache version, known limitations, and recovery steps.
 

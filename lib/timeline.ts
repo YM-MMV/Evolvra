@@ -1,6 +1,7 @@
 import type { AppState, TimelineEvent } from "@/lib/types";
 import { completionGoalIds } from "@/lib/activity-attribution";
-import { localDateKey, parseLocalDate, singularizeTerm } from "@/lib/utils";
+import { terminologyForms } from "@/lib/terminology";
+import { localDateKey, parseLocalDate } from "@/lib/utils";
 
 export type ReconciledTimelineEvent = TimelineEvent;
 export type TimelineRecordType = TimelineEvent["type"] | "activity";
@@ -98,8 +99,7 @@ const normalized = (value: string) => value.trim().toLocaleLowerCase();
  * UI and data export use this selector so neither can silently omit history.
  */
 export function reconciledTimelineEvents(state: AppState): ReconciledTimelineEvent[] {
-  const goalTerm = singularizeTerm(state.settings.terminology.goals);
-  const milestoneTerm = singularizeTerm(state.settings.terminology.milestones);
+  const terms = terminologyForms(state.settings.terminology);
   const goals = new Map(state.goals.map((goal) => [goal.id, goal]));
   const canonical: ReconciledTimelineEvent[] = [];
 
@@ -126,7 +126,7 @@ export function reconciledTimelineEvents(state: AppState): ReconciledTimelineEve
       id: `record-quest-${completion.id}`,
       type: "quest",
       title: completion.title,
-      detail: `Action completed${completionContext.length ? ` · ${completionContext.join(" · ")}` : ""}.`,
+      detail: `${terms.quests.singular} completed${completionContext.length ? ` · ${completionContext.join(" · ")}` : ""}.`,
       at: completion.completedAt,
       goalId: completion.goalId,
       areaId: snapshots.find((snapshot) => snapshot.goalId === completion.goalId)?.areaId ?? goal?.areaId,
@@ -146,7 +146,7 @@ export function reconciledTimelineEvents(state: AppState): ReconciledTimelineEve
       id: `record-metric-${entry.id}`,
       type: "metric",
       title: label ? `${label} updated` : "Measurement updated",
-      detail: `${entry.previousValue.toLocaleString()} → ${entry.value.toLocaleString()}${unit}${entry.source === "quest" ? " · recorded with a completed action" : ""}`,
+      detail: `${entry.previousValue.toLocaleString()} → ${entry.value.toLocaleString()}${unit}${entry.source === "quest" ? ` · recorded with a completed ${terms.quests.singularLower}` : ""}`,
       at: entry.recordedAt,
       goalId: entry.goalId,
       areaId: entry.attribution?.areaId ?? goal?.areaId,
@@ -160,8 +160,8 @@ export function reconciledTimelineEvents(state: AppState): ReconciledTimelineEve
     canonical.push({
       id: `record-goal-created-${goal.id}`,
       type: "goal",
-      title: `Created ${goalTerm.toLowerCase()}: ${goal.title}`,
-      detail: `${goalTerm} creation retained in the permanent record.`,
+      title: `Created ${terms.goals.singularLower}: ${goal.title}`,
+      detail: `${terms.goals.singular} creation retained in the permanent record.`,
       at: goal.createdAt,
       goalId: goal.id,
       areaId: goal.areaId,
@@ -175,7 +175,7 @@ export function reconciledTimelineEvents(state: AppState): ReconciledTimelineEve
         id: `record-milestone-${goal.id}-${milestone.id}`,
         type: "milestone",
         title: milestone.title,
-        detail: `${milestoneTerm} reached and retained in the permanent record.`,
+        detail: `${terms.milestones.singular} reached and retained in the permanent record.`,
         at: milestone.completedAt,
         goalId: goal.id,
         areaId: milestone.attribution?.areaId ?? goal.areaId,
@@ -203,7 +203,7 @@ export function reconciledTimelineEvents(state: AppState): ReconciledTimelineEve
         id: `record-goal-completed-${goal.id}`,
         type: "goal",
         title: `${goal.title} completed`,
-        detail: `${goalTerm} completion retained in the permanent record.`,
+        detail: `${terms.goals.singular} completion retained in the permanent record.`,
         at: goal.completedAt,
         goalId: goal.id,
         areaId: goal.areaId,

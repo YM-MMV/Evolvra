@@ -86,7 +86,7 @@ test("a shared action appears in both goals and retains linked completion histor
   const primaryRow = page.locator(".quest-row").filter({ hasText: "Reflect while walking" });
   await expect(primaryRow).toContainText("session");
   await primaryRow.getByRole("link", { name: "Also: Build dependable cardiovascular fitness" }).click();
-  await expect(page.getByRole("heading", { name: "Actions housed in other goals" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Quests housed in other goals" })).toBeVisible();
   const sharedRow = page.locator(".quest-row").filter({ hasText: "Reflect while walking" });
   await expect(sharedRow).toContainText("Primary home: Build my personal command centre");
   await sharedRow.getByRole("link", { name: "Open primary" }).click();

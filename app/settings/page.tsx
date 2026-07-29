@@ -42,11 +42,13 @@ import {
   type CloudErasureStatus,
 } from "@/lib/account-erasure";
 import { portableWorkspaceState } from "@/lib/provider-evidence";
+import { settingsSyncStatusDescription } from "@/lib/provider-selectors";
 import { MAX_WORKSPACE_SERIALIZED_BYTES, WORKSPACE_TEXT_LIMITS } from "@/lib/state-schema";
 import type { AnonymousHandoffChoice } from "@/lib/sync-reconciliation";
+import { terminologyForms, type TerminologyKey } from "@/lib/terminology";
 import { reconciledTimelineEvents } from "@/lib/timeline";
 import type { Area, DashboardSectionId, LifeStat } from "@/lib/types";
-import { downloadFile, escapeCsv, singularizeTerm, uid } from "@/lib/utils";
+import { downloadFile, escapeCsv, uid } from "@/lib/utils";
 
 type EditItem = { kind: "area"; value?: Area } | { kind: "stat"; value?: LifeStat } | null;
 const IMPORT_SUCCESS_NOTICE_KEY = "evolvra:notice:import-success";
@@ -70,16 +72,15 @@ export default function SettingsPage() {
   const [profileName, setProfileName] = useState(state.profile.displayName);
   const [profileChapter, setProfileChapter] = useState(state.profile.chapter);
   const [terminologyDraft, setTerminologyDraft] = useState(state.settings.terminology);
+  const terminologyDraftRef = useRef(state.settings.terminology);
   const importRef = useRef<HTMLInputElement>(null);
   const term = state.settings.terminology;
-  const goalTerm = singularizeTerm(term.goals);
-  const areaTerm = singularizeTerm(term.areas);
-  const statTerm = singularizeTerm(term.stats);
+  const terms = terminologyForms(term);
   const dashboardLabels: Record<DashboardSectionId, string> = {
     "life-map": "Year life map",
     momentum: "Recent momentum",
-    goals: `Current ${term.goals.toLowerCase()}`,
-    qualities: `Connected ${term.stats.toLowerCase()}`,
+    goals: `Current ${terms.goals.pluralLower}`,
+    qualities: `Connected ${terms.stats.pluralLower}`,
     review: "Review prompt",
   };
 
@@ -96,6 +97,27 @@ export default function SettingsPage() {
     }
     return () => window.clearTimeout(noticeTimer);
   }, []);
+
+  const editTerminology = (key: TerminologyKey, value: string) => {
+    const next = { ...terminologyDraftRef.current, [key]: value };
+    terminologyDraftRef.current = next;
+    setTerminologyDraft(next);
+  };
+
+  const saveTerminology = (key: TerminologyKey) => {
+    const nextValue = terminologyDraftRef.current[key].trim();
+    if (!nextValue) {
+      const restored = { ...terminologyDraftRef.current, [key]: term[key] };
+      terminologyDraftRef.current = restored;
+      setTerminologyDraft(restored);
+      return;
+    }
+    const next = { ...terminologyDraftRef.current, [key]: nextValue };
+    terminologyDraftRef.current = next;
+    setTerminologyDraft(next);
+    if (Object.entries(next).every(([entryKey, entryValue]) => term[entryKey as TerminologyKey] === entryValue)) return;
+    updateSettings({ terminology: next });
+  };
 
   useEffect(() => {
     const followStructureLink = () => {
@@ -115,7 +137,7 @@ export default function SettingsPage() {
 
   const sections = [
     { id: "profile", label: "Profile", icon: User },
-    { id: "structure", label: `${term.areas} & ${term.stats}`, icon: Sparkles },
+    { id: "structure", label: `${terms.areas.plural} & ${terms.stats.plural}`, icon: Sparkles },
     { id: "appearance", label: "Appearance", icon: Palette },
     { id: "language", label: "Terminology", icon: Edit3 },
     { id: "sync", label: "Sync & privacy", icon: Cloud },
@@ -213,7 +235,7 @@ export default function SettingsPage() {
     try {
       await resolveAccountHandoff(choice);
       setMessage(choice === "merge"
-        ? "Device goals and activity were combined with the account. Account identity and settings were retained, and the anonymous original remains on this device."
+        ? `Device ${terms.goals.pluralLower} and activity were combined with the account. Account identity and settings were retained, and the anonymous original remains on this device.`
         : choice === "device"
           ? "The account workspace was replaced with this device copy. The anonymous original remains on this device."
           : "The account workspace is opening. The anonymous device workspace remains stored separately.");
@@ -363,17 +385,17 @@ export default function SettingsPage() {
         {active === "profile" && <Panel><SettingsHead eyebrow="Identity" title="Profile & chapter" description="Shape the context shown across your command centre." /><div className="form-stack"><Field label="Display name"><input maxLength={WORKSPACE_TEXT_LIMITS.profileName} value={profileName} onChange={(e) => setProfileName(e.target.value)} onBlur={() => { if (profileName !== state.profile.displayName) updateProfile({ displayName: profileName }); }} /></Field><Field label="Current chapter" hint="A short description of your main season or objective"><input maxLength={WORKSPACE_TEXT_LIMITS.profileChapter} value={profileChapter} onChange={(e) => setProfileChapter(e.target.value)} onBlur={() => { if (profileChapter !== state.profile.chapter) updateProfile({ chapter: profileChapter }); }} /></Field><Field label="Birth date" hint="Used only for the life calendar and age display"><input type="date" value={state.settings.birthDate ?? ""} onChange={(e) => updateSettings({ birthDate: e.target.value || undefined })} /></Field></div></Panel>}
 
         {active === "structure" && <div className="settings-stack">
-          <Panel id="areas" tabIndex={-1}><SettingsHead eyebrow="Organisational folders" title={term.areas} description="Create, colour, reorder, hide, archive, or restore the divisions of your life." action={<Button onClick={() => openEdit({ kind: "area" })}><Plus size={15} /> Add {areaTerm.toLowerCase()}</Button>} /><div className="custom-list">{[...state.areas].sort((a, b) => a.order - b.order).map((area, index) => { const connected = state.goals.filter((goal) => goal.areaId === area.id).length; return <div key={area.id} className={area.archived ? "archived" : ""}><span className="custom-icon" style={{ color: area.color, background: `${area.color}18` }}><DynamicIcon name={area.icon} /></span><div><strong>{area.name}</strong><small>{connected} {connected === 1 ? goalTerm.toLowerCase() : term.goals.toLowerCase()}{area.archived ? " · archived" : area.hidden ? ` · hidden from new ${term.goals.toLowerCase()}` : ""}</small></div><div className="reorder-buttons"><button aria-label={`Move ${area.name} up`} disabled={index === 0} onClick={() => moveArea(index, -1)}><ArrowUp size={14} /></button><button aria-label={`Move ${area.name} down`} disabled={index === state.areas.length - 1} onClick={() => moveArea(index, 1)}><ArrowDown size={14} /></button></div>{!area.archived && <button className="icon-button" aria-label={area.hidden ? `Show ${area.name} in new ${goalTerm.toLowerCase()} choices` : `Hide ${area.name} from new ${goalTerm.toLowerCase()} choices`} onClick={() => upsertArea({ ...area, hidden: !area.hidden })}>{area.hidden ? <Eye size={15} /> : <EyeOff size={15} />}</button>}<button className="icon-button" aria-label={`Edit ${area.name}`} onClick={() => openEdit({ kind: "area", value: area })}><Edit3 size={15} /></button>{area.archived ? <button className="icon-button" aria-label={`Restore ${area.name}`} onClick={() => upsertArea({ ...area, archived: false })}><RotateCcw size={15} /></button> : <button className="icon-button danger" aria-label={connected ? `Archive ${area.name}` : `Delete ${area.name}`} onClick={() => removeArea(area.id)}><Trash2 size={15} /></button>}</div>; })}</div></Panel>
-          <Panel id="stats" tabIndex={-1}><SettingsHead eyebrow="Personal qualities" title={term.stats} description={`Use qualities to group the ${term.goals.toLowerCase()} and actions that develop different parts of your life.`} action={<Button onClick={() => openEdit({ kind: "stat" })}><Plus size={15} /> Add {statTerm.toLowerCase()}</Button>} /><div className="custom-list">{state.stats.map((stat, index) => <div key={stat.id} className={stat.archived ? "archived" : ""}><span className="custom-icon" style={{ color: stat.color, background: `${stat.color}18` }}><DynamicIcon name={stat.icon} /></span><div><strong>{stat.name}</strong><small>{stat.archived ? "Archived" : `Available for ${goalTerm.toLowerCase()} connections`}</small></div><Pill>{state.goals.filter((goal) => goal.statIds.includes(stat.id)).length} connected</Pill><div className="reorder-buttons"><button aria-label={`Move ${stat.name} up`} disabled={index === 0} onClick={() => moveStat(index, -1)}><ArrowUp size={14} /></button><button aria-label={`Move ${stat.name} down`} disabled={index === state.stats.length - 1} onClick={() => moveStat(index, 1)}><ArrowDown size={14} /></button></div><button className="icon-button" aria-label={`Edit ${stat.name}`} onClick={() => openEdit({ kind: "stat", value: stat })}><Edit3 size={15} /></button>{stat.archived ? <button className="icon-button" aria-label={`Restore ${stat.name}`} onClick={() => upsertStat({ ...stat, archived: false })}><RotateCcw size={15} /></button> : <button className="icon-button danger" aria-label={`Remove ${stat.name}`} onClick={() => removeStat(stat.id)}><Trash2 size={15} /></button>}</div>)}</div></Panel>
+          <Panel id="areas" tabIndex={-1}><SettingsHead eyebrow="Organisational folders" title={terms.areas.plural} description="Create, colour, reorder, hide, archive, or restore the divisions of your life." action={<Button onClick={() => openEdit({ kind: "area" })}><Plus size={15} /> Add {terms.areas.singularLower}</Button>} /><div className="custom-list">{[...state.areas].sort((a, b) => a.order - b.order).map((area, index) => { const connected = state.goals.filter((goal) => goal.areaId === area.id).length; return <div key={area.id} className={area.archived ? "archived" : ""}><span className="custom-icon" style={{ color: area.color, background: `${area.color}18` }}><DynamicIcon name={area.icon} /></span><div><strong>{area.name}</strong><small>{connected} {connected === 1 ? terms.goals.singularLower : terms.goals.pluralLower}{area.archived ? " · archived" : area.hidden ? ` · hidden from new ${terms.goals.pluralLower}` : ""}</small></div><div className="reorder-buttons"><button aria-label={`Move ${area.name} up`} disabled={index === 0} onClick={() => moveArea(index, -1)}><ArrowUp size={14} /></button><button aria-label={`Move ${area.name} down`} disabled={index === state.areas.length - 1} onClick={() => moveArea(index, 1)}><ArrowDown size={14} /></button></div>{!area.archived && <button className="icon-button" aria-label={area.hidden ? `Show ${area.name} in new ${terms.goals.singularLower} choices` : `Hide ${area.name} from new ${terms.goals.singularLower} choices`} onClick={() => upsertArea({ ...area, hidden: !area.hidden })}>{area.hidden ? <Eye size={15} /> : <EyeOff size={15} />}</button>}<button className="icon-button" aria-label={`Edit ${area.name}`} onClick={() => openEdit({ kind: "area", value: area })}><Edit3 size={15} /></button>{area.archived ? <button className="icon-button" aria-label={`Restore ${area.name}`} onClick={() => upsertArea({ ...area, archived: false })}><RotateCcw size={15} /></button> : <button className="icon-button danger" aria-label={connected ? `Archive ${area.name}` : `Delete ${area.name}`} onClick={() => removeArea(area.id)}><Trash2 size={15} /></button>}</div>; })}</div></Panel>
+          <Panel id="stats" tabIndex={-1}><SettingsHead eyebrow={`Personal ${terms.stats.pluralLower}`} title={terms.stats.plural} description={`Use ${terms.stats.pluralLower} to group the ${terms.goals.pluralLower} and ${terms.quests.pluralLower} that develop different parts of your life.`} action={<Button onClick={() => openEdit({ kind: "stat" })}><Plus size={15} /> Add {terms.stats.singularLower}</Button>} /><div className="custom-list">{state.stats.map((stat, index) => <div key={stat.id} className={stat.archived ? "archived" : ""}><span className="custom-icon" style={{ color: stat.color, background: `${stat.color}18` }}><DynamicIcon name={stat.icon} /></span><div><strong>{stat.name}</strong><small>{stat.archived ? "Archived" : `Available for ${terms.goals.singularLower} connections`}</small></div><Pill>{state.goals.filter((goal) => goal.statIds.includes(stat.id)).length} connected</Pill><div className="reorder-buttons"><button aria-label={`Move ${stat.name} up`} disabled={index === 0} onClick={() => moveStat(index, -1)}><ArrowUp size={14} /></button><button aria-label={`Move ${stat.name} down`} disabled={index === state.stats.length - 1} onClick={() => moveStat(index, 1)}><ArrowDown size={14} /></button></div><button className="icon-button" aria-label={`Edit ${stat.name}`} onClick={() => openEdit({ kind: "stat", value: stat })}><Edit3 size={15} /></button>{stat.archived ? <button className="icon-button" aria-label={`Restore ${stat.name}`} onClick={() => upsertStat({ ...stat, archived: false })}><RotateCcw size={15} /></button> : <button className="icon-button danger" aria-label={`Remove ${stat.name}`} onClick={() => removeStat(stat.id)}><Trash2 size={15} /></button>}</div>)}</div></Panel>
         </div>}
 
         {active === "appearance" && <div className="settings-stack">
           <Panel><SettingsHead eyebrow="Visual direction" title="Appearance" description="Choose a calm interface or increase the command-centre atmosphere." /><div className="settings-group"><h3>Theme</h3><div className="option-cards thirds">{([{ id: "dark", label: "Dark", icon: Moon }, { id: "light", label: "Light", icon: Sun }, { id: "system", label: "System", icon: Monitor }] as const).map(({ id, label, icon: Icon }) => <button key={id} className={state.settings.theme === id ? "active" : ""} aria-pressed={state.settings.theme === id} onClick={() => updateSettings({ theme: id })}><Icon /><strong>{label}</strong>{state.settings.theme === id && <Check />}</button>)}</div></div><div className="settings-group"><h3>Interface intensity</h3><div className="option-cards">{([{ id: "minimal", label: "Minimal", body: "Clean productivity language and subdued visual effects." }, { id: "balanced", label: "Balanced", body: "Structured dashboards with a light command-centre atmosphere." }, { id: "immersive", label: "Immersive", body: "Stronger glows, denser panels, and a more cinematic workspace." }] as const).map((item) => <button key={item.id} className={state.settings.interfaceIntensity === item.id ? "active" : ""} aria-pressed={state.settings.interfaceIntensity === item.id} onClick={() => updateSettings({ interfaceIntensity: item.id })}><strong>{item.label}</strong><p>{item.body}</p>{state.settings.interfaceIntensity === item.id && <Check />}</button>)}</div></div></Panel>
           <Panel><SettingsHead eyebrow="Your command centre" title="Dashboard arrangement" description="Move sections into a useful order or hide what you do not need. Hidden sections can always be restored." /><div className="custom-list">{state.settings.dashboardOrder.map((section, index) => { const hidden = state.settings.hiddenDashboardSections.includes(section); return <div key={section}><span className="custom-icon"><Monitor size={17} /></span><div><strong>{dashboardLabels[section]}</strong><small>{hidden ? "Hidden" : "Visible"}</small></div><div className="reorder-buttons"><button aria-label={`Move ${dashboardLabels[section]} up`} disabled={index === 0} onClick={() => moveDashboardSection(section, -1)}><ArrowUp size={14} /></button><button aria-label={`Move ${dashboardLabels[section]} down`} disabled={index === state.settings.dashboardOrder.length - 1} onClick={() => moveDashboardSection(section, 1)}><ArrowDown size={14} /></button></div><button className="icon-button" aria-label={hidden ? `Show ${dashboardLabels[section]}` : `Hide ${dashboardLabels[section]}`} onClick={() => updateSettings({ hiddenDashboardSections: hidden ? state.settings.hiddenDashboardSections.filter((item) => item !== section) : [...state.settings.hiddenDashboardSections, section] })}>{hidden ? <Eye size={15} /> : <EyeOff size={15} />}</button></div>; })}</div></Panel>
-          <Panel><SettingsHead eyebrow="Optional and private" title="Daily reminder" description="A browser notification can gently surface ready actions while an Evolvra tab or installed app window is open. No activity data is sent away." /><div className="form-grid"><Field label="Reminder time"><input type="time" value={state.settings.reminderTime ?? "18:00"} onChange={(event) => updateSettings({ reminderTime: event.target.value })} /></Field><div className="button-row end"><Button variant={state.settings.notifications ? "secondary" : "primary"} onClick={() => void toggleReminders()}><Bell size={16} /> {state.settings.notifications ? "Turn reminders off" : "Turn reminders on"}</Button></div></div></Panel>
+          <Panel><SettingsHead eyebrow="Optional and private" title="Daily reminder" description={`A browser notification can gently surface ready ${terms.quests.pluralLower} while an Evolvra tab or installed app window is open. No activity data is sent away.`} /><div className="form-grid"><Field label="Reminder time"><input type="time" value={state.settings.reminderTime ?? "18:00"} onChange={(event) => updateSettings({ reminderTime: event.target.value })} /></Field><div className="button-row end"><Button variant={state.settings.notifications ? "secondary" : "primary"} onClick={() => void toggleReminders()}><Bell size={16} /> {state.settings.notifications ? "Turn reminders off" : "Turn reminders on"}</Button></div></div></Panel>
         </div>}
 
-        {active === "language" && <Panel><SettingsHead eyebrow="Your words" title="Terminology" description="Rename the main concepts globally so the system feels natural to you." /><div className="form-grid">{Object.entries(terminologyDraft).map(([key, value]) => { const termKey = key as keyof typeof term; return <Field key={key} label={`Default: ${key[0].toUpperCase()}${key.slice(1)}`}><input maxLength={WORKSPACE_TEXT_LIMITS.terminology} value={value} onChange={(e) => setTerminologyDraft((current) => ({ ...current, [key]: e.target.value }))} onBlur={() => { const nextValue = value.trim(); if (!nextValue) { setTerminologyDraft((current) => ({ ...current, [termKey]: term[termKey] })); return; } const nextTerminology = { ...terminologyDraft, [termKey]: nextValue }; if (Object.entries(nextTerminology).every(([entryKey, entryValue]) => term[entryKey as keyof typeof term] === entryValue)) return; setTerminologyDraft(nextTerminology); updateSettings({ terminology: nextTerminology }); }} /></Field>; })}</div><div className="setting-note"><Sparkles size={17} /><p>Examples: Goals → Missions, Quests → Actions, Areas → Realms, Milestones → Chapters, Stats → Attributes.</p></div></Panel>}
+        {active === "language" && <Panel><SettingsHead eyebrow="Your words" title="Terminology" description="Rename the main concepts globally so the system feels natural to you." /><div className="form-grid">{Object.entries(terminologyDraft).map(([key, value]) => { const termKey = key as TerminologyKey; return <Field key={key} label={`Default: ${key[0].toUpperCase()}${key.slice(1)}`}><input maxLength={WORKSPACE_TEXT_LIMITS.terminology} value={value} onChange={(e) => editTerminology(termKey, e.target.value)} onBlur={() => saveTerminology(termKey)} /></Field>; })}</div><div className="setting-note"><Sparkles size={17} /><p>Examples: Goals → Missions, Quests → Actions, Areas → Realms, Milestones → Chapters, Stats → Attributes.</p></div></Panel>}
 
         {active === "sync" && <Panel>
           <SettingsHead eyebrow="Private by design" title="Sync & privacy" description="The app works locally first. Supabase adds private cross-device sync when you choose." />
@@ -381,23 +403,11 @@ export default function SettingsPage() {
             <span>{user ? <Cloud /> : <HardDrive />}</span>
             <div>
               <strong>{user ? `Connected as ${user.email}` : "Stored privately on this device"}</strong>
-              <p>{user
-                ? accountHandoff
-                  ? "Sync is paused until you keep, merge, or replace these separate workspaces. Nothing is copied automatically."
-                  : syncStatus === "synced"
-                    ? "This device and the private cloud snapshot are up to date."
-                    : syncStatus === "offline"
-                      ? "You are offline. Changes remain saved on this device and will sync after reconnection."
-                      : syncStatus === "unsaved"
-                        ? "Changes are saved on this device and waiting for private sync."
-                        : syncStatus === "saving"
-                          ? "Saving the latest local changes…"
-                          : syncStatus === "connecting"
-                            ? "Checking for newer private changes…"
-                            : syncStatus === "conflict"
-                              ? "Both this device and the cloud have unsaved changes. Choose which copy to keep."
-                              : "Sync could not finish. Your device copy is still safe and can be retried."
-                : "No account is required for local use. Export backups whenever you like."}</p>
+              <p>{settingsSyncStatusDescription({
+                authenticated: Boolean(user),
+                handoffPending: Boolean(accountHandoff),
+                syncStatus,
+              })}</p>
             </div>
             {user && <Button variant="secondary" disabled={authPending || handoffPending} onClick={async () => {
               setAuthPending(true);
@@ -410,7 +420,7 @@ export default function SettingsPage() {
           {accountHandoff && <div className="sync-conflict" role="alert">
             <div>
               <strong>Choose which workspace to open</strong>
-              <p>This anonymous device workspace has {accountHandoff.goalCount} {accountHandoff.goalCount === 1 ? goalTerm.toLowerCase() : term.goals.toLowerCase()} and {accountHandoff.activityCount} saved activity {accountHandoff.activityCount === 1 ? "record" : "records"}. It was last changed {new Date(accountHandoff.anonymousUpdatedAt).toLocaleString("en-GB")}.</p>
+              <p>This anonymous device workspace has {accountHandoff.goalCount} {accountHandoff.goalCount === 1 ? terms.goals.singularLower : terms.goals.pluralLower} and {accountHandoff.activityCount} saved activity {accountHandoff.activityCount === 1 ? "record" : "records"}. It was last changed {new Date(accountHandoff.anonymousUpdatedAt).toLocaleString("en-GB")}.</p>
               <p>Merge combines its data with the account while retaining the account profile, terminology, appearance, and settings. Nothing has been copied yet, and the anonymous original remains stored separately whichever option you choose.</p>
             </div>
             <div className="button-row">
@@ -429,13 +439,13 @@ export default function SettingsPage() {
           <div className="privacy-list"><div><ShieldCheck /><span><strong>Row-level security</strong><small>Every cloud record is restricted to the signed-in account.</small></span></div><div><Save /><span><strong>Indexed device storage</strong><small>Your account-scoped workspace and recent undo history stay available offline.</small></span></div><div><RotateCcw /><span><strong>Conflict-safe sync</strong><small>Concurrent device changes are never silently overwritten.</small></span></div></div>
         </Panel>}
 
-        {active === "data" && <Panel><SettingsHead eyebrow="Ownership & recovery" title="Your data" description="Export workspace records, restore a snapshot, or erase the workspace completely." /><div className="data-actions"><button onClick={exportJson}><span><Download /></span><div><strong>Workspace JSON backup</strong><p>Every {term.goals.toLowerCase()}, {term.stats.toLowerCase()}, review, setting, and event. File contents and private account locations are not embedded.</p></div></button><button onClick={exportCsv}><span><Download /></span><div><strong>Timeline CSV</strong><p>The same reconciled permanent record shown on the Timeline page, ready for a spreadsheet.</p></div></button><button onClick={() => importRef.current?.click()}><span><Upload /></span><div><strong>Restore workspace records</strong><p>Import a previous Evolvra JSON file. Evidence files must be attached again after restore.</p></div></button><input ref={importRef} hidden type="file" accept="application/json,.json" onChange={onImport} /></div><div className="danger-zone"><div><strong>Erase this workspace</strong><p>Delete local data, cloud snapshots, and the connected account. Export a backup first.</p></div><Button variant="danger" onClick={() => setDangerOpen(true)}><Trash2 size={15} /> Erase everything</Button></div></Panel>}
+        {active === "data" && <Panel><SettingsHead eyebrow="Ownership & recovery" title="Your data" description="Export workspace records, restore a snapshot, or erase the workspace completely." /><div className="data-actions"><button onClick={exportJson}><span><Download /></span><div><strong>Workspace JSON backup</strong><p>Every {terms.goals.singularLower}, {terms.stats.singularLower}, review, setting, and event. File contents and private account locations are not embedded.</p></div></button><button onClick={exportCsv}><span><Download /></span><div><strong>Timeline CSV</strong><p>The same reconciled permanent record shown on the Timeline page, ready for a spreadsheet.</p></div></button><button onClick={() => importRef.current?.click()}><span><Upload /></span><div><strong>Restore workspace records</strong><p>Import a previous Evolvra JSON file. Evidence files must be attached again after restore.</p></div></button><input ref={importRef} hidden type="file" accept="application/json,.json" onChange={onImport} /></div><div className="danger-zone"><div><strong>Erase this workspace</strong><p>Delete local data, cloud snapshots, and the connected account. Export a backup first.</p></div><Button variant="danger" onClick={() => setDangerOpen(true)}><Trash2 size={15} /> Erase everything</Button></div></Panel>}
 
         {message && <div className="toast-message" role="status" aria-live="polite"><Check size={16} />{message}<button aria-label="Dismiss message" onClick={() => setMessage("")}>×</button></div>}
       </div>
     </div>
 
-    <Modal open={Boolean(editItem)} onClose={() => setEditItem(null)} eyebrow={editItem?.kind === "area" ? "Life structure" : "Personal quality"} title={`${editItem?.value ? "Edit" : "Add"} ${editItem?.kind === "area" ? areaTerm.toLowerCase() : editItem?.kind === "stat" ? statTerm.toLowerCase() : "item"}`}><div className="form-stack"><Field label="Name"><input data-modal-autofocus="true" maxLength={WORKSPACE_TEXT_LIMITS.areaOrQualityName} value={itemName} onChange={(e) => setItemName(e.target.value)} placeholder={editItem?.kind === "area" ? "Creative work" : "Leadership"} /></Field><div className="form-grid"><Field label="Colour"><div className="color-input"><input aria-label="Choose colour" type="color" value={itemColor} onChange={(e) => setItemColor(e.target.value)} /><input aria-label="Colour value" maxLength={WORKSPACE_TEXT_LIMITS.color} value={itemColor} onChange={(e) => setItemColor(e.target.value)} /></div></Field><Field label="Icon"><select value={itemIcon} onChange={(e) => setItemIcon(e.target.value)}>{ICON_OPTIONS.map((icon) => <option key={icon}>{icon}</option>)}</select></Field></div><div className="icon-preview" style={{ color: itemColor, background: `${itemColor}18` }}><DynamicIcon name={itemIcon} size={24} /><strong>{itemName || "Preview"}</strong></div><div className="button-row end"><Button variant="ghost" onClick={() => setEditItem(null)}>Cancel</Button><Button disabled={!itemName.trim()} onClick={saveItem}><Save size={15} /> Save</Button></div></div></Modal>
+    <Modal open={Boolean(editItem)} onClose={() => setEditItem(null)} eyebrow={editItem?.kind === "area" ? "Life structure" : `Personal ${terms.stats.singularLower}`} title={`${editItem?.value ? "Edit" : "Add"} ${editItem?.kind === "area" ? terms.areas.singularLower : editItem?.kind === "stat" ? terms.stats.singularLower : "item"}`}><div className="form-stack"><Field label="Name"><input data-modal-autofocus="true" maxLength={WORKSPACE_TEXT_LIMITS.areaOrQualityName} value={itemName} onChange={(e) => setItemName(e.target.value)} placeholder={editItem?.kind === "area" ? "Creative work" : "Leadership"} /></Field><div className="form-grid"><Field label="Colour"><div className="color-input"><input aria-label="Choose colour" type="color" value={itemColor} onChange={(e) => setItemColor(e.target.value)} /><input aria-label="Colour value" maxLength={WORKSPACE_TEXT_LIMITS.color} value={itemColor} onChange={(e) => setItemColor(e.target.value)} /></div></Field><Field label="Icon"><select value={itemIcon} onChange={(e) => setItemIcon(e.target.value)}>{ICON_OPTIONS.map((icon) => <option key={icon}>{icon}</option>)}</select></Field></div><div className="icon-preview" style={{ color: itemColor, background: `${itemColor}18` }}><DynamicIcon name={itemIcon} size={24} /><strong>{itemName || "Preview"}</strong></div><div className="button-row end"><Button variant="ghost" onClick={() => setEditItem(null)}>Cancel</Button><Button disabled={!itemName.trim()} onClick={saveItem}><Save size={15} /> Save</Button></div></div></Modal>
     <Modal open={dangerOpen} onClose={() => { if (!erasing) setDangerOpen(false); }} eyebrow="Permanent action" title="Erase your Evolvra workspace?"><div className="danger-confirm"><span><Trash2 /></span><p>This removes all information in this workspace and, if connected, its cloud snapshot and account. Other account workspaces and the anonymous original stay separate on this device. Evolvra keeps an account-scoped cleanup checkpoint if cloud deletion finishes before device cleanup, so retry never depends on the deleted session.</p><div className="button-row end"><Button variant="ghost" disabled={erasing} onClick={() => setDangerOpen(false)}>Keep my data</Button><Button variant="danger" disabled={erasing} onClick={eraseEverything}>{erasing ? "Erasing…" : "Erase everything"}</Button></div></div></Modal>
   </div>;
 }

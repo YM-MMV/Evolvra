@@ -5,14 +5,13 @@ import { ArrowUpRight, CalendarDays, Flag } from "lucide-react";
 import { useApp } from "@/components/app-provider";
 import { DynamicIcon } from "@/components/icons";
 import { ProgressBar, Pill } from "@/components/ui";
+import { terminologyForms } from "@/lib/terminology";
 import type { Area, Goal } from "@/lib/types";
-import { goalProgress, isQuestAvailable, shortDate, singularizeTerm } from "@/lib/utils";
+import { goalProgress, isQuestAvailable, shortDate } from "@/lib/utils";
 
 export function GoalCard({ goal, area }: { goal: Goal; area?: Area }) {
   const { state } = useApp();
-  const terms = state.settings.terminology;
-  const goalTerm = singularizeTerm(terms.goals);
-  const milestoneTerm = singularizeTerm(terms.milestones);
+  const terms = terminologyForms(state.settings.terminology);
   const progress = goalProgress(goal);
   const active = goal.status === "active";
   const nextMilestone = active ? goal.milestones.find((milestone) => !milestone.completed) : undefined;
@@ -21,7 +20,13 @@ export function GoalCard({ goal, area }: { goal: Goal; area?: Area }) {
     .filter((quest) => quest.repeat !== "none" || !quest.completed)
     .filter((quest) => !isQuestAvailable(quest))
     .sort((a, b) => (a.dueDate ?? "9999-12-31").localeCompare(b.dueDate ?? "9999-12-31"))[0] : undefined;
-  const nextLabel = nextMilestone ? `Next ${milestoneTerm.toLowerCase()}` : nextQuest ? "Next action" : nextScheduledQuest ? "Next scheduled action" : `${goalTerm} status`;
+  const nextLabel = nextMilestone
+    ? `Next ${terms.milestones.singularLower}`
+    : nextQuest
+      ? `Next ${terms.quests.singularLower}`
+      : nextScheduledQuest
+        ? `Next scheduled ${terms.quests.singularLower}`
+        : `${terms.goals.singular} status`;
   const nextValue = goal.status === "completed"
     ? `Completed${goal.completedAt ? ` ${shortDate(goal.completedAt)}` : ""}`
     : goal.status === "archived"
@@ -30,7 +35,7 @@ export function GoalCard({ goal, area }: { goal: Goal; area?: Area }) {
         ? "Paused until you are ready"
         : nextMilestone?.title ?? nextQuest?.title ?? nextScheduledQuest?.title ?? "Ready for review";
   return (
-    <Link href={`/goals/${goal.id}`} className="goal-card panel" aria-label={`Open ${goalTerm.toLowerCase()}: ${goal.title}`}>
+    <Link href={`/goals/${goal.id}`} className="goal-card panel" aria-label={`Open ${terms.goals.singularLower}: ${goal.title}`}>
       <div className="goal-card-top">
         <span className="area-icon" style={{ color: area?.color, background: `${area?.color}18` }} aria-hidden="true"><DynamicIcon name={area?.icon ?? "Target"} /></span>
         <span className="goal-arrow" aria-hidden="true"><ArrowUpRight size={18} /></span>

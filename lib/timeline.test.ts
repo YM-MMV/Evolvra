@@ -83,8 +83,10 @@ describe("reconciledTimelineEvents", () => {
 
   it("uses current terminology in reconstructed permanent records", () => {
     const state = workspace();
+    state.settings.terminology.quests = "Rituals";
     state.settings.terminology.milestones = "Stages";
     state.goals[0].milestones = [{ id: "stage-1", title: "Outline approved", weight: 25, completed: true, completedAt: AT }];
+    expect(reconciledTimelineEvents(state).find((event) => event.type === "quest")?.detail).toContain("Ritual completed");
     expect(reconciledTimelineEvents(state).find((event) => event.type === "milestone")?.detail).toContain("Stage reached");
   });
 

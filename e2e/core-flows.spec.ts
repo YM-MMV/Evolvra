@@ -64,7 +64,7 @@ test("a repeating action records one occurrence and cannot be completed twice in
   await page.getByRole("button", { name: "Completed" }).click();
   await expect(page.getByText("Comfortable effort throughout.")).toBeVisible();
   await expect(page.getByText("32 actual min")).toBeVisible();
-  await expect(page.getByRole("region", { name: "Recorded actions" }).locator(".quest-board-list"))
+  await expect(page.getByRole("region", { name: "Recorded quests" }).locator(".quest-board-list"))
     .toContainText("Complete an easy 30-minute run");
   await expect(page.locator(".quest-board-row.completed")).toHaveCount(1);
 });

@@ -25,9 +25,10 @@ import { PwaRegistration } from "@/components/pwa-registration";
 import { ReminderScheduler } from "@/components/reminder-scheduler";
 import { Button } from "@/components/ui";
 import { privacySafeWorkspaceExport } from "@/lib/persistence";
+import { shellSyncStatusLabel } from "@/lib/provider-selectors";
 import { MAX_WORKSPACE_SERIALIZED_BYTES } from "@/lib/state-schema";
 import type { AnonymousHandoffChoice } from "@/lib/sync-reconciliation";
-import { singularizeTerm } from "@/lib/utils";
+import { terminologyForms, type TerminologyKey } from "@/lib/terminology";
 
 const MOBILE_NAV_QUERY = "(max-width: 900px)";
 const DRAWER_FOCUSABLE_SELECTOR = "a[href], button:not([disabled]), [tabindex]:not([tabindex='-1'])";
@@ -44,11 +45,11 @@ function drawerIsTopmostDialog(drawer: HTMLElement) {
   return dialogs.at(-1) === drawer;
 }
 
-const nav: { href: string; label: string; termKey?: "goals" | "quests" | "stats"; icon: typeof LayoutDashboard }[] = [
+const nav: { href: string; label?: string; termKey?: TerminologyKey; icon: typeof LayoutDashboard }[] = [
   { href: "/", label: "Command centre", icon: LayoutDashboard },
-  { href: "/goals", label: "Goals", termKey: "goals" as const, icon: Goal },
-  { href: "/quests", label: "Quests", termKey: "quests" as const, icon: CheckSquare2 },
-  { href: "/stats", label: "Stats", termKey: "stats" as const, icon: BarChart3 },
+  { href: "/goals", termKey: "goals", icon: Goal },
+  { href: "/quests", termKey: "quests", icon: CheckSquare2 },
+  { href: "/stats", termKey: "stats", icon: BarChart3 },
   { href: "/reviews", label: "Reviews", icon: Command },
   { href: "/timeline", label: "Timeline", icon: History },
 ];
@@ -73,6 +74,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
     signOut,
   } = useApp();
   const pathname = usePathname();
+  const terms = terminologyForms(state.settings.terminology);
   const [mobileOpen, setMobileOpen] = useState(false);
   const [workspaceChoicePending, setWorkspaceChoicePending] = useState(false);
   const [workspaceChoiceError, setWorkspaceChoiceError] = useState("");
@@ -269,55 +271,61 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   if (!ready) return <div className="loading-screen"><span className="brand-mark"><Sparkles /></span><p>Preparing your command centre…</p></div>;
   if (localWorkspaceConflict) {
     return (
-      <div
-        ref={localConflictDialogRef}
-        className="loading-screen"
-        role="dialog"
-        tabIndex={-1}
-        aria-modal="true"
-        aria-labelledby="local-workspace-conflict-title"
-        aria-describedby="local-workspace-conflict-description"
-      >
-        <span className="brand-mark"><CloudOff /></span>
-        <div style={{ width: "min(560px, calc(100vw - 40px))", textAlign: "center" }}>
-          <h1 id="local-workspace-conflict-title" style={{ fontSize: "clamp(24px, 5vw, 34px)" }}>This workspace changed in another tab</h1>
-          <p id="local-workspace-conflict-description">{localWorkspaceConflict.message} Download this tab&apos;s in-memory records before reloading if you need to preserve its unsaved changes.</p>
-          <p>File contents stored only on this device are not embedded in the download, and private account identifiers are removed from file references.</p>
-          <div className="button-row" style={{ justifyContent: "center", flexWrap: "wrap", marginTop: 22 }}>
-            <Button variant="secondary" onClick={exportCurrentMemory}>Download unsaved memory copy</Button>
-            <Button onClick={() => window.location.reload()}>Reload latest device copy</Button>
+      <>
+        <PwaRegistration goalIds={state.goals.map((goal) => goal.id)} goalLabel={terms.goals.pluralLower} goalSingularLabel={terms.goals.singularLower} showStatus={false} />
+        <div
+          ref={localConflictDialogRef}
+          className="loading-screen"
+          role="dialog"
+          tabIndex={-1}
+          aria-modal="true"
+          aria-labelledby="local-workspace-conflict-title"
+          aria-describedby="local-workspace-conflict-description"
+        >
+          <span className="brand-mark"><CloudOff /></span>
+          <div style={{ width: "min(560px, calc(100vw - 40px))", textAlign: "center" }}>
+            <h1 id="local-workspace-conflict-title" style={{ fontSize: "clamp(24px, 5vw, 34px)" }}>This workspace changed in another tab</h1>
+            <p id="local-workspace-conflict-description">{localWorkspaceConflict.message} Download this tab&apos;s in-memory records before reloading if you need to preserve its unsaved changes.</p>
+            <p>File contents stored only on this device are not embedded in the download, and private account identifiers are removed from file references.</p>
+            <div className="button-row" style={{ justifyContent: "center", flexWrap: "wrap", marginTop: 22 }}>
+              <Button variant="secondary" onClick={exportCurrentMemory}>Download unsaved memory copy</Button>
+              <Button onClick={() => window.location.reload()}>Reload latest device copy</Button>
+            </div>
           </div>
         </div>
-      </div>
+      </>
     );
   }
   if (workspaceSwitching) {
     return (
-      <div
-        ref={accountHandoff ? workspaceChoiceDialogRef : undefined}
-        className="loading-screen"
-        role={accountHandoff ? "dialog" : "status"}
-        tabIndex={accountHandoff ? -1 : undefined}
-        aria-modal={accountHandoff ? true : undefined}
-        aria-labelledby={accountHandoff ? "workspace-choice-title" : undefined}
-        aria-live={accountHandoff ? undefined : "polite"}
-      >
-        <span className="brand-mark"><Sparkles /></span>
-        {accountHandoff ? (
-          <div style={{ width: "min(680px, calc(100vw - 40px))", textAlign: "center" }}>
-            <h1 id="workspace-choice-title" style={{ fontSize: "clamp(24px, 5vw, 34px)" }}>Choose which private workspace to open</h1>
-            <p>This signed-in account and this device have separate workspaces. Nothing is copied automatically.</p>
-            <p>Merging combines their goals and activity while keeping the account profile, terminology, appearance, and other settings. The anonymous original stays separately on this device.</p>
-            {workspaceChoiceError && <div className="system-alert" role="alert">{workspaceChoiceError}</div>}
-            <div className="button-row" style={{ justifyContent: "center", flexWrap: "wrap", marginTop: 22 }}>
-              <Button variant="secondary" disabled={workspaceChoicePending} onClick={() => void chooseWorkspace("account")}>Keep account/cloud workspace</Button>
-              <Button disabled={workspaceChoicePending} onClick={() => void chooseWorkspace("merge")}>{workspaceChoicePending ? "Applying choice…" : "Merge device data into account"}</Button>
-              <Button variant="secondary" disabled={workspaceChoicePending} onClick={() => void chooseWorkspace("device")}>Replace account with device copy</Button>
-              <Button variant="ghost" disabled={workspaceChoicePending} onClick={() => void cancelWorkspaceSwitch()}>Cancel and sign out</Button>
+      <>
+        <PwaRegistration goalIds={[]} goalLabel={terms.goals.pluralLower} goalSingularLabel={terms.goals.singularLower} showStatus={false} />
+        <div
+          ref={accountHandoff ? workspaceChoiceDialogRef : undefined}
+          className="loading-screen"
+          role={accountHandoff ? "dialog" : "status"}
+          tabIndex={accountHandoff ? -1 : undefined}
+          aria-modal={accountHandoff ? true : undefined}
+          aria-labelledby={accountHandoff ? "workspace-choice-title" : undefined}
+          aria-live={accountHandoff ? undefined : "polite"}
+        >
+          <span className="brand-mark"><Sparkles /></span>
+          {accountHandoff ? (
+            <div style={{ width: "min(680px, calc(100vw - 40px))", textAlign: "center" }}>
+              <h1 id="workspace-choice-title" style={{ fontSize: "clamp(24px, 5vw, 34px)" }}>Choose which private workspace to open</h1>
+              <p>This signed-in account and this device have separate workspaces. Nothing is copied automatically.</p>
+              <p>Merging combines their {terms.goals.pluralLower} and activity while keeping the account profile, terminology, appearance, and other settings. The anonymous original stays separately on this device.</p>
+              {workspaceChoiceError && <div className="system-alert" role="alert">{workspaceChoiceError}</div>}
+              <div className="button-row" style={{ justifyContent: "center", flexWrap: "wrap", marginTop: 22 }}>
+                <Button variant="secondary" disabled={workspaceChoicePending} onClick={() => void chooseWorkspace("account")}>Keep account/cloud workspace</Button>
+                <Button disabled={workspaceChoicePending} onClick={() => void chooseWorkspace("merge")}>{workspaceChoicePending ? "Applying choice…" : "Merge device data into account"}</Button>
+                <Button variant="secondary" disabled={workspaceChoicePending} onClick={() => void chooseWorkspace("device")}>Replace account with device copy</Button>
+                <Button variant="ghost" disabled={workspaceChoicePending} onClick={() => void cancelWorkspaceSwitch()}>Cancel and sign out</Button>
+              </div>
             </div>
-          </div>
-        ) : <p>Opening your private workspace…</p>}
-      </div>
+          ) : <p>Opening your private workspace…</p>}
+        </div>
+      </>
     );
   }
   if (quarantinedRecovery) {
@@ -330,62 +338,55 @@ export function AppShell({ children }: { children: React.ReactNode }) {
       link.click();
       window.setTimeout(() => URL.revokeObjectURL(url), 1_000);
     };
-    return <div className="loading-screen" role="alertdialog" aria-modal="true" aria-labelledby="recovery-title" aria-describedby="recovery-description">
-      <span className="brand-mark"><CloudOff /></span>
-      <div style={{ width: "min(620px, calc(100vw - 40px))", textAlign: "center" }}>
-        <h1 id="recovery-title" style={{ fontSize: "clamp(24px, 5vw, 34px)" }}>This device copy needs recovery</h1>
-        <p id="recovery-description">{quarantinedRecovery.message}</p>
-        <p>Evolvra will not overwrite it. Download the damaged envelope for support, restore a validated backup, or explicitly erase only this account&apos;s device copy.</p>
-        {recoveryError && <div className="system-alert" role="alert">{recoveryError}</div>}
-        <div className="button-row" style={{ justifyContent: "center", flexWrap: "wrap", marginTop: 22 }}>
-          <Button variant="secondary" disabled={!quarantinedRecovery.rawJson || recoveryPending} onClick={downloadRaw}>Download damaged copy</Button>
-          <Button variant="secondary" disabled={recoveryPending} onClick={() => recoveryInputRef.current?.click()}>Restore backup</Button>
-          <Button disabled={recoveryPending} onClick={async () => {
-            if (!window.confirm("Erase this quarantined device copy and its device-only evidence? Cloud data is not erased.")) return;
+    return <>
+      <PwaRegistration goalIds={[]} goalLabel={terms.goals.pluralLower} goalSingularLabel={terms.goals.singularLower} showStatus={false} />
+      <div className="loading-screen" role="alertdialog" aria-modal="true" aria-labelledby="recovery-title" aria-describedby="recovery-description">
+        <span className="brand-mark"><CloudOff /></span>
+        <div style={{ width: "min(620px, calc(100vw - 40px))", textAlign: "center" }}>
+          <h1 id="recovery-title" style={{ fontSize: "clamp(24px, 5vw, 34px)" }}>This device copy needs recovery</h1>
+          <p id="recovery-description">{quarantinedRecovery.message}</p>
+          <p>Evolvra will not overwrite it. Download the damaged envelope for support, restore a validated backup, or explicitly erase only this account&apos;s device copy.</p>
+          {recoveryError && <div className="system-alert" role="alert">{recoveryError}</div>}
+          <div className="button-row" style={{ justifyContent: "center", flexWrap: "wrap", marginTop: 22 }}>
+            <Button variant="secondary" disabled={!quarantinedRecovery.rawJson || recoveryPending} onClick={downloadRaw}>Download damaged copy</Button>
+            <Button variant="secondary" disabled={recoveryPending} onClick={() => recoveryInputRef.current?.click()}>Restore backup</Button>
+            <Button disabled={recoveryPending} onClick={async () => {
+              if (!window.confirm("Erase this quarantined device copy and its device-only evidence? Cloud data is not erased.")) return;
+              setRecoveryPending(true); setRecoveryError("");
+              try { await discardQuarantinedWorkspace(); } catch (error) { setRecoveryError(error instanceof Error ? error.message : "The quarantined device copy could not be erased."); } finally { setRecoveryPending(false); }
+            }}>{recoveryPending ? "Working…" : "Erase device copy"}</Button>
+          </div>
+          <input ref={recoveryInputRef} hidden type="file" accept="application/json,.json" onChange={async (event) => {
+            const file = event.target.files?.[0]; event.target.value = ""; if (!file) return;
+            if (file.size > MAX_WORKSPACE_SERIALIZED_BYTES) {
+              setRecoveryError("That backup is too large to import safely. Choose a file no larger than 5 MB.");
+              return;
+            }
             setRecoveryPending(true); setRecoveryError("");
-            try { await discardQuarantinedWorkspace(); } catch (error) { setRecoveryError(error instanceof Error ? error.message : "The quarantined device copy could not be erased."); } finally { setRecoveryPending(false); }
-          }}>{recoveryPending ? "Working…" : "Erase device copy"}</Button>
+            try { await importState(JSON.parse(await file.text()) as unknown); } catch (error) { setRecoveryError(error instanceof Error ? error.message : "The selected backup could not be restored."); } finally { setRecoveryPending(false); }
+          }} />
         </div>
-        <input ref={recoveryInputRef} hidden type="file" accept="application/json,.json" onChange={async (event) => {
-          const file = event.target.files?.[0]; event.target.value = ""; if (!file) return;
-          if (file.size > MAX_WORKSPACE_SERIALIZED_BYTES) {
-            setRecoveryError("That backup is too large to import safely. Choose a file no larger than 5 MB.");
-            return;
-          }
-          setRecoveryPending(true); setRecoveryError("");
-          try { await importState(JSON.parse(await file.text()) as unknown); } catch (error) { setRecoveryError(error instanceof Error ? error.message : "The selected backup could not be restored."); } finally { setRecoveryPending(false); }
-        }} />
       </div>
-    </div>;
+    </>;
   }
-  if (!state.profile.onboarded) return <Onboarding key={workspaceScopeKey} systemAlert={persistenceError} />;
+  if (!state.profile.onboarded) return <>
+    <PwaRegistration goalIds={[]} goalLabel={terms.goals.pluralLower} goalSingularLabel={terms.goals.singularLower} showStatus={false} />
+    <Onboarding key={workspaceScopeKey} systemAlert={persistenceError} />
+  </>;
 
   const activeGoalCount = state.goals.filter((goal) => goal.status === "active").length;
   const completedActionCount = state.questCompletions.length;
-  const goalTerm = singularizeTerm(state.settings.terminology.goals);
   const current = nav.find((item) => item.href === pathname) ?? nav.find((item) => item.href !== "/" && pathname.startsWith(item.href));
   const currentLabel = pathname.startsWith("/settings")
     ? "Customise"
     : current?.termKey
-      ? state.settings.terminology[current.termKey]
+      ? terms[current.termKey].plural
       : current?.label ?? "Evolvra";
-  const syncLabel = !user
-    ? "Private on this device"
-    : syncStatus === "persisting"
-      ? "Saving to this device…"
-      : syncStatus === "offline"
-        ? "Offline — saved on this device"
-        : syncStatus === "unsaved"
-          ? "Changes waiting to sync"
-          : syncStatus === "saving"
-            ? "Saving changes…"
-            : syncStatus === "connecting"
-              ? "Connecting to private sync…"
-              : syncStatus === "conflict"
-                ? "Sync choice required"
-                : syncStatus === "error"
-                  ? "Sync needs attention"
-                  : "Private sync up to date";
+  const syncLabel = shellSyncStatusLabel({
+    authenticated: Boolean(user),
+    handoffPending: Boolean(accountHandoff),
+    syncStatus,
+  });
 
   return (
     <div className="app-layout">
@@ -397,13 +398,13 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         <nav className="nav-list">
           {nav.map(({ href, label, termKey, icon: Icon }) => {
             const active = href === "/" ? pathname === href : pathname.startsWith(href);
-            const displayLabel = termKey ? state.settings.terminology[termKey] : label;
+            const displayLabel = termKey ? terms[termKey].plural : label;
             return <Link key={href} href={href} className={active ? "active" : ""} aria-current={active ? "page" : undefined} onClick={() => setMobileOpen(false)}><Icon size={17} /><span>{displayLabel}</span>{active && <i />}</Link>;
           })}
         </nav>
-        <div className="workspace-summary" aria-label={`${activeGoalCount} active ${state.settings.terminology.goals.toLowerCase()} and ${completedActionCount} completed actions recorded`}>
+        <div className="workspace-summary" aria-label={`${activeGoalCount} active ${activeGoalCount === 1 ? terms.goals.singularLower : terms.goals.pluralLower} and ${completedActionCount} completed ${completedActionCount === 1 ? terms.quests.singularLower : terms.quests.pluralLower} recorded`}>
           <span className="workspace-orb"><Goal size={18} /></span>
-          <div><small>Current focus</small><strong>{activeGoalCount} active {activeGoalCount === 1 ? goalTerm.toLowerCase() : state.settings.terminology.goals.toLowerCase()}</strong><span>{completedActionCount} completed {completedActionCount === 1 ? "action" : "actions"} recorded</span></div>
+          <div><small>Current focus</small><strong>{activeGoalCount} active {activeGoalCount === 1 ? terms.goals.singularLower : terms.goals.pluralLower}</strong><span>{completedActionCount} completed {completedActionCount === 1 ? terms.quests.singularLower : terms.quests.pluralLower} recorded</span></div>
         </div>
         <div className="sidebar-bottom">
           <Link href="/settings" aria-label="Customise settings" className={pathname.startsWith("/settings") ? "active" : ""} aria-current={pathname.startsWith("/settings") ? "page" : undefined} onClick={() => setMobileOpen(false)}><Settings size={17} /><span>Customise</span></Link>
@@ -416,17 +417,17 @@ export function AppShell({ children }: { children: React.ReactNode }) {
           <div className="topbar-title"><button ref={menuButtonRef} className="mobile-menu icon-button" onClick={(event) => { event.currentTarget.blur(); setMobileOpen(true); }} aria-label="Open menu" aria-haspopup="dialog" aria-expanded={mobileOpen} aria-controls="primary-navigation"><Menu size={21} /></button><div><small>Workspace / {currentLabel}</small><strong>{state.profile.chapter}</strong></div></div>
           <div className="topbar-actions">
             {canUndo && <button className="undo-button" onClick={undo} aria-label="Undo most recent change"><RotateCcw size={15} /><span>Undo</span></button>}
-            <Link href="/goals?new=true" className="quick-add" aria-label={`Create a new ${goalTerm.toLowerCase()}`}><Plus size={17} /><span>New {goalTerm.toLowerCase()}</span></Link>
+            <Link href="/goals?new=true" className="quick-add" aria-label={`Create a new ${terms.goals.singularLower}`}><Plus size={17} /><span>New {terms.goals.singularLower}</span></Link>
             <Link href="/settings" className="avatar" aria-label="Open settings">{state.profile.displayName.slice(0, 2).toUpperCase()}</Link>
           </div>
         </header>
-        <PwaRegistration />
+        <PwaRegistration goalIds={state.goals.map((goal) => goal.id)} goalLabel={terms.goals.pluralLower} goalSingularLabel={terms.goals.singularLower} />
         <ReminderScheduler />
         {persistenceError && <div className="system-alert" role="alert">{persistenceError}</div>}
         <main key={workspaceScopeKey} id="main-content" tabIndex={-1} className="page-container">{children}</main>
         <footer className="system-footer">
           <span><i className={user && syncStatus === "synced" ? "online" : "local"} />{user ? syncLabel.toUpperCase() : "LOCAL-FIRST MODE"}</span>
-          <span>{completedActionCount.toLocaleString("en-GB")} COMPLETED ACTIONS</span>
+          <span>{completedActionCount.toLocaleString("en-GB")} COMPLETED {terms.quests.plural.toLocaleUpperCase()}</span>
           <span>EVOLVRA / BETA</span>
         </footer>
       </div>

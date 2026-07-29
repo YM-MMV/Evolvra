@@ -63,7 +63,7 @@ test("a granted local reminder schedules a privacy-safe notification", async ({ 
   await expect.poll(() => page.evaluate(() => (window as typeof window & { __scheduledNotifications?: unknown[] }).__scheduledNotifications?.length ?? 0), { timeout: 15_000 }).toBeGreaterThan(0);
   const notification = await page.evaluate(() => (window as typeof window & { __scheduledNotifications?: Array<{ title: string; body?: string; tag?: string }> }).__scheduledNotifications?.[0]);
   expect(notification?.title).toBe("A calm Evolvra check-in");
-  expect(notification?.body).toMatch(/^\d+ actions? (is|are) ready when you are\.$/);
+  expect(notification?.body).toMatch(/^\d+ quests? (is|are) ready when you are\.$/);
   expect(notification?.tag).toMatch(/^evolvra-reminder-\d{4}-\d{2}-\d{2}$/);
   expect(JSON.stringify(notification)).not.toContain("Reminder Tester");
 });

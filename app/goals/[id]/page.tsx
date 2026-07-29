@@ -12,6 +12,7 @@ import { QuestCompletionForm } from "@/components/quest-completion-form";
 import { MetricHistoryChart } from "@/components/metric-history-chart";
 import { Button, EmptyState, Field, FieldGroup, Modal, Panel, Pill, ProgressBar } from "@/components/ui";
 import { completionGoalIds } from "@/lib/activity-attribution";
+import { selectConsistencySummary } from "@/lib/consistency-summary";
 import {
   ALLOWED_EVIDENCE_MIME_TYPES,
   goalEvidenceFromText,
@@ -22,6 +23,7 @@ import {
   normalizeEvidenceMimeType,
   normalizedEvidenceBlob,
 } from "@/lib/goal-evidence";
+import { goalProgressConfigurationIssue, metricsForGoalModel } from "@/lib/goal-progress";
 import { deleteEvidenceBlob, readEvidenceBlob, storeEvidenceBlob } from "@/lib/persistence";
 import { WORKSPACE_TEXT_LIMITS } from "@/lib/state-schema";
 import { getSupabase } from "@/lib/supabase";
@@ -54,6 +56,23 @@ const nearInstant = (left: string, right: string) => {
   const leftTime = new Date(left).getTime();
   const rightTime = new Date(right).getTime();
   return Number.isFinite(leftTime) && Number.isFinite(rightTime) && Math.abs(leftTime - rightTime) <= 1_000;
+};
+
+const formatRecordedTime = (minutes: number) => {
+  if (!minutes) return "0m";
+  const hours = Math.floor(minutes / 60);
+  const remainder = minutes % 60;
+  if (!hours) return `${remainder}m`;
+  return remainder ? `${hours}h ${remainder}m` : `${hours}h`;
+};
+
+const momentumValue = (
+  summary: ReturnType<typeof selectConsistencySummary>["longTermMomentum"],
+) => {
+  if (summary.direction === "no-data") return "No history";
+  if (summary.direction === "steady") return "Steady";
+  if (summary.direction === "rising" && summary.previousSessions === 0) return "New rhythm";
+  return `${summary.change > 0 ? "+" : "−"}${Math.abs(summary.change)}`;
 };
 
 export default function GoalDetailPage() {
@@ -140,8 +159,8 @@ export default function GoalDetailPage() {
         type: "quest" as const,
         title: completion.title,
         detail: completion.goalId === goal.id
-          ? "Action completion retained in the permanent record."
-          : `Shared action whose primary home is ${primaryGoal?.title ?? `another ${goalTerm.toLowerCase()}`}.`,
+          ? `${questTerm} completion retained in the permanent record.`
+          : `Shared ${questTerm.toLowerCase()} whose primary home is ${primaryGoal?.title ?? `another ${goalTerm.toLowerCase()}`}.`,
         at: completion.completedAt,
         goalId: completion.goalId,
         areaId: primaryGoal?.areaId,
@@ -161,12 +180,16 @@ export default function GoalDetailPage() {
   const activity = [...canonicalActivity, ...structuralActivity].sort((left, right) => right.at.localeCompare(left.at));
   const goalCompletions = state.questCompletions.filter((item) => completionGoalIds(item).includes(goal.id));
   const completedQuests = goalCompletions.length;
-  const recentCompletions = goalCompletions.filter((item) => analysisNow - new Date(item.completedAt).getTime() < 30 * 86_400_000);
-  const previousCompletions = goalCompletions.filter((item) => {
-    const age = analysisNow - new Date(item.completedAt).getTime();
-    return age >= 30 * 86_400_000 && age < 60 * 86_400_000;
-  });
-  const totalMinutes = goalCompletions.reduce((sum, item) => sum + (item.durationMinutes ?? 0), 0);
+  const consistencySummary = selectConsistencySummary(
+    state.questCompletions,
+    goal.id,
+    new Date(analysisNow),
+  );
+  const editMetrics = metricsForGoalModel(goal.metrics, editModel);
+  const goalEditProgressIssue = goalProgressConfigurationIssue({
+    model: editModel,
+    metrics: editMetrics,
+  }, goalTerm.toLowerCase());
   const totalWeight = goal.milestones.reduce((sum, milestone) => sum + milestone.weight, 0);
 
   const addMilestone = () => {
@@ -241,7 +264,7 @@ export default function GoalDetailPage() {
       (goal.model === "numeric" || goal.model === "consistency")
       && (!metrics.length || !metrics.some((item) => item.weight > 0))
     ) {
-      setEvidenceMessage("A measured goal needs at least one metric with a positive relative weight. Add or reweight another metric first.");
+      setEvidenceMessage(`A measured ${goalTerm.toLowerCase()} needs at least one metric with a positive relative weight. Add or reweight another metric first.`);
       return;
     }
     if (!window.confirm(`Delete ${metric.label}? Its recorded history will remain in the timeline.`)) return;
@@ -260,17 +283,8 @@ export default function GoalDetailPage() {
   };
 
   const saveGoalEdit = () => {
-    if (!editTitle.trim() || !editDescription.trim() || !editAreaId) return;
-    const metrics = goal.metrics.map((metric) => {
-      if (editModel === "consistency") {
-        const period = metric.period ?? "month";
-        return { ...metric, period, periodKey: metric.periodKey ?? activePeriodKey(period) };
-      }
-      const { period: _period, periodKey: _periodKey, ...unscopedMetric } = metric;
-      void _period;
-      void _periodKey;
-      return unscopedMetric;
-    });
+    const metrics = metricsForGoalModel(goal.metrics, editModel, new Date());
+    if (!editTitle.trim() || !editDescription.trim() || !editAreaId || goalProgressConfigurationIssue({ model: editModel, metrics })) return;
     updateGoal(goal.id, { title: editTitle.trim(), description: editDescription.trim(), areaId: editAreaId, model: editModel, priority: editPriority, targetDate: editTargetDate || undefined, statIds: editStatIds, metrics });
     setGoalEditOpen(false);
   };
@@ -730,7 +744,7 @@ export default function GoalDetailPage() {
         </Panel>
 
         <Panel>
-          <div className="section-heading"><div><p className="eyebrow">Actions that move it</p><h2>{questTerm} board</h2></div><Button onClick={() => { setEditingQuestId(null); setQuestOpen(true); }}><Plus size={15} /> Add {questTerm.toLowerCase()}</Button></div>
+          <div className="section-heading"><div><p className="eyebrow">{terms.quests} that move it</p><h2>{questTerm} board</h2></div><Button onClick={() => { setEditingQuestId(null); setQuestOpen(true); }}><Plus size={15} /> Add {questTerm.toLowerCase()}</Button></div>
           <div className="quest-list">{goal.quests.map((quest, index) => {
             const available = isQuestAvailable(quest);
             return <div key={quest.id} className={quest.completed ? "quest-row completed" : "quest-row"}>
@@ -740,12 +754,12 @@ export default function GoalDetailPage() {
               <div className="item-actions"><button aria-label={`Move ${quest.title} up`} disabled={index === 0} onClick={() => updateGoal(goal.id, { quests: reorder(goal.quests, index, -1) })}><ArrowUp size={14} /></button><button aria-label={`Move ${quest.title} down`} disabled={index === goal.quests.length - 1} onClick={() => updateGoal(goal.id, { quests: reorder(goal.quests, index, 1) })}><ArrowDown size={14} /></button><button aria-label={`Edit ${quest.title}`} onClick={() => { setEditingQuestId(quest.id); setQuestOpen(true); }}><Edit3 size={14} /></button><button className="danger" aria-label={`Delete ${quest.title}`} onClick={() => { if (window.confirm(`Delete ${quest.title}? Existing completion history will remain.`)) updateGoal(goal.id, { quests: goal.quests.filter((item) => item.id !== quest.id) }); }}><Trash2 size={14} /></button></div>
             </div>;
           })}</div>
-          {!goal.quests.length && <EmptyState icon={<Check />} title="No next action yet" body="Add the smallest useful action that would create genuine movement." />}
+          {!goal.quests.length && <EmptyState icon={<Check />} title={`No next ${questTerm.toLowerCase()} yet`} body={`Add the smallest useful ${questTerm.toLowerCase()} that would create genuine movement.`} />}
         </Panel>
 
         {sharedQuests.length ? <Panel>
-          <div className="section-heading"><div><p className="eyebrow">Shared support</p><h2>Actions housed in other {terms.goals.toLowerCase()}</h2></div></div>
-          <p className="supportive-copy">These actions also support this {goalTerm.toLowerCase()}, while editing and completion remain attached to one canonical primary {goalTerm.toLowerCase()}.</p>
+          <div className="section-heading"><div><p className="eyebrow">Shared support</p><h2>{terms.quests} housed in other {terms.goals.toLowerCase()}</h2></div></div>
+          <p className="supportive-copy">These {terms.quests.toLowerCase()} also support this {goalTerm.toLowerCase()}, while editing and completion remain attached to one canonical primary {goalTerm.toLowerCase()}.</p>
           <div className="quest-list">{sharedQuests.map(({ primaryGoal, quest }) => <div key={`${primaryGoal.id}:${quest.id}`} className={quest.completed ? "quest-row completed" : "quest-row"}>
             <span className="quest-check" aria-hidden="true">{quest.completed ? <Check size={16} /> : <Circle size={17} />}</span>
             <div><strong>{quest.title}</strong><span>Primary home: <Link href={`/goals/${primaryGoal.id}`}>{primaryGoal.title}</Link></span></div>
@@ -779,9 +793,9 @@ export default function GoalDetailPage() {
       </div>
 
       <aside className="goal-detail-rail">
-        <Panel><div className="section-heading compact"><div><p className="eyebrow">Personal development</p><h2>Connected qualities</h2></div></div><div className="connected-stats">{goal.statIds.map((statId) => { const stat = state.stats.find((item) => item.id === statId); if (!stat) return null; return <div key={statId}><span style={{ color: stat.color, background: `${stat.color}18` }}><DynamicIcon name={stat.icon} size={17} /></span><div><strong>{stat.name}</strong><small>Connected to this {goalTerm.toLowerCase()}</small></div></div>; })}</div></Panel>
-        {goal.model === "consistency" && <Panel><div className="section-heading compact"><div><p className="eyebrow">Consistency context</p><h2>Real activity</h2></div></div><div className="record-grid"><div><strong>{goalCompletions.length}</strong><span>all-time sessions</span></div><div><strong>{totalMinutes ? `${Math.round(totalMinutes / 60 * 10) / 10}h` : "—"}</strong><span>time recorded</span></div><div><strong>{recentCompletions.length}</strong><span>last 30 days</span></div><div><strong>{previousCompletions.length}</strong><span>previous 30 days</span></div></div><p className="supportive-copy">This comparison describes your recorded rhythm. A quieter month is context, not a judgement.</p></Panel>}
-        <Panel><div className="section-heading compact"><div><p className="eyebrow">At a glance</p><h2>{goalTerm} record</h2></div></div><div className="record-grid"><div><strong>{completedQuests}</strong><span>actions completed</span></div><div><strong>{goal.milestones.filter((item) => item.completed).length}/{goal.milestones.length}</strong><span>{terms.milestones.toLowerCase()} reached</span></div><div><strong>{goal.checkIns.length}</strong><span>written check-ins</span></div><div><strong>{activity.length}</strong><span>recent events</span></div></div></Panel>
+        <Panel><div className="section-heading compact"><div><p className="eyebrow">Personal development</p><h2>Connected {terms.stats.toLowerCase()}</h2></div></div><div className="connected-stats">{goal.statIds.map((statId) => { const stat = state.stats.find((item) => item.id === statId); if (!stat) return null; return <div key={statId}><span style={{ color: stat.color, background: `${stat.color}18` }}><DynamicIcon name={stat.icon} size={17} /></span><div><strong>{stat.name}</strong><small>Connected to this {goalTerm.toLowerCase()}</small></div></div>; })}</div></Panel>
+        {goal.model === "consistency" && <Panel><div className="section-heading compact"><div><p className="eyebrow">Consistency context</p><h2>Real activity</h2></div></div><div className="record-grid"><div><strong>{consistencySummary.weeklyRate}</strong><span>weekly rate · sessions / 7 days</span></div><div><strong>{consistencySummary.monthlyRate}</strong><span>monthly rate · sessions / 30 days</span></div><div><strong>{consistencySummary.totalSessions}</strong><span>total sessions</span></div><div><strong>{formatRecordedTime(consistencySummary.totalRecordedMinutes)}</strong><span>total recorded time</span></div><div><strong>{momentumValue(consistencySummary.longTermMomentum)}</strong><span>long-term momentum · vs prior 30 days</span></div></div><p className="supportive-copy">The latest 30 days contain {consistencySummary.longTermMomentum.currentSessions} sessions, compared with {consistencySummary.longTermMomentum.previousSessions} in the preceding 30 days. This is context, not a judgement.</p></Panel>}
+        <Panel><div className="section-heading compact"><div><p className="eyebrow">At a glance</p><h2>{goalTerm} record</h2></div></div><div className="record-grid"><div><strong>{completedQuests}</strong><span>{terms.quests.toLowerCase()} completed</span></div><div><strong>{goal.milestones.filter((item) => item.completed).length}/{goal.milestones.length}</strong><span>{terms.milestones.toLowerCase()} reached</span></div><div><strong>{goal.checkIns.length}</strong><span>written check-ins</span></div><div><strong>{activity.length}</strong><span>recent events</span></div></div></Panel>
         <Panel><div className="section-heading compact"><div><p className="eyebrow">History</p><h2>Recent movement</h2></div></div><div className="activity-list">{activity.slice(0, visibleActivity).map((event) => { const primaryGoal = event.goalId && event.goalId !== goal.id ? state.goals.find((item) => item.id === event.goalId) : undefined; return <div key={event.id}><span className={`event-dot type-${event.type}`} /><div><strong>{event.title}</strong><small>{formatDate(event.at)}{primaryGoal ? <> · Primary home: <Link href={`/goals/${primaryGoal.id}`}>{primaryGoal.title}</Link></> : null}</small></div></div>; })}{!activity.length && <p className="muted-copy">Activity will appear as you progress this {goalTerm.toLowerCase()}.</p>}{visibleActivity < activity.length ? <button className="button button-secondary history-load-more" onClick={() => setVisibleActivity((count) => count + 12)}>Load older activity ({activity.length - visibleActivity} remaining)</button> : null}</div></Panel>
       </aside>
     </div>
@@ -799,7 +813,7 @@ export default function GoalDetailPage() {
       </div>}
     </Modal>
     <Modal open={milestoneOpen} onClose={() => { setMilestoneOpen(false); setEditingMilestoneId(null); setMilestoneError(""); }} title={editingMilestoneId ? `Edit ${milestoneTerm.toLowerCase()}` : `Add a ${milestoneTerm.toLowerCase()}`} eyebrow="Meaningful stage"><div className="form-stack"><Field label={milestoneTerm}><input data-modal-autofocus="true" maxLength={WORKSPACE_TEXT_LIMITS.milestoneTitle} value={milestoneTitle} onChange={(e) => setMilestoneTitle(e.target.value)} placeholder="Pass the A2 assessment" /></Field>{goal.model === "weighted" && <Field label={`${goalTerm} weight`} hint={`Weighted ${terms.milestones.toLowerCase()} must total no more than 100%`}><input type="number" min="0" max="100" value={milestoneWeight} onChange={(e) => { const next = Number(e.target.value); setMilestoneWeight(isFiniteWorkspaceNumber(next, 0, 100) ? next : 0); setMilestoneError(""); }} /></Field>}{milestoneError && <p className="evidence-message" role="alert">{milestoneError}</p>}<div className="button-row end"><Button variant="ghost" onClick={() => setMilestoneOpen(false)}>Cancel</Button><Button disabled={!milestoneTitle.trim() || (goal.model === "weighted" && !isFiniteWorkspaceNumber(milestoneWeight, 0, 100))} onClick={addMilestone}><Save size={16} /> Save {milestoneTerm.toLowerCase()}</Button></div></div></Modal>
-    <Modal open={metricOpen} onClose={() => { setMetricOpen(false); setEditingMetricId(null); setMetricError(""); }} title={editingMetricId ? "Edit metric" : "Add a metric"} eyebrow="Real-world measurement"><div className="form-stack"><Field label="Metric"><input data-modal-autofocus="true" maxLength={WORKSPACE_TEXT_LIMITS.metricLabel} value={metricLabel} onChange={(e) => setMetricLabel(e.target.value)} placeholder="Applications submitted" /></Field><div className="form-grid"><Field label="Target"><input type="number" min="0.0000000001" max={MAX_WORKSPACE_NUMBER} value={metricTarget} onChange={(e) => { const next = Number(e.target.value); setMetricTarget(isFiniteWorkspaceNumber(next, Number.MIN_VALUE) ? next : 0); setMetricError(""); }} /></Field><Field label="Unit"><input maxLength={WORKSPACE_TEXT_LIMITS.metricUnit} value={metricUnit} onChange={(e) => setMetricUnit(e.target.value)} placeholder="applications, £, sessions…" /></Field></div>{goal.model === "numeric" && <Field label="Relative weight" hint="Used when this goal has multiple metrics"><input type="number" min="0" max="100" value={metricWeight} onChange={(e) => { const next = Number(e.target.value); setMetricWeight(isFiniteWorkspaceNumber(next, 0, 100) ? next : 0); setMetricError(""); }} /></Field>}{goal.model === "consistency" && <Field label="Reset this count every"><select value={metricPeriod} onChange={(e) => setMetricPeriod(e.target.value as ConsistencyPeriod)}><option value="week">Week</option><option value="month">Month</option><option value="quarter">Quarter</option><option value="year">Year</option></select></Field>}{metricError && <p className="evidence-message" role="alert">{metricError}</p>}<div className="button-row end"><Button variant="ghost" onClick={() => setMetricOpen(false)}>Cancel</Button><Button disabled={!metricLabel.trim() || !isFiniteWorkspaceNumber(metricTarget, Number.MIN_VALUE) || !isFiniteWorkspaceNumber(metricWeight, 0, 100)} onClick={saveMetric}><Save size={16} /> Save metric</Button></div></div></Modal>
-    <Modal open={goalEditOpen} onClose={() => setGoalEditOpen(false)} title={`Edit ${goalTerm.toLowerCase()}`} eyebrow="Direction and connections" wide><div className="form-stack"><Field label={`${goalTerm} title`}><input data-modal-autofocus="true" maxLength={WORKSPACE_TEXT_LIMITS.goalTitle} value={editTitle} onChange={(e) => setEditTitle(e.target.value)} /></Field><Field label="Why this matters"><textarea rows={3} maxLength={WORKSPACE_TEXT_LIMITS.goalDescription} value={editDescription} onChange={(e) => setEditDescription(e.target.value)} /></Field><div className="form-grid thirds"><Field label={`Life ${areaTerm.toLowerCase()}`}><select value={editAreaId} onChange={(e) => setEditAreaId(e.target.value)}>{state.areas.filter((item) => (!item.archived && !item.hidden) || item.id === editAreaId).map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></Field><Field label="Progress model"><select value={editModel} onChange={(e) => setEditModel(e.target.value as GoalModel)}><option value="numeric">Numeric metrics</option><option value="weighted">Weighted {terms.milestones.toLowerCase()}</option><option value="consistency">Consistency period</option><option value="open">Open reflection</option></select></Field><Field label="Importance"><select value={editPriority} onChange={(e) => setEditPriority(e.target.value as Priority)}><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option><option value="critical">Critical</option></select></Field></div><Field label="Target date" hint="Optional"><input type="date" value={editTargetDate} onChange={(e) => setEditTargetDate(e.target.value)} /></Field>{editModel !== goal.model && <p className="setting-note">Changing the model keeps compatible structures and permanent history. Review the new model after saving so it reflects the outcome honestly.</p>}<FieldGroup label="Connected qualities"><div className="quality-list">{state.stats.filter((item) => !item.archived || editStatIds.includes(item.id)).map((stat) => { const selected = editStatIds.includes(stat.id); return <button type="button" key={stat.id} className={selected ? "selected" : ""} aria-pressed={selected} onClick={() => setEditStatIds((current) => selected ? current.filter((id) => id !== stat.id) : [...current, stat.id])}><i style={{ background: stat.color }} /><span>{stat.name}</span>{selected && <Check size={15} aria-hidden="true" />}</button>; })}</div></FieldGroup><div className="button-row end"><Button variant="ghost" onClick={() => setGoalEditOpen(false)}>Cancel</Button><Button disabled={!editTitle.trim() || !editDescription.trim() || !editAreaId} onClick={saveGoalEdit}><Save size={16} /> Save {goalTerm.toLowerCase()}</Button></div></div></Modal>
+    <Modal open={metricOpen} onClose={() => { setMetricOpen(false); setEditingMetricId(null); setMetricError(""); }} title={editingMetricId ? "Edit metric" : "Add a metric"} eyebrow="Real-world measurement"><div className="form-stack"><Field label="Metric"><input data-modal-autofocus="true" maxLength={WORKSPACE_TEXT_LIMITS.metricLabel} value={metricLabel} onChange={(e) => setMetricLabel(e.target.value)} placeholder="Applications submitted" /></Field><div className="form-grid"><Field label="Target"><input type="number" min="0.0000000001" max={MAX_WORKSPACE_NUMBER} value={metricTarget} onChange={(e) => { const next = Number(e.target.value); setMetricTarget(isFiniteWorkspaceNumber(next, Number.MIN_VALUE) ? next : 0); setMetricError(""); }} /></Field><Field label="Unit"><input maxLength={WORKSPACE_TEXT_LIMITS.metricUnit} value={metricUnit} onChange={(e) => setMetricUnit(e.target.value)} placeholder="applications, £, sessions…" /></Field></div><Field label="Relative weight" hint={`Used when this ${goalTerm.toLowerCase()} has multiple metrics`}><input type="number" min="0" max="100" value={metricWeight} onChange={(e) => { const next = Number(e.target.value); setMetricWeight(isFiniteWorkspaceNumber(next, 0, 100) ? next : 0); setMetricError(""); }} /></Field>{goal.model === "consistency" && <Field label="Reset this count every"><select value={metricPeriod} onChange={(e) => setMetricPeriod(e.target.value as ConsistencyPeriod)}><option value="week">Week</option><option value="month">Month</option><option value="quarter">Quarter</option><option value="year">Year</option></select></Field>}{metricError && <p className="evidence-message" role="alert">{metricError}</p>}<div className="button-row end"><Button variant="ghost" onClick={() => setMetricOpen(false)}>Cancel</Button><Button disabled={!metricLabel.trim() || !isFiniteWorkspaceNumber(metricTarget, Number.MIN_VALUE) || !isFiniteWorkspaceNumber(metricWeight, 0, 100)} onClick={saveMetric}><Save size={16} /> Save metric</Button></div></div></Modal>
+    <Modal open={goalEditOpen} onClose={() => setGoalEditOpen(false)} title={`Edit ${goalTerm.toLowerCase()}`} eyebrow="Direction and connections" wide><div className="form-stack"><Field label={`${goalTerm} title`}><input data-modal-autofocus="true" maxLength={WORKSPACE_TEXT_LIMITS.goalTitle} value={editTitle} onChange={(e) => setEditTitle(e.target.value)} /></Field><Field label="Why this matters"><textarea rows={3} maxLength={WORKSPACE_TEXT_LIMITS.goalDescription} value={editDescription} onChange={(e) => setEditDescription(e.target.value)} /></Field><div className="form-grid thirds"><Field label={`Life ${areaTerm.toLowerCase()}`}><select value={editAreaId} onChange={(e) => setEditAreaId(e.target.value)}>{state.areas.filter((item) => (!item.archived && !item.hidden) || item.id === editAreaId).map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></Field><Field label="Progress model"><select value={editModel} onChange={(e) => setEditModel(e.target.value as GoalModel)}><option value="numeric">Numeric metrics</option><option value="weighted">Weighted {terms.milestones.toLowerCase()}</option><option value="consistency">Consistency period</option><option value="open">Open reflection</option></select></Field><Field label="Importance"><select value={editPriority} onChange={(e) => setEditPriority(e.target.value as Priority)}><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option><option value="critical">Critical</option></select></Field></div><Field label="Target date" hint="Optional"><input type="date" value={editTargetDate} onChange={(e) => setEditTargetDate(e.target.value)} /></Field>{editModel !== goal.model && <p className="setting-note">Changing the model keeps compatible structures and permanent history. Review the new model after saving so it reflects the outcome honestly.</p>}{goalEditProgressIssue && <div className="setting-note" role="alert"><p>{goalEditProgressIssue} Add or reweight a measurement before saving this progress model.</p>{!goal.metrics.length && <Button variant="secondary" onClick={() => { setGoalEditOpen(false); openMetric(); }}><Plus size={15} /> Add measurement</Button>}</div>}<FieldGroup label={`Connected ${terms.stats.toLowerCase()}`}><div className="quality-list">{state.stats.filter((item) => !item.archived || editStatIds.includes(item.id)).map((stat) => { const selected = editStatIds.includes(stat.id); return <button type="button" key={stat.id} className={selected ? "selected" : ""} aria-pressed={selected} onClick={() => setEditStatIds((current) => selected ? current.filter((id) => id !== stat.id) : [...current, stat.id])}><i style={{ background: stat.color }} /><span>{stat.name}</span>{selected && <Check size={15} aria-hidden="true" />}</button>; })}</div></FieldGroup><div className="button-row end"><Button variant="ghost" onClick={() => setGoalEditOpen(false)}>Cancel</Button><Button disabled={!editTitle.trim() || !editDescription.trim() || !editAreaId || Boolean(goalEditProgressIssue)} onClick={saveGoalEdit}><Save size={16} /> Save {goalTerm.toLowerCase()}</Button></div></div></Modal>
   </div>;
 }

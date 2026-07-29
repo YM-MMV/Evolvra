@@ -8,6 +8,7 @@ import {
 } from "@/lib/persistence";
 import { LEGACY_LAST_REMINDER_KEY, reminderStorageKey } from "@/lib/reminders";
 import { persistenceAccountId } from "@/lib/sync-reconciliation";
+import { terminologyForms } from "@/lib/terminology";
 import { isQuestAvailable, localDateKey } from "@/lib/utils";
 
 /**
@@ -93,8 +94,9 @@ export function ReminderScheduler() {
             .filter((quest) => isQuestAvailable(quest, now)).length;
           if (!readyActions) return;
 
+          const questTerms = terminologyForms(state.settings.terminology).quests;
           const options: NotificationOptions = {
-            body: `${readyActions} ${readyActions === 1 ? "action is" : "actions are"} ready when you are.`,
+            body: `${readyActions} ${readyActions === 1 ? `${questTerms.singularLower} is` : `${questTerms.pluralLower} are`} ready when you are.`,
             icon: "/icon-192.png",
             badge: "/icon-192.png",
             tag: `evolvra-reminder-${dateKey}`,
@@ -126,7 +128,7 @@ export function ReminderScheduler() {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [accountId, persistenceIdentity, persistenceScopeGeneration, reportPersistenceError, runWorkspaceFileOperation, state.goals, state.settings.notifications, state.settings.reminderTime, storageKey, workspaceScopeKey, workspaceSwitching]);
+  }, [accountId, persistenceIdentity, persistenceScopeGeneration, reportPersistenceError, runWorkspaceFileOperation, state.goals, state.settings.notifications, state.settings.reminderTime, state.settings.terminology, storageKey, workspaceScopeKey, workspaceSwitching]);
 
   return null;
 }

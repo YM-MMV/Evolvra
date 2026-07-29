@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { createStarterGoals, EMPTY_STATE } from "@/lib/defaults";
 import {
+  addGoalDraft,
   addQuestDraft,
   completeQuestDraft,
   deleteGoalRecordsDraft,
@@ -216,5 +217,54 @@ describe("provider domain commands", () => {
     }, runtime())).toThrow(/unique/i);
     expect(goal.evidence).toEqual([]);
     expect(draft.timeline).toHaveLength(beforeTimeline);
+  });
+
+  it("rejects measured goals without a positively weighted metric before adding or editing", () => {
+    const draft = cloneWorkspaceValue(EMPTY_STATE);
+    const [weightedGoal, consistencyGoal] = createStarterGoals();
+    const invalidNumeric = {
+      ...weightedGoal,
+      id: "goal-invalid-numeric",
+      model: "numeric" as const,
+      metrics: [],
+    };
+
+    expect(() => addGoalDraft(draft, invalidNumeric, runtime())).toThrow(
+      /needs at least one metric/i,
+    );
+    expect(draft.goals).toEqual([]);
+    expect(draft.timeline).toEqual([]);
+
+    draft.goals = [weightedGoal, consistencyGoal];
+    const originalTimeline = draft.timeline.length;
+    expect(() => updateGoalDraft(draft, weightedGoal.id, {
+      model: "numeric",
+      metrics: [],
+    }, runtime())).toThrow(/needs at least one metric/i);
+    expect(weightedGoal.model).toBe("weighted");
+    expect(weightedGoal.metrics).toEqual([]);
+    expect(draft.timeline).toHaveLength(originalTimeline);
+
+    expect(() => updateGoalDraft(draft, consistencyGoal.id, {
+      metrics: consistencyGoal.metrics.map((metric) => ({ ...metric, weight: 0 })),
+    }, runtime())).toThrow(/positive relative weight/i);
+    expect(consistencyGoal.metrics[0].weight).toBe(100);
+    expect(draft.timeline).toHaveLength(originalTimeline);
+  });
+
+  it("rejects consistency edits without complete period metadata atomically", () => {
+    const draft = cloneWorkspaceValue(EMPTY_STATE);
+    draft.goals = createStarterGoals();
+    const numericGoal = draft.goals.find((goal) => goal.model === "numeric")!;
+    const metricsWithoutPeriods = numericGoal.metrics.map((metric) => ({ ...metric }));
+    const before = cloneWorkspaceValue(numericGoal);
+
+    expect(() => updateGoalDraft(draft, numericGoal.id, {
+      model: "consistency",
+      metrics: metricsWithoutPeriods,
+    }, runtime())).toThrow(/valid period and matching period key/i);
+
+    expect(numericGoal).toEqual(before);
+    expect(draft.timeline).toEqual([]);
   });
 });

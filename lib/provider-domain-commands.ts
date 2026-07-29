@@ -1,5 +1,6 @@
 import { createStarterGoals } from "@/lib/defaults";
 import { validateGoalEvidenceList } from "@/lib/goal-evidence";
+import { assertGoalProgressConfiguration } from "@/lib/goal-progress";
 import { cloneWorkspaceValue } from "@/lib/provider-state";
 import type {
   AppState,
@@ -102,6 +103,7 @@ export function addGoalDraft(
   goal: Goal,
   runtime = defaultRuntime,
 ) {
+  assertGoalProgressConfiguration(goal);
   validateGoalEvidenceList(goal.evidence, goal.id);
   const goalTerm = singularizeTerm(draft.settings.terminology.goals);
   draft.goals.unshift(goal);
@@ -123,6 +125,7 @@ export function updateGoalDraft(
   const goalTerm = singularizeTerm(draft.settings.terminology.goals);
   const goal = draft.goals.find((item) => item.id === goalId);
   if (!goal) return;
+  assertGoalProgressConfiguration({ ...goal, ...patch });
   if (patch.evidence) validateGoalEvidenceList(patch.evidence, goalId);
   Object.assign(goal, patch);
   addTimelineDraft(draft, {

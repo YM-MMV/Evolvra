@@ -9,6 +9,7 @@ import { completionAreaShares, completionGoalIds, completionStatIds, metricEntry
 import { timelineHref, type TimelineFilters } from "@/lib/timeline";
 import { reviewPromptLabel, reviewPromptsFor } from "@/lib/review-prompts";
 import { WORKSPACE_TEXT_LIMITS } from "@/lib/state-schema";
+import { terminologyForms } from "@/lib/terminology";
 import type { Goal, ReviewCadence } from "@/lib/types";
 import { formatDate, localDateKey, parseLocalDate, singularizeTerm, uid } from "@/lib/utils";
 
@@ -84,6 +85,7 @@ export default function ReviewsPage() {
   const [saved, setSaved] = useState(false);
   const [visibleReviews, setVisibleReviews] = useState(12);
   const terms = state.settings.terminology;
+  const termLabels = terminologyForms(terms);
   const prompts = reviewPromptsFor(terms);
   const goalTerm = singularizeTerm(terms.goals);
   const milestoneTerm = singularizeTerm(terms.milestones);
@@ -179,7 +181,7 @@ export default function ReviewsPage() {
         id: `quest-${completion.id}`,
         title: completion.title,
         detail: [
-          completion.durationMinutes ? `${completion.durationMinutes} minutes recorded` : "Action completion",
+          completion.durationMinutes ? `${completion.durationMinutes} minutes recorded` : `${singularizeTerm(terms.quests)} completion`,
           completionGoalIds(completion).length > 1 ? `supports ${completionGoalIds(completion).length} ${terms.goals.toLowerCase()}` : null,
         ].filter(Boolean).join(" · "),
         at: completion.completedAt,
@@ -382,7 +384,7 @@ export default function ReviewsPage() {
       previousMonthRange,
       weekLabel: `${formatDate(localDateKey(weekStart))} – ${formatDate(todayKey)}`,
     };
-  }, [goalTerm, milestoneTerm, state.areas, state.goals, state.metricEntries, state.questCompletions, state.reviews, state.stats, state.timeline, terms.goals, terms.milestones]);
+  }, [goalTerm, milestoneTerm, state.areas, state.goals, state.metricEntries, state.questCompletions, state.reviews, state.stats, state.timeline, terms.goals, terms.milestones, terms.quests]);
 
   const submit = () => {
     const writtenAnswers = Object.fromEntries(Object.entries(answers).map(([key, answer]) => [key, answer.trim()]));
@@ -398,7 +400,7 @@ export default function ReviewsPage() {
     <section className="page-header"><div><p className="eyebrow">Reflection without judgement</p><h1>Reviews</h1><p className="page-lead">Turn activity into understanding. Adjust your system without treating a quiet period as failure.</p></div></section>
     <div className="review-summary-grid" aria-label={`Recorded activity from ${reviewContext.weekLabel}`}>{[
       { label: "Active days this week", value: reviewContext.summary.activeDays, href: timelineHref(reviewContext.weekRange) },
-      { label: "Actions completed", value: reviewContext.summary.quests, href: timelineHref({ ...reviewContext.weekRange, type: "quest" }) },
+      { label: `${termLabels.quests.plural} completed`, value: reviewContext.summary.quests, href: timelineHref({ ...reviewContext.weekRange, type: "quest" }) },
       { label: "Measurements updated", value: reviewContext.summary.measurements, href: timelineHref({ ...reviewContext.weekRange, type: "metric" }) },
       { label: `${terms.milestones} reached`, value: reviewContext.summary.milestones, href: timelineHref({ ...reviewContext.weekRange, type: "milestone" }) },
       { label: `${terms.goals} with activity`, value: reviewContext.summary.goals, href: timelineHref({ ...reviewContext.weekRange, type: "activity" }) },
@@ -417,7 +419,7 @@ export default function ReviewsPage() {
         </Panel>
         {cadence === "weekly" ? <Panel>
           <div className="section-heading compact"><div><p className="eyebrow">Measured movement</p><h2>How {terms.goals.toLowerCase()} changed this week</h2></div><CalendarCheck size={19} /></div>
-          {reviewContext.weeklyMetricMovements.length ? <div className="activity-list" role="list" aria-label={`Measured ${goalTerm.toLowerCase()} movement this week`}>{reviewContext.weeklyMetricMovements.map((movement) => <div key={movement.key} role="listitem"><span className="event-dot type-metric" /><div><Link href={movement.href}><strong>{movement.label} · {movement.goalTitle}</strong></Link><small>{movement.updates} recorded {movement.updates === 1 ? "update" : "updates"}; open the underlying timeline record</small></div><b>{formatMeasurement(movement.from, movement.unit)} → {formatMeasurement(movement.to, movement.unit)}</b></div>)}</div> : <p className="supportive-copy">No measurement values changed this week. Completed actions and reflections remain available in the source records below.</p>}
+          {reviewContext.weeklyMetricMovements.length ? <div className="activity-list" role="list" aria-label={`Measured ${goalTerm.toLowerCase()} movement this week`}>{reviewContext.weeklyMetricMovements.map((movement) => <div key={movement.key} role="listitem"><span className="event-dot type-metric" /><div><Link href={movement.href}><strong>{movement.label} · {movement.goalTitle}</strong></Link><small>{movement.updates} recorded {movement.updates === 1 ? "update" : "updates"}; open the underlying timeline record</small></div><b>{formatMeasurement(movement.from, movement.unit)} → {formatMeasurement(movement.to, movement.unit)}</b></div>)}</div> : <p className="supportive-copy">No measurement values changed this week. Completed {termLabels.quests.pluralLower} and reflections remain available in the source records below.</p>}
         </Panel> : null}
         {cadence === "weekly" && reviewContext.weeklyTimeByArea.length ? <Panel>
           <div className="section-heading compact"><div><p className="eyebrow">Time context</p><h2>Time recorded by {areaTerm.toLowerCase()}</h2></div><Clock3 size={19} /></div>
@@ -436,7 +438,7 @@ export default function ReviewsPage() {
             {reviewContext.monthlyComparison.rows.map((row) => { const maximum = Math.max(1, row.current, row.previous); return <div className="review-comparison-row" key={row.label} aria-hidden="true"><strong>{row.label}</strong><div className="review-comparison-bars"><span className="review-comparison-bar current" style={{ width: `${(row.current / maximum) * 100}%` }} /><span className="review-comparison-bar previous" style={{ width: `${(row.previous / maximum) * 100}%` }} /></div><b>{row.current} / {row.previous}</b></div>; })}
           </div>
           <div className="activity-list" role="list" aria-label={`Monthly ${goalTerm.toLowerCase()} and ${milestoneTerm.toLowerCase()} comparison`}>{reviewContext.monthlyComparison.rows.map((row) => <div key={row.label} role="listitem"><span className="event-dot type-metric" /><div><strong>{row.label}</strong><small>Select either count to inspect every matching source record</small></div><b className="review-source-counts"><Link href={timelineHref({ ...reviewContext.currentMonthRange, ...row.filters })} aria-label={`${row.current} ${row.label.toLowerCase()} in ${reviewContext.monthlyComparison.currentLabel}`}>{row.current}</Link><span aria-hidden="true"> / </span><Link href={timelineHref({ ...reviewContext.previousMonthRange, ...row.filters })} aria-label={`${row.previous} ${row.label.toLowerCase()} in ${reviewContext.monthlyComparison.previousLabel}`}>{row.previous}</Link></b></div>)}</div>
-          {reviewContext.monthlyComparison.qualityRows.length ? <><div className="section-heading compact review-subheading"><div><p className="eyebrow">{terms.stats} connections</p><h3>Recorded moments</h3></div></div><div className="activity-list" role="list" aria-label={`Monthly activity by connected ${singularizeTerm(terms.stats).toLowerCase()}`}>{reviewContext.monthlyComparison.qualityRows.map(({ stat, current, previous }) => <div key={stat.id} role="listitem"><i className="area-dot" style={{ background: stat.color }} /><div><Link className="trace-link" href={timelineHref({ ...reviewContext.currentMonthRange, type: "activity", statId: stat.id })}><strong>{stat.name}</strong></Link><small>Select either count to inspect every matching source record</small></div><b className="review-source-counts"><Link href={timelineHref({ ...reviewContext.currentMonthRange, type: "activity", statId: stat.id })} aria-label={`${current} ${stat.name} records in ${reviewContext.monthlyComparison.currentLabel}`}>{current}</Link><span aria-hidden="true"> / </span><Link href={timelineHref({ ...reviewContext.previousMonthRange, type: "activity", statId: stat.id })} aria-label={`${previous} ${stat.name} records in ${reviewContext.monthlyComparison.previousLabel}`}>{previous}</Link></b></div>)}</div></> : <p className="supportive-copy">No activity connected to {terms.stats.toLowerCase()} has been recorded in either month yet.</p>}
+          {reviewContext.monthlyComparison.qualityRows.length ? <><div className="section-heading compact review-subheading"><div><p className="eyebrow">{terms.stats} connections</p><h3>Recorded moments</h3></div></div><div className="activity-list" role="list" aria-label={`Monthly activity by connected ${termLabels.stats.singularLower}`}>{reviewContext.monthlyComparison.qualityRows.map(({ stat, current, previous }) => <div key={stat.id} role="listitem"><i className="area-dot" style={{ background: stat.color }} /><div><Link className="trace-link" href={timelineHref({ ...reviewContext.currentMonthRange, type: "activity", statId: stat.id })}><strong>{stat.name}</strong></Link><small>Select either count to inspect every matching source record</small></div><b className="review-source-counts"><Link href={timelineHref({ ...reviewContext.currentMonthRange, type: "activity", statId: stat.id })} aria-label={`${current} ${stat.name} records in ${reviewContext.monthlyComparison.currentLabel}`}>{current}</Link><span aria-hidden="true"> / </span><Link href={timelineHref({ ...reviewContext.previousMonthRange, type: "activity", statId: stat.id })} aria-label={`${previous} ${stat.name} records in ${reviewContext.monthlyComparison.previousLabel}`}>{previous}</Link></b></div>)}</div></> : <p className="supportive-copy">No activity connected to {termLabels.stats.pluralLower} has been recorded in either month yet.</p>}
         </Panel><Panel>
           <div className="section-heading compact"><div><p className="eyebrow">Lifecycle detail</p><h2>What started or changed state</h2></div><Clock3 size={19} /></div>
           {reviewContext.monthlyLifecycle.length ? <div className="activity-list" role="list" aria-label={`${goalTerm} and ${milestoneTerm.toLowerCase()} lifecycle changes this month`}>{reviewContext.monthlyLifecycle.map((record) => <div key={record.id} role="listitem"><span className="event-dot type-goal" /><div><Link href={record.href}><strong>{record.title}</strong></Link><small>{record.detail} · open the underlying record</small></div><b>{formatDate(record.at)}</b></div>)}</div> : <p className="supportive-copy">No {terms.goals.toLowerCase()} started or completed and no {terms.milestones.toLowerCase()} were reached this month.</p>}

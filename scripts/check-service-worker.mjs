@@ -11,8 +11,13 @@ const requiredSafetyMarkers = [
   "content-type",
   "MAX_NAVIGATION_ENTRIES",
   "MAX_STATIC_ENTRIES",
+  "MAX_WORKSPACE_GOAL_ROUTES",
+  "WORKSPACE_ROUTES_CACHE_NAME",
+  "BUILD_ASSET_CACHE_NAME",
+  "SYNC_WORKSPACE_GOAL_ROUTES",
   "OFFLINE_FALLBACK_URL",
   "expectedAssetKind",
+  "requestUrl.search",
 ];
 
 const missing = requiredSafetyMarkers.filter((marker) => !source.includes(marker));
