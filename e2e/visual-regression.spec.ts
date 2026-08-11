@@ -88,8 +88,16 @@ for (const variant of visualMatrix) {
           await document.fonts.ready;
           document.documentElement.scrollTop = 0;
         });
+        // The stats surface contains the longest full-page stack of compact
+        // monospace copy. Native system-font metrics make that reviewed page a
+        // few pixels taller on Linux than on macOS, even though its structure
+        // and content are identical. Keep platform baselines only for this
+        // route; every other release surface remains cross-platform shared.
+        const snapshotName = routeSlug === "qualities"
+          ? `${variant.slug}-${routeSlug}-${process.platform}.png`
+          : `${variant.slug}-${routeSlug}.png`;
         await expect(page).toHaveScreenshot(
-          `${variant.slug}-${routeSlug}.png`,
+          snapshotName,
           {
             animations: "disabled",
             caret: "hide",
