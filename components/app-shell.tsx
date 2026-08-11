@@ -6,7 +6,6 @@ import { usePathname } from "next/navigation";
 import {
   BarChart3,
   CheckSquare2,
-  Cloud,
   CloudOff,
   Command,
   Goal,
@@ -19,9 +18,16 @@ import {
   Sparkles,
   X,
 } from "lucide-react";
-import { useApp } from "@/components/app-provider";
+import {
+  useAppActions,
+  useProviderStatus,
+  useWorkspaceData,
+} from "@/components/app-provider";
+import { BlockingRecoveryScreen } from "@/components/blocking-recovery-screen";
 import { Onboarding } from "@/components/onboarding";
+import { createOverlayLease } from "@/components/overlay-effects";
 import { PwaRegistration } from "@/components/pwa-registration";
+import { ProviderLifecycleStatus } from "@/components/provider-lifecycle-status";
 import { ReminderScheduler } from "@/components/reminder-scheduler";
 import { Button } from "@/components/ui";
 import { privacySafeWorkspaceExport } from "@/lib/persistence";
@@ -40,9 +46,52 @@ function visibleDrawerControls(drawer: HTMLElement) {
       && element.getClientRects().length > 0);
 }
 
-function drawerIsTopmostDialog(drawer: HTMLElement) {
+function isTopmostAppDialog(dialog: HTMLElement) {
+  const activeRecoveryScreen = [...document.querySelectorAll<HTMLElement>("[data-recovery-layer]")]
+    .some((candidate) =>
+      !candidate.closest("[inert]")
+      && !candidate.closest("[aria-hidden='true']"));
+  if (activeRecoveryScreen) return false;
   const dialogs = [...document.querySelectorAll<HTMLElement>("[role='dialog'][aria-modal='true']")];
-  return dialogs.at(-1) === drawer;
+  return dialogs.filter((candidate) =>
+    !candidate.closest("[inert]")
+    && !candidate.closest("[aria-hidden='true']")).at(-1) === dialog;
+}
+
+function isolateDialogBackground(
+  dialog: HTMLElement,
+  overlay: ReturnType<typeof createOverlayLease>,
+  exclude?: (element: HTMLElement) => boolean,
+) {
+  let activeBranch = dialog;
+  let parent = activeBranch.parentElement;
+  while (parent) {
+    for (const sibling of parent.children) {
+      if (
+        sibling !== activeBranch
+        && sibling instanceof HTMLElement
+        && !sibling.hasAttribute("data-recovery-layer")
+        && !sibling.querySelector("[data-recovery-layer]")
+        && !exclude?.(sibling)
+      ) {
+        overlay.isolate(sibling, { inert: true, ariaHidden: true });
+      }
+    }
+    if (parent === dialog.ownerDocument.body) break;
+    activeBranch = parent;
+    parent = parent.parentElement;
+  }
+}
+
+function containDialogFocus(dialog: HTMLElement, event: FocusEvent) {
+  const target = event.target;
+  if (
+    !isTopmostAppDialog(dialog)
+    || !(target instanceof Node)
+    || dialog.contains(target)
+  ) return;
+  event.stopImmediatePropagation();
+  dialog.focus({ preventScroll: true });
 }
 
 const nav: { href: string; label?: string; termKey?: TerminologyKey; icon: typeof LayoutDashboard }[] = [
@@ -55,24 +104,26 @@ const nav: { href: string; label?: string; termKey?: TerminologyKey; icon: typeo
 ];
 
 export function AppShell({ children }: { children: React.ReactNode }) {
+  const { state, workspaceScopeKey } = useWorkspaceData();
   const {
-    state,
     ready,
     workspaceSwitching,
-    workspaceScopeKey,
+    terminalErasureAccountId,
     user,
     syncStatus,
     accountHandoff,
     localWorkspaceConflict,
     quarantinedRecovery,
     canUndo,
-    undo,
     persistenceError,
+  } = useProviderStatus();
+  const {
+    undo,
     importState,
     discardQuarantinedWorkspace,
     resolveAccountHandoff,
     signOut,
-  } = useApp();
+  } = useAppActions();
   const pathname = usePathname();
   const terms = terminologyForms(state.settings.terminology);
   const [mobileOpen, setMobileOpen] = useState(false);
@@ -81,7 +132,6 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   const menuButtonRef = useRef<HTMLButtonElement>(null);
   const sidebarRef = useRef<HTMLElement>(null);
   const workspaceChoiceDialogRef = useRef<HTMLDivElement>(null);
-  const localConflictDialogRef = useRef<HTMLDivElement>(null);
   const recoveryInputRef = useRef<HTMLInputElement>(null);
   const [recoveryPending, setRecoveryPending] = useState(false);
   const [recoveryError, setRecoveryError] = useState("");
@@ -107,15 +157,21 @@ export function AppShell({ children }: { children: React.ReactNode }) {
     const drawer = sidebarRef.current;
     if (!drawer) return;
     const menuButton = menuButtonRef.current;
-    const previousOverflow = document.body.style.overflow;
-    document.body.style.overflow = "hidden";
+    const overlay = createOverlayLease(document);
+    isolateDialogBackground(
+      drawer,
+      overlay,
+      (element) => element.classList.contains("app-main")
+        || element.classList.contains("mobile-scrim"),
+    );
+    overlay.lockBodyScroll();
     const focusTimer = window.setTimeout(() => {
-      if (!drawerIsTopmostDialog(drawer)) return;
+      if (!isTopmostAppDialog(drawer)) return;
       const closeButton = drawer.querySelector<HTMLElement>(".mobile-close");
       (closeButton ?? visibleDrawerControls(drawer)[0] ?? drawer).focus({ preventScroll: true });
     }, 0);
     const handleKeyDown = (event: KeyboardEvent) => {
-      if (!drawerIsTopmostDialog(drawer)) return;
+      if (!isTopmostAppDialog(drawer)) return;
       if (event.key === "Escape") {
         event.preventDefault();
         setMobileOpen(false);
@@ -141,26 +197,32 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         firstItem?.focus();
       }
     };
+    const handleFocusIn = (event: FocusEvent) => containDialogFocus(drawer, event);
     const closeAtDesktopWidth = (event: MediaQueryListEvent) => {
       if (!event.matches) setMobileOpen(false);
     };
     document.addEventListener("keydown", handleKeyDown);
+    document.addEventListener("focusin", handleFocusIn, true);
     mobileViewport.addEventListener("change", closeAtDesktopWidth);
     return () => {
       window.clearTimeout(focusTimer);
       document.removeEventListener("keydown", handleKeyDown);
+      document.removeEventListener("focusin", handleFocusIn, true);
       mobileViewport.removeEventListener("change", closeAtDesktopWidth);
-      document.body.style.overflow = previousOverflow;
+      overlay.release();
       window.requestAnimationFrame(() => {
         if (menuButton?.isConnected) menuButton.focus({ preventScroll: true });
       });
     };
-  }, [mobileOpen]);
+  }, [mobileOpen, workspaceSwitching]);
 
   useEffect(() => {
     if (!workspaceSwitching || !accountHandoff) return;
     const dialog = workspaceChoiceDialogRef.current;
     if (!dialog) return;
+    const overlay = createOverlayLease(document);
+    isolateDialogBackground(dialog, overlay);
+    overlay.lockBodyScroll();
     const focusableControls = () => visibleDrawerControls(dialog);
     const focusTimer = window.setTimeout(() => {
       (focusableControls()[0] ?? dialog).focus({ preventScroll: true });
@@ -186,48 +248,16 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         first.focus();
       }
     };
+    const containFocus = (event: FocusEvent) => containDialogFocus(dialog, event);
     document.addEventListener("keydown", trapFocus);
+    document.addEventListener("focusin", containFocus, true);
     return () => {
       window.clearTimeout(focusTimer);
       document.removeEventListener("keydown", trapFocus);
+      document.removeEventListener("focusin", containFocus, true);
+      overlay.release();
     };
   }, [accountHandoff, workspaceSwitching]);
-
-  useEffect(() => {
-    if (!localWorkspaceConflict) return;
-    const dialog = localConflictDialogRef.current;
-    if (!dialog) return;
-    const focusableControls = () => visibleDrawerControls(dialog);
-    const focusTimer = window.setTimeout(() => {
-      (focusableControls()[0] ?? dialog).focus({ preventScroll: true });
-    }, 0);
-    const trapFocus = (event: KeyboardEvent) => {
-      if (event.key !== "Tab") return;
-      const controls = focusableControls();
-      if (!controls.length) {
-        event.preventDefault();
-        dialog.focus({ preventScroll: true });
-        return;
-      }
-      const first = controls[0];
-      const last = controls[controls.length - 1];
-      if (!dialog.contains(document.activeElement)) {
-        event.preventDefault();
-        (event.shiftKey ? last : first).focus();
-      } else if (event.shiftKey && document.activeElement === first) {
-        event.preventDefault();
-        last.focus();
-      } else if (!event.shiftKey && document.activeElement === last) {
-        event.preventDefault();
-        first.focus();
-      }
-    };
-    document.addEventListener("keydown", trapFocus);
-    return () => {
-      window.clearTimeout(focusTimer);
-      document.removeEventListener("keydown", trapFocus);
-    };
-  }, [localWorkspaceConflict]);
 
   const exportCurrentMemory = () => {
     const safeState = privacySafeWorkspaceExport(state);
@@ -273,26 +303,21 @@ export function AppShell({ children }: { children: React.ReactNode }) {
     return (
       <>
         <PwaRegistration goalIds={state.goals.map((goal) => goal.id)} goalLabel={terms.goals.pluralLower} goalSingularLabel={terms.goals.singularLower} showStatus={false} />
-        <div
-          ref={localConflictDialogRef}
-          className="loading-screen"
-          role="dialog"
-          tabIndex={-1}
-          aria-modal="true"
-          aria-labelledby="local-workspace-conflict-title"
-          aria-describedby="local-workspace-conflict-description"
-        >
-          <span className="brand-mark"><CloudOff /></span>
-          <div style={{ width: "min(560px, calc(100vw - 40px))", textAlign: "center" }}>
-            <h1 id="local-workspace-conflict-title" style={{ fontSize: "clamp(24px, 5vw, 34px)" }}>This workspace changed in another tab</h1>
-            <p id="local-workspace-conflict-description">{localWorkspaceConflict.message} Download this tab&apos;s in-memory records before reloading if you need to preserve its unsaved changes.</p>
+        <BlockingRecoveryScreen
+          layer="quarantine"
+          mode="alert"
+          title="This workspace changed in another tab"
+          description={<>
+            <p>{localWorkspaceConflict.message} Download this tab&apos;s in-memory records before reloading if you need to preserve its unsaved changes.</p>
             <p>File contents stored only on this device are not embedded in the download, and private account identifiers are removed from file references.</p>
-            <div className="button-row" style={{ justifyContent: "center", flexWrap: "wrap", marginTop: 22 }}>
-              <Button variant="secondary" onClick={exportCurrentMemory}>Download unsaved memory copy</Button>
-              <Button onClick={() => window.location.reload()}>Reload latest device copy</Button>
-            </div>
+          </>}
+          icon={<CloudOff />}
+        >
+          <div className="button-row" style={{ justifyContent: "center", flexWrap: "wrap", marginTop: 22 }}>
+            <Button variant="secondary" onClick={exportCurrentMemory}>Download unsaved memory copy</Button>
+            <Button onClick={() => window.location.reload()}>Reload latest device copy</Button>
           </div>
-        </div>
+        </BlockingRecoveryScreen>
       </>
     );
   }
@@ -340,33 +365,39 @@ export function AppShell({ children }: { children: React.ReactNode }) {
     };
     return <>
       <PwaRegistration goalIds={[]} goalLabel={terms.goals.pluralLower} goalSingularLabel={terms.goals.singularLower} showStatus={false} />
-      <div className="loading-screen" role="alertdialog" aria-modal="true" aria-labelledby="recovery-title" aria-describedby="recovery-description">
-        <span className="brand-mark"><CloudOff /></span>
-        <div style={{ width: "min(620px, calc(100vw - 40px))", textAlign: "center" }}>
-          <h1 id="recovery-title" style={{ fontSize: "clamp(24px, 5vw, 34px)" }}>This device copy needs recovery</h1>
-          <p id="recovery-description">{quarantinedRecovery.message}</p>
-          <p>Evolvra will not overwrite it. Download the damaged envelope for support, restore a validated backup, or explicitly erase only this account&apos;s device copy.</p>
-          {recoveryError && <div className="system-alert" role="alert">{recoveryError}</div>}
-          <div className="button-row" style={{ justifyContent: "center", flexWrap: "wrap", marginTop: 22 }}>
-            <Button variant="secondary" disabled={!quarantinedRecovery.rawJson || recoveryPending} onClick={downloadRaw}>Download damaged copy</Button>
-            <Button variant="secondary" disabled={recoveryPending} onClick={() => recoveryInputRef.current?.click()}>Restore backup</Button>
-            <Button disabled={recoveryPending} onClick={async () => {
-              if (!window.confirm("Erase this quarantined device copy and its device-only evidence? Cloud data is not erased.")) return;
-              setRecoveryPending(true); setRecoveryError("");
-              try { await discardQuarantinedWorkspace(); } catch (error) { setRecoveryError(error instanceof Error ? error.message : "The quarantined device copy could not be erased."); } finally { setRecoveryPending(false); }
-            }}>{recoveryPending ? "Working…" : "Erase device copy"}</Button>
-          </div>
-          <input ref={recoveryInputRef} hidden type="file" accept="application/json,.json" onChange={async (event) => {
-            const file = event.target.files?.[0]; event.target.value = ""; if (!file) return;
-            if (file.size > MAX_WORKSPACE_SERIALIZED_BYTES) {
-              setRecoveryError("That backup is too large to import safely. Choose a file no larger than 5 MB.");
-              return;
-            }
+      <BlockingRecoveryScreen
+        layer="quarantine"
+        mode="alert"
+        title="This device copy needs recovery"
+        description={(
+          <>
+            <p>{quarantinedRecovery.message}</p>
+            <p>Evolvra will not overwrite it. Download the damaged envelope for support, restore a validated backup, or explicitly erase only this account&apos;s device copy.</p>
+          </>
+        )}
+        icon={<CloudOff />}
+        contentWidth="min(620px, calc(100vw - 40px))"
+      >
+        {recoveryError && <div className="system-alert" role="alert">{recoveryError}</div>}
+        <div className="button-row" style={{ justifyContent: "center", flexWrap: "wrap", marginTop: 22 }}>
+          <Button variant="secondary" disabled={!quarantinedRecovery.rawJson || recoveryPending} onClick={downloadRaw}>Download damaged copy</Button>
+          <Button variant="secondary" disabled={recoveryPending} onClick={() => recoveryInputRef.current?.click()}>Restore backup</Button>
+          <Button disabled={recoveryPending} onClick={async () => {
+            if (!window.confirm("Erase this quarantined device copy and its device-only evidence? Cloud data is not erased.")) return;
             setRecoveryPending(true); setRecoveryError("");
-            try { await importState(JSON.parse(await file.text()) as unknown); } catch (error) { setRecoveryError(error instanceof Error ? error.message : "The selected backup could not be restored."); } finally { setRecoveryPending(false); }
-          }} />
+            try { await discardQuarantinedWorkspace(); } catch (error) { setRecoveryError(error instanceof Error ? error.message : "The quarantined device copy could not be erased."); } finally { setRecoveryPending(false); }
+          }}>{recoveryPending ? "Working…" : "Erase device copy"}</Button>
         </div>
-      </div>
+        <input ref={recoveryInputRef} hidden type="file" accept="application/json,.json" onChange={async (event) => {
+          const file = event.target.files?.[0]; event.target.value = ""; if (!file) return;
+          if (file.size > MAX_WORKSPACE_SERIALIZED_BYTES) {
+            setRecoveryError("That backup is too large to import safely. Choose a file no larger than 5 MB.");
+            return;
+          }
+          setRecoveryPending(true); setRecoveryError("");
+          try { await importState(JSON.parse(await file.text()) as unknown); } catch (error) { setRecoveryError(error instanceof Error ? error.message : "The selected backup could not be restored."); } finally { setRecoveryPending(false); }
+        }} />
+      </BlockingRecoveryScreen>
     </>;
   }
   if (!state.profile.onboarded) return <>
@@ -408,10 +439,15 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         </div>
         <div className="sidebar-bottom">
           <Link href="/settings" aria-label="Customise settings" className={pathname.startsWith("/settings") ? "active" : ""} aria-current={pathname.startsWith("/settings") ? "page" : undefined} onClick={() => setMobileOpen(false)}><Settings size={17} /><span>Customise</span></Link>
-          <div className={`sync-indicator sync-${syncStatus}`} role="status" aria-live="polite">{user && syncStatus !== "error" && syncStatus !== "offline" && syncStatus !== "persisting" ? <Cloud size={16} /> : <CloudOff size={16} />}<span>{syncLabel}</span></div>
+          <ProviderLifecycleStatus
+            authenticated={Boolean(user)}
+            handoffPending={Boolean(accountHandoff)}
+            erasurePending={Boolean(terminalErasureAccountId)}
+            syncStatus={syncStatus}
+          />
         </div>
       </aside>
-      {mobileOpen && <button className="mobile-scrim" onClick={() => setMobileOpen(false)} aria-label="Close navigation" />}
+      {mobileOpen && <button className="mobile-scrim" tabIndex={-1} aria-hidden="true" onMouseDown={(event) => event.preventDefault()} onClick={() => setMobileOpen(false)} aria-label="Close navigation" />}
       <div className="app-main" inert={mobileOpen ? true : undefined} aria-hidden={mobileOpen ? true : undefined}>
         <header className="topbar">
           <div className="topbar-title"><button ref={menuButtonRef} className="mobile-menu icon-button" onClick={(event) => { event.currentTarget.blur(); setMobileOpen(true); }} aria-label="Open menu" aria-haspopup="dialog" aria-expanded={mobileOpen} aria-controls="primary-navigation"><Menu size={21} /></button><div><small>Workspace / {currentLabel}</small><strong>{state.profile.chapter}</strong></div></div>

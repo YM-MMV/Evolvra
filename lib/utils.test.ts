@@ -10,6 +10,7 @@ import {
   isQuestAvailable,
   isQuestDue,
   localDateKey,
+  monthlyAnchorDayForSchedule,
   nextRepeatDate,
   parseLocalDate,
   rollMetricPeriod,
@@ -38,6 +39,36 @@ const baseGoal: Goal = {
 };
 
 describe("goal progress", () => {
+  it("normalizes partial weighted milestone totals so all defined stages reach 100%", () => {
+    const goal: Goal = {
+      ...baseGoal,
+      model: "weighted",
+      milestones: [
+        { id: "outline", title: "Outline", weight: 20, completed: true },
+        { id: "delivery", title: "Delivery", weight: 30, completed: false },
+      ],
+    };
+
+    expect(goalProgress(goal)).toBe(40);
+    goal.milestones[1].completed = true;
+    expect(goalProgress(goal)).toBe(100);
+  });
+
+  it("shares progress evenly when every weighted milestone has zero weight", () => {
+    const goal: Goal = {
+      ...baseGoal,
+      model: "weighted",
+      milestones: [
+        { id: "one", title: "One", weight: 0, completed: true },
+        { id: "two", title: "Two", weight: 0, completed: false },
+      ],
+    };
+
+    expect(goalProgress(goal)).toBe(50);
+    goal.milestones[1].completed = true;
+    expect(goalProgress(goal)).toBe(100);
+  });
+
   it("calculates weighted numeric progress", () => {
     const goal: Goal = {
       ...baseGoal,
@@ -174,9 +205,15 @@ describe("calendar dates", () => {
     expect(formatDate("not-a-date")).toBe("No date");
   });
 
-  it("clamps monthly repeats to the final day of shorter months", () => {
-    expect(nextRepeatDate("monthly", "2026-01-31", new Date(2026, 0, 30))).toBe("2026-02-28");
-    expect(nextRepeatDate("monthly", "2028-01-31", new Date(2028, 0, 30))).toBe("2028-02-29");
+  it("clamps monthly repeats without losing their original calendar anchor", () => {
+    const february = nextRepeatDate("monthly", "2026-01-31", new Date(2026, 0, 30), 31);
+    expect(february).toBe("2026-02-28");
+    expect(nextRepeatDate("monthly", february, new Date(2026, 1, 28), 31)).toBe("2026-03-31");
+
+    const leapFebruary = nextRepeatDate("monthly", "2028-01-31", new Date(2028, 0, 30), 31);
+    expect(leapFebruary).toBe("2028-02-29");
+    expect(nextRepeatDate("monthly", leapFebruary, new Date(2028, 1, 29), 31)).toBe("2028-03-31");
+    expect(nextRepeatDate("monthly", "2026-03-31", new Date(2026, 2, 31), 31)).toBe("2026-04-30");
   });
 
   it("moves daily and weekly repeats safely across year boundaries", () => {
@@ -187,7 +224,7 @@ describe("calendar dates", () => {
   it("schedules an overdue repeat from the completion day, not a missed occurrence", () => {
     expect(nextRepeatDate("daily", "2026-07-01", new Date(2026, 6, 18))).toBe("2026-07-19");
     expect(nextRepeatDate("weekly", "2026-07-01", new Date(2026, 6, 18))).toBe("2026-07-25");
-    expect(nextRepeatDate("monthly", "2026-01-31", new Date(2026, 2, 31))).toBe("2026-04-30");
+    expect(nextRepeatDate("monthly", "2026-01-31", new Date(2026, 2, 31), 31)).toBe("2026-04-30");
   });
 
   it("keeps the recurrence cadence anchored to a future due date", () => {
@@ -195,6 +232,17 @@ describe("calendar dates", () => {
     expect(nextRepeatDate("daily", "2026-07-22", today)).toBe("2026-07-23");
     expect(nextRepeatDate("weekly", "2026-07-22", today)).toBe("2026-07-29");
     expect(nextRepeatDate("monthly", "2026-07-31", today)).toBe("2026-08-31");
+  });
+
+  it("preserves a monthly anchor on no-op edits and resets it when the date changes", () => {
+    const previous = {
+      repeat: "monthly" as const,
+      dueDate: "2026-02-28",
+      monthlyAnchorDay: 31,
+    };
+    expect(monthlyAnchorDayForSchedule("monthly", "2026-02-28", previous)).toBe(31);
+    expect(monthlyAnchorDayForSchedule("monthly", "2026-02-27", previous)).toBe(27);
+    expect(monthlyAnchorDayForSchedule("weekly", "2026-02-28", previous)).toBeUndefined();
   });
 
   it("keeps future actions unavailable and completed one-off actions closed", () => {

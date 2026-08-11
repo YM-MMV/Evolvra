@@ -22,6 +22,7 @@ function checkpoint(
     local: "complete",
     session: "complete",
     persistenceGeneration: 2,
+    backup: null,
     owner: null,
     updatedAt: at,
     ...patch,

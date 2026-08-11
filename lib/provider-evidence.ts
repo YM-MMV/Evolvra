@@ -1,9 +1,8 @@
 import {
-  deleteEvidenceBlob,
-  readEvidenceBlob,
-  storeEvidenceBlob,
-  type EvidenceBlobRecord,
+  rollbackStagedEvidenceBlob,
+  stageEvidenceBlob,
   type PersistenceScopeGeneration,
+  type StagedEvidenceBlobWrite,
 } from "@/lib/persistence";
 import {
   isStructurallyValidRemoteEvidencePath,
@@ -13,13 +12,13 @@ import {
 import { cloneWorkspaceValue } from "@/lib/provider-state";
 import type { AppState, GoalEvidence, GoalFileEvidence } from "@/lib/types";
 
-export interface StagedEvidenceWrite {
-  accountId: string;
-  goalId: string;
-  evidenceId: string;
+export interface StagedEvidenceWrite extends StagedEvidenceBlobWrite {
   scopeGeneration: PersistenceScopeGeneration;
-  /** Restored if a later migration step fails; absent means this key was new. */
-  previous?: EvidenceBlobRecord;
+}
+
+export interface EvidenceRollbackSummary {
+  rolledBack: number;
+  alreadyAbsent: number;
 }
 
 export interface ExternalizedEvidence {
@@ -61,23 +60,22 @@ async function rollbackOrThrowOriginal(
 
 export async function rollbackEvidenceWrites(createdEvidence: StagedEvidenceWrite[]) {
   const failures: unknown[] = [];
+  let rolledBack = 0;
+  let alreadyAbsent = 0;
   for (const item of [...createdEvidence].reverse()) {
     try {
-      if (item.previous) {
-        await storeEvidenceBlob(item.previous, item.scopeGeneration);
-      } else {
-        await deleteEvidenceBlob(
-          item.accountId,
-          item.goalId,
-          item.evidenceId,
-          item.scopeGeneration,
-        );
-      }
+      const result = await rollbackStagedEvidenceBlob(
+        item,
+        item.scopeGeneration,
+      );
+      if (result === "rolled-back") rolledBack += 1;
+      else alreadyAbsent += 1;
     } catch (error) {
       failures.push(error);
     }
   }
   if (failures.length) throw new AggregateError(failures, "One or more staged evidence writes could not be rolled back.");
+  return { rolledBack, alreadyAbsent } satisfies EvidenceRollbackSummary;
 }
 
 export async function externalizeEmbeddedEvidence(
@@ -105,22 +103,14 @@ export async function externalizeEmbeddedEvidence(
         if (!blob) {
           throw new Error("Legacy embedded evidence did not match its validated file metadata.");
         }
-        const previous = await readEvidenceBlob(
-          accountId,
-          goal.id,
-          item.id,
-          scopeGeneration,
-        );
-        await storeEvidenceBlob(
+        const staged = await stageEvidenceBlob(
           { accountId, goalId: goal.id, evidenceId: item.id, blob },
           scopeGeneration,
         );
         createdEvidence.push({
-          accountId,
-          goalId: goal.id,
-          evidenceId: item.id,
+          token: staged.token,
+          record: staged.record,
           scopeGeneration,
-          ...(previous ? { previous } : {}),
         });
         evidence.push({
           id: item.id,

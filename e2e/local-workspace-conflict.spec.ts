@@ -35,10 +35,12 @@ test("a stale tab cannot overwrite a newer IndexedDB workspace", async ({ contex
   await staleTab.getByLabel("Display name").fill("Unsaved in the stale tab");
   await staleTab.getByLabel("Display name").press("Tab");
 
-  const conflict = staleTab.getByRole("dialog", { name: "This workspace changed in another tab" });
+  const conflict = staleTab.getByRole("alertdialog", { name: "This workspace changed in another tab" });
   await expect(conflict).toBeVisible();
   const exportButton = conflict.getByRole("button", { name: "Download unsaved memory copy" });
   const reloadButton = conflict.getByRole("button", { name: "Reload latest device copy" });
+  await expect(conflict).toBeFocused();
+  await staleTab.keyboard.press("Tab");
   await expect(exportButton).toBeFocused();
   await staleTab.keyboard.press("Shift+Tab");
   await expect(reloadButton).toBeFocused();

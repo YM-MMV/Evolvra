@@ -13,3 +13,12 @@ test-results
 next-env.d.ts
 .env*
 !.env.example
+
+# Operator backups and private credentials never belong in the repository.
+backups/
+*.dump
+*.backup
+*.pem
+*.key
+*.p12
+*.pfx

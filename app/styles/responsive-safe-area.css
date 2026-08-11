@@ -47,12 +47,16 @@
   .topbar { top: 0; }
   .page-container { padding: 22px 20px 72px; }
   .dashboard-command-grid,
+  .dashboard-sections,
   .dashboard-grid,
   .goal-detail-grid,
   .review-layout { grid-template-columns: 1fr; }
   .dashboard-command-main { grid-template-columns: 1fr; }
+  .dashboard-section { grid-column: 1; }
   .dashboard-command-rail > .panel { height: auto; }
   .dashboard-rail { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .settings-layout { grid-template-columns: minmax(0, 1fr); }
+  .settings-content { min-width: 0; }
   .settings-nav { top: 64px; }
 }
 
@@ -132,6 +136,22 @@
   .setting-note p,
   .cloud-status p,
   .data-actions p { font-size: 12px; }
+}
+
+@media (forced-colors: active) {
+  .skip-link {
+    color: LinkText;
+    border: 2px solid LinkText;
+    background: Canvas;
+  }
+  .quick-add,
+  .button {
+    color: ButtonText;
+    border-color: ButtonText;
+    background: ButtonFace;
+  }
+  .quick-add svg,
+  .button svg { color: currentColor; }
 }
 
 .review-comparison-chart { display: flex; flex-direction: column; gap: 10px; margin-top: 13px; }

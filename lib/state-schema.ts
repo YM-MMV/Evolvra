@@ -16,6 +16,18 @@ import {
   hasConsistencyPeriodMetadata,
   hasPositiveWeightedMetric,
 } from "@/lib/goal-progress";
+import {
+  MAX_GOAL_OUTCOME_CHECK_INS,
+  MAX_GOAL_OUTCOME_METRICS,
+  MAX_GOAL_OUTCOME_MILESTONES,
+  MAX_REVIEW_CONTEXT_SOURCES,
+  MAX_REVIEW_SOURCE_DETAIL_LENGTH,
+  MAX_REVIEW_SOURCE_TITLE_LENGTH,
+} from "@/lib/historical-snapshots";
+import {
+  assertMigratedStateCoherence,
+  finalizeMigratedState,
+} from "@/lib/state-migrations";
 import type {
   AppState,
   Area,
@@ -26,6 +38,10 @@ import type {
   GoalAttributionSnapshot,
   GoalCheckIn,
   GoalModel,
+  GoalOutcomeCheckInSnapshot,
+  GoalOutcomeMetricSnapshot,
+  GoalOutcomeMilestoneSnapshot,
+  GoalOutcomeSnapshot,
   GoalStatus,
   LifeStat,
   MetricDelta,
@@ -38,9 +54,12 @@ import type {
   QuestCompletion,
   Review,
   ReviewCadence,
+  ReviewContextSnapshot,
+  ReviewSourceSnapshot,
   TimelineEvent,
   UserSettings,
 } from "@/lib/types";
+import { DASHBOARD_SECTION_IDS } from "@/lib/types";
 import { isPeriodKey } from "@/lib/utils";
 import { profileJsonValue } from "@/lib/workspace-json-profile";
 
@@ -126,6 +145,19 @@ const validTimestamp = (value: unknown, fallback: string) => {
 
 const optionalValidDate = (value: unknown) =>
   typeof value === "string" && value.trim() && isValidDateValue(value) ? value : undefined;
+
+const optionalCalendarDate = (value: unknown) => {
+  if (typeof value !== "string" || !value.trim()) return undefined;
+  if (isValidCalendarDateValue(value)) return value;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(value)) return undefined;
+  const leadingDate = /^(\d{4}-\d{2}-\d{2})(?:T|\s)/.exec(value)?.[1];
+  if (leadingDate) {
+    return isValidCalendarDateValue(leadingDate) ? leadingDate : undefined;
+  }
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return undefined;
+  return `${parsed.getUTCFullYear()}-${String(parsed.getUTCMonth() + 1).padStart(2, "0")}-${String(parsed.getUTCDate()).padStart(2, "0")}`;
+};
 
 function uniqueById<T extends { id: string }>(items: T[]) {
   const seen = new Set<string>();
@@ -213,10 +245,12 @@ const GOAL_STATUSES = ["active", "paused", "completed", "archived"] as const;
 const QUEST_KINDS = ["task", "session", "challenge", "milestone"] as const;
 const QUEST_REPEATS = ["none", "daily", "weekly", "monthly"] as const;
 const REVIEW_CADENCES = ["daily", "weekly", "monthly"] as const;
+const REVIEW_SOURCE_TYPES = ["quest", "metric", "milestone", "check-in", "goal"] as const;
 const METRIC_ENTRY_SOURCES = ["manual", "quest"] as const;
 const SETTINGS_THEMES = ["dark", "light", "system"] as const;
 const INTERFACE_INTENSITIES = ["minimal", "balanced", "immersive"] as const;
-const DASHBOARD_SECTIONS: DashboardSectionId[] = ["life-map", "momentum", "goals", "qualities", "review"];
+const DASHBOARD_SECTIONS: DashboardSectionId[] = [...DASHBOARD_SECTION_IDS];
+const LEGACY_FIXED_DASHBOARD_SECTIONS: DashboardSectionId[] = ["hero", "overview", "due-now"];
 
 function sanitizeMetric(value: unknown, index: number): ProgressMetric | null {
   if (!isRecord(value)) return null;
@@ -263,7 +297,7 @@ function sanitizeQuest(value: unknown, index: number): Quest | null {
     metricDeltas: mergeMetricDeltas(value.metricDeltas),
   };
   const description = optionalString(value.description);
-  const dueDate = optionalValidDate(value.dueDate);
+  const dueDate = optionalCalendarDate(value.dueDate);
   const completedAt = optionalValidDate(value.completedAt);
   const durationMinutes = typeof value.durationMinutes === "number"
     && Number.isFinite(value.durationMinutes)
@@ -272,6 +306,18 @@ function sanitizeQuest(value: unknown, index: number): Quest | null {
     : Number.NaN;
   if (description) quest.description = description;
   if (dueDate) quest.dueDate = dueDate;
+  if (quest.repeat === "monthly") {
+    const suppliedAnchor = typeof value.monthlyAnchorDay === "number"
+      && Number.isSafeInteger(value.monthlyAnchorDay)
+      && value.monthlyAnchorDay >= 1
+      && value.monthlyAnchorDay <= 31
+      ? value.monthlyAnchorDay
+      : undefined;
+    const derivedAnchor = dueDate ? Number(dueDate.slice(8, 10)) : undefined;
+    if (suppliedAnchor ?? derivedAnchor) {
+      quest.monthlyAnchorDay = suppliedAnchor ?? derivedAnchor;
+    }
+  }
   if (completedAt) quest.completedAt = completedAt;
   if (Number.isFinite(durationMinutes) && durationMinutes >= 0) quest.durationMinutes = durationMinutes;
   return quest;
@@ -333,6 +379,111 @@ function repairMigratedGoalProgress(goal: Goal) {
   }
 }
 
+function sanitizeGoalOutcomeMetric(value: unknown, index: number): GoalOutcomeMetricSnapshot | null {
+  if (!isRecord(value)) return null;
+  const metric: GoalOutcomeMetricSnapshot = {
+    id: stringValue(value.id, `outcome-metric-${index + 1}`),
+    label: stringValue(value.label, "Progress"),
+    current: boundedNumberValue(value.current, 0, 0, Number.MAX_SAFE_INTEGER),
+    target: positiveNumberValue(value.target),
+    unit: typeof value.unit === "string" ? value.unit : "",
+    weight: boundedNumberValue(value.weight, 100, 0, 100),
+  };
+  if (
+    typeof value.period === "string"
+    && CONSISTENCY_PERIODS.includes(value.period as ConsistencyPeriod)
+  ) {
+    metric.period = value.period as ConsistencyPeriod;
+    const periodKey = optionalString(value.periodKey);
+    if (periodKey && isPeriodKey(metric.period, periodKey)) metric.periodKey = periodKey;
+  }
+  return metric;
+}
+
+function sanitizeGoalOutcomeMilestone(
+  value: unknown,
+  index: number,
+): GoalOutcomeMilestoneSnapshot | null {
+  if (!isRecord(value)) return null;
+  const milestone: GoalOutcomeMilestoneSnapshot = {
+    id: stringValue(value.id, `outcome-milestone-${index + 1}`),
+    title: stringValue(value.title, "Untitled milestone"),
+    weight: boundedNumberValue(value.weight, 0, 0, 100),
+    completed: booleanValue(value.completed),
+  };
+  const completedAt = optionalValidDate(value.completedAt);
+  if (completedAt) milestone.completedAt = completedAt;
+  return milestone;
+}
+
+function sanitizeGoalOutcomeCheckIn(
+  value: unknown,
+  index: number,
+  completedAt: string,
+): GoalOutcomeCheckInSnapshot | null {
+  if (!isRecord(value)) return null;
+  const note = optionalString(value.note);
+  if (!note) return null;
+  return {
+    id: stringValue(value.id, `outcome-check-in-${index + 1}`),
+    createdAt: validTimestamp(value.createdAt, completedAt),
+    note,
+  };
+}
+
+function sanitizeGoalOutcome(value: unknown): GoalOutcomeSnapshot | null {
+  if (!isRecord(value) || value.version !== 1) return null;
+  const completedAt = optionalValidDate(value.completedAt);
+  const title = optionalString(value.title);
+  const areaId = optionalString(value.areaId);
+  if (!completedAt || !title || !areaId) return null;
+  const metrics = Array.isArray(value.metrics)
+    ? uniqueById(value.metrics
+      .slice(0, MAX_GOAL_OUTCOME_METRICS)
+      .map(sanitizeGoalOutcomeMetric)
+      .filter((item): item is GoalOutcomeMetricSnapshot => Boolean(item)))
+    : [];
+  const milestones = Array.isArray(value.milestones)
+    ? uniqueById(value.milestones
+      .slice(0, MAX_GOAL_OUTCOME_MILESTONES)
+      .map(sanitizeGoalOutcomeMilestone)
+      .filter((item): item is GoalOutcomeMilestoneSnapshot => Boolean(item)))
+    : [];
+  const checkIns = Array.isArray(value.checkIns)
+    ? uniqueById(value.checkIns
+      .slice(0, MAX_GOAL_OUTCOME_CHECK_INS)
+      .map((checkIn, index) => sanitizeGoalOutcomeCheckIn(checkIn, index, completedAt))
+      .filter((item): item is GoalOutcomeCheckInSnapshot => Boolean(item)))
+    : [];
+  const safeCount = (candidate: unknown, retained: number) => (
+    typeof candidate === "number"
+    && Number.isSafeInteger(candidate)
+    && candidate >= retained
+    && candidate <= COLLECTION_LIMITS.goalChildren
+      ? candidate
+      : retained
+  );
+  const snapshot: GoalOutcomeSnapshot = {
+    version: 1,
+    completedAt,
+    title,
+    description: typeof value.description === "string" ? value.description : "",
+    areaId,
+    statIds: stringArray(value.statIds),
+    model: enumValue<GoalModel>(value.model, GOAL_MODELS, "open"),
+    priority: enumValue<Priority>(value.priority, GOAL_PRIORITIES, "medium"),
+    metricCount: safeCount(value.metricCount, metrics.length),
+    milestoneCount: safeCount(value.milestoneCount, milestones.length),
+    checkInCount: safeCount(value.checkInCount, checkIns.length),
+    metrics,
+    milestones,
+    checkIns,
+  };
+  const targetDate = optionalCalendarDate(value.targetDate);
+  if (targetDate) snapshot.targetDate = targetDate;
+  return snapshot;
+}
+
 function sanitizeGoal(value: unknown, index: number, fallbackAt: string): Goal | null {
   if (!isRecord(value)) return null;
   const id = stringValue(value.id, `goal-migrated-${index + 1}`);
@@ -377,10 +528,14 @@ function sanitizeGoal(value: unknown, index: number, fallbackAt: string): Goal |
     }));
   }
   repairMigratedGoalProgress(goal);
-  const targetDate = optionalValidDate(value.targetDate);
+  const targetDate = optionalCalendarDate(value.targetDate);
   const completedAt = optionalValidDate(value.completedAt);
   if (targetDate) goal.targetDate = targetDate;
   if (completedAt) goal.completedAt = completedAt;
+  const completionSnapshot = sanitizeGoalOutcome(value.completionSnapshot);
+  if (completionSnapshot && completionSnapshot.completedAt === completedAt) {
+    goal.completionSnapshot = completionSnapshot;
+  }
   if (goal.areaId) {
     const attribution = { areaId: goal.areaId, statIds: [...goal.statIds] };
     goal.milestones.forEach((milestone) => {
@@ -393,6 +548,73 @@ function sanitizeGoal(value: unknown, index: number, fallbackAt: string): Goal |
   return goal;
 }
 
+function sanitizeReviewSource(value: unknown): ReviewSourceSnapshot | null {
+  if (!isRecord(value)) return null;
+  const sourceId = optionalString(value.sourceId);
+  const title = optionalString(value.title);
+  const detail = typeof value.detail === "string" ? value.detail : undefined;
+  const occurredAt = optionalValidDate(value.occurredAt);
+  if (
+    !sourceId
+    || !title
+    || detail === undefined
+    || !occurredAt
+    || typeof value.type !== "string"
+    || !REVIEW_SOURCE_TYPES.includes(value.type as ReviewSourceSnapshot["type"])
+  ) return null;
+  const item: ReviewSourceSnapshot = {
+    sourceId,
+    type: value.type as ReviewSourceSnapshot["type"],
+    title: title.slice(0, MAX_REVIEW_SOURCE_TITLE_LENGTH),
+    detail: detail.slice(0, MAX_REVIEW_SOURCE_DETAIL_LENGTH),
+    occurredAt,
+  };
+  const goalId = optionalString(value.goalId);
+  if (goalId) item.goalId = goalId;
+  return item;
+}
+
+function sanitizeReviewContext(value: unknown): ReviewContextSnapshot | null {
+  if (!isRecord(value) || value.version !== 1) return null;
+  const periodStartedAt = optionalValidDate(value.periodStartedAt);
+  const periodEndedAt = optionalValidDate(value.periodEndedAt);
+  if (
+    !periodStartedAt
+    || !periodEndedAt
+    || new Date(periodStartedAt).getTime() > new Date(periodEndedAt).getTime()
+  ) return null;
+  const sources = Array.isArray(value.sources)
+    ? value.sources
+      .slice(0, MAX_REVIEW_CONTEXT_SOURCES)
+      .map(sanitizeReviewSource)
+      .filter((item): item is ReviewSourceSnapshot => Boolean(item))
+    : [];
+  const count = (candidate: unknown, fallback: number) => (
+    typeof candidate === "number"
+    && Number.isSafeInteger(candidate)
+    && candidate >= 0
+    && candidate <= MAX_WORKSPACE_NODES
+      ? candidate
+      : fallback
+  );
+  const retainedTypeCount = (type: ReviewSourceSnapshot["type"]) =>
+    sources.filter((item) => item.type === type).length;
+  return {
+    version: 1,
+    periodStartedAt,
+    periodEndedAt,
+    activeDays: count(value.activeDays, new Set(sources.map((item) => item.occurredAt.slice(0, 10))).size),
+    questsCompleted: count(value.questsCompleted, retainedTypeCount("quest")),
+    metricsUpdated: count(value.metricsUpdated, retainedTypeCount("metric")),
+    milestonesReached: count(value.milestonesReached, retainedTypeCount("milestone")),
+    checkInsRecorded: count(value.checkInsRecorded, retainedTypeCount("check-in")),
+    goalsCompleted: count(value.goalsCompleted, retainedTypeCount("goal")),
+    goalsWithActivity: count(value.goalsWithActivity, new Set(sources.flatMap((item) => item.goalId ? [item.goalId] : [])).size),
+    sourceCount: count(value.sourceCount, sources.length),
+    sources,
+  };
+}
+
 function sanitizeReview(value: unknown, index: number, fallbackAt: string): Review | null {
   if (!isRecord(value)) return null;
   const answers: Record<string, string> = {};
@@ -403,12 +625,15 @@ function sanitizeReview(value: unknown, index: number, fallbackAt: string): Revi
       answers[migratedKey] = answer;
     });
   }
-  return {
+  const review: Review = {
     id: stringValue(value.id, `review-migrated-${index + 1}`),
     cadence: enumValue<ReviewCadence>(value.cadence, REVIEW_CADENCES, "weekly"),
     createdAt: validTimestamp(value.createdAt, fallbackAt),
     answers,
   };
+  const context = sanitizeReviewContext(value.context);
+  if (context) review.context = context;
+  return review;
 }
 
 const TIMELINE_TYPES: TimelineEvent["type"][] = ["quest", "milestone", "goal", "review", "note", "metric"];
@@ -515,9 +740,19 @@ function sanitizeSettings(value: unknown): UserSettings {
   const terminologySource = isRecord(value.terminology) ? value.terminology : {};
   const suppliedDashboardOrder = stringArray(value.dashboardOrder)
     .filter((item): item is DashboardSectionId => DASHBOARD_SECTIONS.includes(item as DashboardSectionId));
+  // Hero, overview, and due-now were fixed above the configurable sections in
+  // earlier workspaces. Put those newly configurable regions first when
+  // migrating an old preference list, while retaining the user's established
+  // order for every section they could already move.
+  const migratedFixedSections = LEGACY_FIXED_DASHBOARD_SECTIONS
+    .filter((item) => !suppliedDashboardOrder.includes(item));
   const dashboardOrder = [
+    ...migratedFixedSections,
     ...suppliedDashboardOrder,
-    ...DASHBOARD_SECTIONS.filter((item) => !suppliedDashboardOrder.includes(item)),
+    ...DASHBOARD_SECTIONS.filter((item) => (
+      !migratedFixedSections.includes(item)
+      && !suppliedDashboardOrder.includes(item)
+    )),
   ];
   const settings: UserSettings = {
     theme: enumValue(value.theme, SETTINGS_THEMES, DEFAULT_SETTINGS.theme),
@@ -538,61 +773,11 @@ function sanitizeSettings(value: unknown): UserSettings {
       stats: stringValue(terminologySource.stats, DEFAULT_SETTINGS.terminology.stats),
     },
   };
-  const birthDate = optionalValidDate(value.birthDate);
+  const birthDate = optionalCalendarDate(value.birthDate);
   if (birthDate) settings.birthDate = birthDate;
   const reminderTime = optionalString(value.reminderTime);
   if (reminderTime && /^([01]\d|2[0-3]):[0-5]\d$/.test(reminderTime)) settings.reminderTime = reminderTime;
   return settings;
-}
-
-function addInferredCompletions(state: AppState) {
-  const seen = new Set(
-    state.questCompletions.map((completion) => `${completion.goalId}\u0000${completion.questId}\u0000${completion.completedAt}`),
-  );
-
-  const add = (completion: QuestCompletion) => {
-    const key = `${completion.goalId}\u0000${completion.questId}\u0000${completion.completedAt}`;
-    if (seen.has(key)) return;
-    seen.add(key);
-    state.questCompletions.push(completion);
-  };
-
-  state.timeline.forEach((event) => {
-    if (event.type !== "quest" || !event.goalId) return;
-    const goal = state.goals.find((item) => item.id === event.goalId);
-    const quest = goal?.quests.find((item) => item.title === event.title);
-    if (!goal || !quest) return;
-      add({
-        id: `completion-${event.id}`,
-        goalId: goal.id,
-        linkedGoalIds: quest.linkedGoalIds,
-        questId: quest.id,
-      title: quest.title,
-      completedAt: event.at,
-      evidence: [],
-      metricDeltas: [],
-      ...(quest.durationMinutes === undefined ? {} : { durationMinutes: quest.durationMinutes }),
-    });
-  });
-
-  state.goals.forEach((goal) => {
-    goal.quests.forEach((quest) => {
-      if (!quest.completedAt) return;
-      add({
-        id: `completion-${goal.id}-${quest.id}`,
-        goalId: goal.id,
-        linkedGoalIds: quest.linkedGoalIds,
-        questId: quest.id,
-        title: quest.title,
-        completedAt: quest.completedAt,
-        evidence: [],
-        metricDeltas: quest.metricDeltas,
-        ...(quest.durationMinutes === undefined ? {} : { durationMinutes: quest.durationMinutes }),
-      });
-    });
-  });
-
-  state.questCompletions.sort((a, b) => b.completedAt.localeCompare(a.completedAt));
 }
 
 export function migrateState(value: unknown, now = new Date().toISOString()): AppState {
@@ -607,19 +792,9 @@ export function migrateState(value: unknown, now = new Date().toISOString()): Ap
   const statsSource = Array.isArray(value.stats) ? value.stats : DEFAULT_STATS;
   const areas = uniqueById(areasSource.map(sanitizeArea).filter((item): item is Area => Boolean(item)));
   const stats = uniqueById(statsSource.map(sanitizeStat).filter((item): item is LifeStat => Boolean(item)));
-  const statIds = new Set(stats.map((stat) => stat.id));
   const goals = Array.isArray(value.goals)
     ? uniqueById(value.goals.map((goal, index) => sanitizeGoal(goal, index, now)).filter((item): item is Goal => Boolean(item)))
     : [];
-  const goalIds = new Set(goals.map((goal) => goal.id));
-  goals.forEach((goal) => {
-    goal.statIds = goal.statIds.filter((statId) => statIds.has(statId));
-    goal.quests.forEach((quest) => {
-      quest.linkedGoalIds = quest.linkedGoalIds.filter((linkedGoalId) => (
-        linkedGoalId !== goal.id && goalIds.has(linkedGoalId)
-      ));
-    });
-  });
 
   const profileSource = isRecord(value.profile) ? value.profile : {};
   const state: AppState = {
@@ -665,60 +840,10 @@ export function migrateState(value: unknown, now = new Date().toISOString()): Ap
       : [],
   };
 
-  const goalsById = new Map(state.goals.map((goal) => [goal.id, goal]));
-  state.questCompletions.forEach((completion) => {
-    completion.linkedGoalIds = completion.linkedGoalIds.filter((linkedGoalId) => (
-      linkedGoalId !== completion.goalId && goalsById.has(linkedGoalId)
-    ));
-    const relatedGoalIds = [completion.goalId, ...completion.linkedGoalIds];
-    const existingSnapshots = new Map(completion.goalSnapshots?.map((snapshot) => [snapshot.goalId, snapshot]));
-    completion.goalSnapshots = relatedGoalIds.flatMap((goalId) => {
-      const existing = existingSnapshots.get(goalId);
-      if (existing) return [existing];
-      const goal = goalsById.get(goalId);
-      return goal ? [{ goalId, areaId: goal.areaId, statIds: [...goal.statIds] }] : [];
-    });
-  });
-  state.metricEntries.forEach((entry) => {
-    const contextualEntry = entry as MetricEntry & { label?: string; unit?: string };
-    const metric = goalsById.get(entry.goalId)?.metrics.find((item) => item.id === entry.metricId);
-    const goal = goalsById.get(entry.goalId);
-    if (!entry.attribution && goal) {
-      entry.attribution = { areaId: goal.areaId, statIds: [...goal.statIds] };
-    }
-    if (!metric) return;
-    if (!contextualEntry.label) contextualEntry.label = metric.label.trim().slice(0, 120);
-    if (!contextualEntry.unit && metric.unit.trim()) contextualEntry.unit = metric.unit.trim().slice(0, 32);
-  });
-  state.timeline.forEach((event) => {
-    const relatedGoalIds = [...new Set([
-      ...(event.goalId ? [event.goalId] : []),
-      ...(event.relatedGoalIds ?? []),
-    ])];
-    const relatedGoals = relatedGoalIds.flatMap((goalId) => {
-      const goal = goalsById.get(goalId);
-      return goal ? [goal] : [];
-    });
-    const explicitAreaIds = [...new Set([
-      ...(event.areaId ? [event.areaId] : []),
-      ...(event.relatedAreaIds ?? []),
-    ])];
-    const relatedAreaIds = explicitAreaIds.length
-      ? explicitAreaIds
-      : [...new Set(relatedGoals.map((goal) => goal.areaId))];
-    const relatedStatIds = event.relatedStatIds?.length
-      ? [...new Set(event.relatedStatIds)]
-      : [...new Set(relatedGoals.flatMap((goal) => goal.statIds))];
-    if (relatedGoalIds.length) event.relatedGoalIds = relatedGoalIds;
-    if (relatedAreaIds.length) event.relatedAreaIds = relatedAreaIds;
-    if (relatedStatIds.length) event.relatedStatIds = relatedStatIds;
-  });
-
   const sourceVersion = typeof value.version === "number" && Number.isInteger(value.version)
     ? value.version
     : 1;
-  if (sourceVersion < CURRENT_STATE_VERSION) addInferredCompletions(state);
-  return state;
+  return finalizeMigratedState(state, sourceVersion, CURRENT_STATE_VERSION);
 }
 
 export class UnsupportedStoredWorkspaceVersionError extends Error {
@@ -837,16 +962,23 @@ function assertUniqueIds(items: UnknownRecord[], path: string) {
   });
 }
 
-function isValidDateValue(value: unknown) {
+function isValidCalendarDateValue(value: unknown) {
   if (typeof value !== "string" || !value.trim()) return false;
   const dateOnly = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
-  if (dateOnly) {
-    const year = Number(dateOnly[1]);
-    const month = Number(dateOnly[2]) - 1;
-    const day = Number(dateOnly[3]);
-    const parsed = new Date(Date.UTC(year, month, day));
-    return parsed.getUTCFullYear() === year && parsed.getUTCMonth() === month && parsed.getUTCDate() === day;
-  }
+  if (!dateOnly) return false;
+  const year = Number(dateOnly[1]);
+  const month = Number(dateOnly[2]) - 1;
+  const day = Number(dateOnly[3]);
+  const parsed = new Date(Date.UTC(year, month, day));
+  return parsed.getUTCFullYear() === year && parsed.getUTCMonth() === month && parsed.getUTCDate() === day;
+}
+
+function isValidDateValue(value: unknown) {
+  if (isValidCalendarDateValue(value)) return true;
+  if (typeof value !== "string" || !value.trim()) return false;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+  const leadingDate = /^(\d{4}-\d{2}-\d{2})(?:T|\s)/.exec(value)?.[1];
+  if (leadingDate && !isValidCalendarDateValue(leadingDate)) return false;
   return !Number.isNaN(new Date(value).getTime());
 }
 
@@ -856,6 +988,13 @@ function assertDateField(value: UnknownRecord, key: string, path: string, requir
     return;
   }
   if (!isValidDateValue(value[key])) importFailure(`${path}.${key} must be a valid date.`);
+}
+
+function assertCalendarDateField(value: UnknownRecord, key: string, path: string) {
+  if (!(key in value)) return;
+  if (!isValidCalendarDateValue(value[key])) {
+    importFailure(`${path}.${key} must use the YYYY-MM-DD calendar-date format.`);
+  }
 }
 
 function assertBooleanField(value: UnknownRecord, key: string, path: string, required = false) {
@@ -984,6 +1123,236 @@ function validateAttributionSnapshot(value: unknown, path: string, includeGoalId
   return value;
 }
 
+function validateGoalOutcomeSnapshot(value: unknown, path: string) {
+  if (!isRecord(value)) importFailure(`${path} must be an object.`);
+  assertExactKeys(value, path, [
+    "version",
+    "completedAt",
+    "title",
+    "description",
+    "areaId",
+    "statIds",
+    "model",
+    "priority",
+    "targetDate",
+    "metricCount",
+    "milestoneCount",
+    "checkInCount",
+    "metrics",
+    "milestones",
+    "checkIns",
+  ]);
+  assertNumberField(value, "version", path, { minimum: 1, maximum: 1, integer: true });
+  assertDateField(value, "completedAt", path, true);
+  const completedAt = new Date(value.completedAt as string).getTime();
+  assertStringField(value, "title", path, false, WORKSPACE_TEXT_LIMITS.goalTitle);
+  assertStringField(value, "description", path, true, WORKSPACE_TEXT_LIMITS.goalDescription);
+  assertStringField(value, "areaId", path, false, WORKSPACE_TEXT_LIMITS.identifier);
+  assertEnumField(value, "model", path, GOAL_MODELS, true);
+  assertEnumField(value, "priority", path, GOAL_PRIORITIES, true);
+  assertCalendarDateField(value, "targetDate", path);
+  const statIds = requiredArray(value, "statIds", path);
+  assertCollectionLimit(statIds, `${path}.statIds`, COLLECTION_LIMITS.stats);
+  assertStringItems(statIds, `${path}.statIds`);
+  if (new Set(statIds).size !== statIds.length) {
+    importFailure(`${path}.statIds contains duplicate ids.`);
+  }
+
+  const metrics = objectItems(requiredArray(value, "metrics", path), `${path}.metrics`);
+  const milestones = objectItems(requiredArray(value, "milestones", path), `${path}.milestones`);
+  const checkIns = objectItems(requiredArray(value, "checkIns", path), `${path}.checkIns`);
+  assertCollectionLimit(metrics, `${path}.metrics`, MAX_GOAL_OUTCOME_METRICS);
+  assertCollectionLimit(milestones, `${path}.milestones`, MAX_GOAL_OUTCOME_MILESTONES);
+  assertCollectionLimit(checkIns, `${path}.checkIns`, MAX_GOAL_OUTCOME_CHECK_INS);
+  assertUniqueIds(metrics, `${path}.metrics`);
+  assertUniqueIds(milestones, `${path}.milestones`);
+  assertUniqueIds(checkIns, `${path}.checkIns`);
+
+  metrics.forEach((metric, index) => {
+    const metricPath = `${path}.metrics[${index}]`;
+    assertExactKeys(metric, metricPath, [
+      "id",
+      "label",
+      "current",
+      "target",
+      "unit",
+      "weight",
+      "period",
+      "periodKey",
+    ]);
+    assertStringField(metric, "label", metricPath, false, WORKSPACE_TEXT_LIMITS.metricLabel);
+    assertStringField(metric, "unit", metricPath, true, WORKSPACE_TEXT_LIMITS.metricUnit);
+    assertNumberField(metric, "current", metricPath, { minimum: 0 });
+    assertNumberField(metric, "target", metricPath, { minimum: 0, exclusiveMinimum: true });
+    assertNumberField(metric, "weight", metricPath, { minimum: 0, maximum: 100 });
+    if ("period" in metric) {
+      assertEnumField(metric, "period", metricPath, CONSISTENCY_PERIODS, true);
+      if (
+        "periodKey" in metric
+        && (
+          typeof metric.periodKey !== "string"
+          || !isPeriodKey(metric.period as ConsistencyPeriod, metric.periodKey)
+        )
+      ) {
+        importFailure(`${metricPath}.periodKey is not valid for ${metric.period}.`);
+      }
+    } else if ("periodKey" in metric) {
+      importFailure(`${metricPath}.periodKey requires a period.`);
+    }
+  });
+  milestones.forEach((milestone, index) => {
+    const milestonePath = `${path}.milestones[${index}]`;
+    assertExactKeys(milestone, milestonePath, [
+      "id",
+      "title",
+      "weight",
+      "completed",
+      "completedAt",
+    ]);
+    assertStringField(milestone, "title", milestonePath, false, WORKSPACE_TEXT_LIMITS.milestoneTitle);
+    assertNumberField(milestone, "weight", milestonePath, { minimum: 0, maximum: 100 });
+    assertBooleanField(milestone, "completed", milestonePath, true);
+    assertDateField(milestone, "completedAt", milestonePath);
+    if (
+      typeof milestone.completedAt === "string"
+      && new Date(milestone.completedAt).getTime() > completedAt
+    ) {
+      importFailure(`${milestonePath}.completedAt cannot be after the goal completion.`);
+    }
+  });
+  checkIns.forEach((checkIn, index) => {
+    const checkInPath = `${path}.checkIns[${index}]`;
+    assertExactKeys(checkIn, checkInPath, ["id", "createdAt", "note"]);
+    assertDateField(checkIn, "createdAt", checkInPath, true);
+    assertStringField(checkIn, "note", checkInPath, false, WORKSPACE_TEXT_LIMITS.checkIn);
+    if (new Date(checkIn.createdAt as string).getTime() > completedAt) {
+      importFailure(`${checkInPath}.createdAt cannot be after the goal completion.`);
+    }
+  });
+
+  for (const [key, retained] of [
+    ["metricCount", metrics.length],
+    ["milestoneCount", milestones.length],
+    ["checkInCount", checkIns.length],
+  ] as const) {
+    assertNumberField(value, key, path, {
+      minimum: retained,
+      maximum: COLLECTION_LIMITS.goalChildren,
+      integer: true,
+    });
+  }
+}
+
+function validateReviewContextSnapshot(
+  value: unknown,
+  path: string,
+  reviewCreatedAt: unknown,
+) {
+  if (!isRecord(value)) importFailure(`${path} must be an object.`);
+  assertExactKeys(value, path, [
+    "version",
+    "periodStartedAt",
+    "periodEndedAt",
+    "activeDays",
+    "questsCompleted",
+    "metricsUpdated",
+    "milestonesReached",
+    "checkInsRecorded",
+    "goalsCompleted",
+    "goalsWithActivity",
+    "sourceCount",
+    "sources",
+  ]);
+  assertNumberField(value, "version", path, { minimum: 1, maximum: 1, integer: true });
+  assertDateField(value, "periodStartedAt", path, true);
+  assertDateField(value, "periodEndedAt", path, true);
+  const periodStartedAt = new Date(value.periodStartedAt as string).getTime();
+  const periodEndedAt = new Date(value.periodEndedAt as string).getTime();
+  if (periodStartedAt > periodEndedAt) {
+    importFailure(`${path}.periodStartedAt cannot be after periodEndedAt.`);
+  }
+  if (
+    typeof reviewCreatedAt !== "string"
+    || new Date(reviewCreatedAt).getTime() !== periodEndedAt
+  ) {
+    importFailure(`${path}.periodEndedAt must match the saved review time.`);
+  }
+
+  const countKeys = [
+    "activeDays",
+    "questsCompleted",
+    "metricsUpdated",
+    "milestonesReached",
+    "checkInsRecorded",
+    "goalsCompleted",
+    "goalsWithActivity",
+    "sourceCount",
+  ] as const;
+  countKeys.forEach((key) => assertNumberField(value, key, path, {
+    minimum: 0,
+    maximum: MAX_WORKSPACE_NODES,
+    integer: true,
+  }));
+
+  const sources = objectItems(requiredArray(value, "sources", path), `${path}.sources`);
+  assertCollectionLimit(sources, `${path}.sources`, MAX_REVIEW_CONTEXT_SOURCES);
+  const seen = new Set<string>();
+  const retainedCounts = new Map<string, number>();
+  sources.forEach((item, index) => {
+    const itemPath = `${path}.sources[${index}]`;
+    assertExactKeys(item, itemPath, [
+      "sourceId",
+      "type",
+      "title",
+      "detail",
+      "occurredAt",
+      "goalId",
+    ]);
+    assertStringField(item, "sourceId", itemPath, false, WORKSPACE_TEXT_LIMITS.identifier);
+    assertEnumField(item, "type", itemPath, REVIEW_SOURCE_TYPES, true);
+    assertStringField(item, "title", itemPath, false, MAX_REVIEW_SOURCE_TITLE_LENGTH);
+    assertStringField(item, "detail", itemPath, true, MAX_REVIEW_SOURCE_DETAIL_LENGTH);
+    assertDateField(item, "occurredAt", itemPath, true);
+    if ("goalId" in item) {
+      assertStringField(item, "goalId", itemPath, false, WORKSPACE_TEXT_LIMITS.identifier);
+    }
+    const occurredAt = new Date(item.occurredAt as string).getTime();
+    if (occurredAt < periodStartedAt || occurredAt > periodEndedAt) {
+      importFailure(`${itemPath}.occurredAt must fall within the saved review period.`);
+    }
+    const uniqueKey = `${item.type}\u0000${item.sourceId}`;
+    if (seen.has(uniqueKey)) {
+      importFailure(`${path}.sources contains a duplicate source record.`);
+    }
+    seen.add(uniqueKey);
+    retainedCounts.set(item.type as string, (retainedCounts.get(item.type as string) ?? 0) + 1);
+  });
+
+  const sourceCount = value.sourceCount as number;
+  if (sourceCount < sources.length) {
+    importFailure(`${path}.sourceCount cannot be smaller than the retained source list.`);
+  }
+  const typedCounts = [
+    ["quest", "questsCompleted"],
+    ["metric", "metricsUpdated"],
+    ["milestone", "milestonesReached"],
+    ["check-in", "checkInsRecorded"],
+    ["goal", "goalsCompleted"],
+  ] as const;
+  typedCounts.forEach(([type, key]) => {
+    if ((value[key] as number) < (retainedCounts.get(type) ?? 0)) {
+      importFailure(`${path}.${key} cannot be smaller than its retained source records.`);
+    }
+  });
+  const typedTotal = typedCounts.reduce((total, [, key]) => total + (value[key] as number), 0);
+  if (typedTotal !== sourceCount) {
+    importFailure(`${path}.sourceCount must equal the saved source-type totals.`);
+  }
+  if ((value.activeDays as number) > sourceCount || (value.goalsWithActivity as number) > sourceCount) {
+    importFailure(`${path} activity totals cannot exceed sourceCount.`);
+  }
+}
+
 function assertNumberField(
   value: UnknownRecord,
   key: string,
@@ -1059,8 +1428,19 @@ function validateGoalStructure(goal: UnknownRecord, goalIndex: number, version: 
   assertEnumField(goal, "priority", path, GOAL_PRIORITIES, requireCurrentScalar);
   assertEnumField(goal, "status", path, GOAL_STATUSES, requireCurrentScalar);
   assertDateField(goal, "createdAt", path, true);
-  assertDateField(goal, "targetDate", path);
+  if (requireCurrentScalar) assertCalendarDateField(goal, "targetDate", path);
+  else assertDateField(goal, "targetDate", path);
   assertDateField(goal, "completedAt", path);
+  if ("completionSnapshot" in goal) {
+    validateGoalOutcomeSnapshot(goal.completionSnapshot, `${path}.completionSnapshot`);
+    const snapshot = goal.completionSnapshot as UnknownRecord;
+    if (
+      typeof goal.completedAt !== "string"
+      || new Date(snapshot.completedAt as string).getTime() !== new Date(goal.completedAt).getTime()
+    ) {
+      importFailure(`${path}.completionSnapshot does not match its first completion time.`);
+    }
+  }
 
   const metrics = objectItems(requiredArray(goal, "metrics", path), `${path}.metrics`);
   const milestones = objectItems(requiredArray(goal, "milestones", path), `${path}.milestones`);
@@ -1137,8 +1517,19 @@ function validateGoalStructure(goal: UnknownRecord, goalIndex: number, version: 
     assertEnumField(quest, "kind", questPath, QUEST_KINDS, requireCurrentScalar);
     assertEnumField(quest, "repeat", questPath, QUEST_REPEATS, requireCurrentScalar);
     assertBooleanField(quest, "completed", questPath, requireCurrentScalar);
-    assertDateField(quest, "dueDate", questPath);
+    if (requireCurrentScalar) assertCalendarDateField(quest, "dueDate", questPath);
+    else assertDateField(quest, "dueDate", questPath);
     assertDateField(quest, "completedAt", questPath);
+    if ("monthlyAnchorDay" in quest) {
+      assertNumberField(quest, "monthlyAnchorDay", questPath, {
+        minimum: 1,
+        maximum: 31,
+        integer: true,
+      });
+      if (quest.repeat !== "monthly") {
+        importFailure(`${questPath}.monthlyAnchorDay is only supported for a monthly repeat.`);
+      }
+    }
     validateLinkedGoalIds(quest, questPath);
     const deltas = validateMetricDeltas(
       requiredArray(quest, "metricDeltas", questPath),
@@ -1211,106 +1602,6 @@ function assertLinkedGoalReferences(goals: UnknownRecord[], questCompletions: Un
   });
 }
 
-function assertCoherentWorkspace(state: AppState, version: number) {
-  const areaIds = new Set(state.areas.map((area) => area.id));
-  const statIds = new Set(state.stats.map((stat) => stat.id));
-  const goals = new Map(state.goals.map((goal) => [goal.id, goal]));
-  const assertAttributionReferences = (attribution: AttributionSnapshot, label: string) => {
-    if (!areaIds.has(attribution.areaId)) importFailure(`${label} references missing area "${attribution.areaId}".`);
-    attribution.statIds.forEach((statId) => {
-      if (!statIds.has(statId)) importFailure(`${label} references missing quality "${statId}".`);
-    });
-  };
-
-  state.goals.forEach((goal) => {
-    if (!areaIds.has(goal.areaId)) importFailure(`goal "${goal.id}" references missing area "${goal.areaId}".`);
-    const progressIssue = goalProgressConfigurationIssue(goal);
-    if (progressIssue) importFailure(`goal "${goal.id}" is inconsistent: ${progressIssue}`);
-    goal.statIds.forEach((statId) => {
-      if (!statIds.has(statId)) importFailure(`goal "${goal.id}" references missing quality "${statId}".`);
-    });
-    const metricIds = new Set(goal.metrics.map((metric) => metric.id));
-    goal.quests.forEach((quest) => {
-      quest.metricDeltas.forEach((delta) => {
-        if (!metricIds.has(delta.metricId)) {
-          importFailure(`action "${quest.id}" references missing metric "${delta.metricId}".`);
-        }
-      });
-      quest.linkedGoalIds.forEach((linkedGoalId) => {
-        if (linkedGoalId === goal.id) {
-          importFailure(`action "${quest.id}" cannot link primary goal "${goal.id}" as an additional goal.`);
-        }
-        if (!goals.has(linkedGoalId)) {
-          importFailure(`action "${quest.id}" references missing linked goal "${linkedGoalId}".`);
-        }
-      });
-    });
-    goal.milestones.forEach((milestone) => {
-      if (milestone.attribution) assertAttributionReferences(milestone.attribution, `milestone "${milestone.id}" attribution`);
-    });
-    goal.checkIns.forEach((checkIn) => {
-      if (checkIn.attribution) assertAttributionReferences(checkIn.attribution, `check-in "${checkIn.id}" attribution`);
-    });
-  });
-
-  if (version >= 2) {
-    const completions = new Map(state.questCompletions.map((completion) => [completion.id, completion]));
-    const linkedMetricSources = new Set<string>();
-    state.questCompletions.forEach((completion) => {
-      if (!goals.has(completion.goalId)) {
-        importFailure(`action history "${completion.id}" references missing goal "${completion.goalId}".`);
-      }
-      completion.linkedGoalIds.forEach((linkedGoalId) => {
-        if (linkedGoalId === completion.goalId) {
-          importFailure(`action history "${completion.id}" cannot link primary goal "${completion.goalId}" as an additional goal.`);
-        }
-        if (!goals.has(linkedGoalId)) {
-          importFailure(`action history "${completion.id}" references missing linked goal "${linkedGoalId}".`);
-        }
-      });
-      completion.goalSnapshots?.forEach((snapshot) => {
-        if (!goals.has(snapshot.goalId)) importFailure(`action history "${completion.id}" attribution references missing goal "${snapshot.goalId}".`);
-        assertAttributionReferences(snapshot, `action history "${completion.id}" attribution`);
-      });
-    });
-    state.metricEntries.forEach((entry) => {
-      if (!goals.has(entry.goalId)) {
-        importFailure(`metric history "${entry.id}" references missing goal "${entry.goalId}".`);
-      }
-      if (entry.sourceCompletionId) {
-        const completion = completions.get(entry.sourceCompletionId);
-        if (!completion || completion.goalId !== entry.goalId || entry.source !== "quest") {
-          importFailure(`metric history "${entry.id}" has an invalid source completion link.`);
-        }
-        const sourceDelta = completion.metricDeltas.find((delta) => delta.metricId === entry.metricId);
-        if (!sourceDelta || sourceDelta.amount !== entry.value - entry.previousValue) {
-          importFailure(`metric history "${entry.id}" does not match its source completion delta.`);
-        }
-        const sourceKey = `${entry.sourceCompletionId}\u0000${entry.metricId}`;
-        if (linkedMetricSources.has(sourceKey)) {
-          importFailure(`metric history contains a duplicate source completion and metric link.`);
-        }
-        linkedMetricSources.add(sourceKey);
-      }
-      if (entry.attribution) assertAttributionReferences(entry.attribution, `metric history "${entry.id}" attribution`);
-    });
-    state.timeline.forEach((event) => {
-      if (event.goalId && !goals.has(event.goalId)) {
-        importFailure(`timeline event "${event.id}" references missing goal "${event.goalId}".`);
-      }
-      event.relatedGoalIds?.forEach((goalId) => {
-        if (!goals.has(goalId)) importFailure(`timeline event "${event.id}" attribution references missing goal "${goalId}".`);
-      });
-      event.relatedAreaIds?.forEach((areaId) => {
-        if (!areaIds.has(areaId)) importFailure(`timeline event "${event.id}" attribution references missing area "${areaId}".`);
-      });
-      event.relatedStatIds?.forEach((statId) => {
-        if (!statIds.has(statId)) importFailure(`timeline event "${event.id}" attribution references missing quality "${statId}".`);
-      });
-    });
-  }
-}
-
 /**
  * Validates a user-selected backup before it can replace the active workspace.
  * The same boundary is used for device and cloud snapshots so malformed data is
@@ -1357,7 +1648,11 @@ export function parseImportedState(value: unknown, now = new Date().toISOString(
   const terminology = requiredRecord(settings, "terminology", "workspace.settings");
   ["goals", "quests", "areas", "milestones", "stats"].forEach((key) =>
     assertStringField(terminology, key, "workspace.settings.terminology", false, WORKSPACE_TEXT_LIMITS.terminology));
-  assertDateField(settings, "birthDate", "workspace.settings");
+  if (requireCurrentScalar) {
+    assertCalendarDateField(settings, "birthDate", "workspace.settings");
+  } else {
+    assertDateField(settings, "birthDate", "workspace.settings");
+  }
   if ("reminderTime" in settings && (typeof settings.reminderTime !== "string" || !/^([01]\d|2[0-3]):[0-5]\d$/.test(settings.reminderTime))) {
     importFailure("workspace.settings.reminderTime must use 24-hour HH:MM format.");
   }
@@ -1424,6 +1719,9 @@ export function parseImportedState(value: unknown, now = new Date().toISOString(
         importFailure(`${path}.answers.${key} must be a string no longer than ${WORKSPACE_TEXT_LIMITS.reviewAnswer.toLocaleString()} characters.`);
       }
     });
+    if ("context" in review) {
+      validateReviewContextSnapshot(review.context, `${path}.context`, review.createdAt);
+    }
   });
   timeline.forEach((event, index) => {
     const path = `workspace.timeline[${index}]`;
@@ -1516,7 +1814,7 @@ export function parseImportedState(value: unknown, now = new Date().toISOString(
   });
 
   const migrated = migrateState(value, now);
-  assertCoherentWorkspace(migrated, version);
+  assertMigratedStateCoherence(migrated, version, importFailure);
   // Prime exact resource profiles at the untrusted boundary. Later internal
   // copy-on-write commands can reuse every untouched subtree instead of
   // serialising or walking the full workspace again.
@@ -1559,7 +1857,7 @@ function validateCurrentSettingsStructure(settings: UnknownRecord) {
       false,
       WORKSPACE_TEXT_LIMITS.terminology,
     ));
-  assertDateField(settings, "birthDate", "workspace.settings");
+  assertCalendarDateField(settings, "birthDate", "workspace.settings");
   if (
     "reminderTime" in settings
     && (
@@ -1577,6 +1875,15 @@ function validateCurrentSettingsStructure(settings: UnknownRecord) {
     }
     if (items.some((item) => !DASHBOARD_SECTIONS.includes(item as DashboardSectionId))) {
       importFailure(`workspace.settings.${key} contains an unsupported section.`);
+    }
+    if (
+      key === "dashboardOrder"
+      && (
+        items.length !== DASHBOARD_SECTIONS.length
+        || DASHBOARD_SECTIONS.some((section) => !items.includes(section))
+      )
+    ) {
+      importFailure("workspace.settings.dashboardOrder must contain every dashboard section exactly once.");
     }
   }
 }
@@ -1597,6 +1904,9 @@ function validateCurrentReviewStructure(review: UnknownRecord, index: number) {
       importFailure(`${path}.answers.${key} must be a string no longer than ${WORKSPACE_TEXT_LIMITS.reviewAnswer.toLocaleString()} characters.`);
     }
   });
+  if ("context" in review) {
+    validateReviewContextSnapshot(review.context, `${path}.context`, review.createdAt);
+  }
 }
 
 function validateCurrentTimelineStructure(event: UnknownRecord, index: number) {
@@ -1886,7 +2196,7 @@ export function assertInternalWorkspaceTransition(
     || removedCollectionIds(previous.goals, next.goals)
     || removedCollectionIds(previous.questCompletions, next.questCompletions);
   if (removedReferenceTarget) {
-    assertCoherentWorkspace(next, CURRENT_STATE_VERSION);
+    assertMigratedStateCoherence(next, CURRENT_STATE_VERSION, importFailure);
     return;
   }
 
@@ -1910,6 +2220,15 @@ export function assertInternalWorkspaceTransition(
   changedGoals.forEach((goal) => {
     if (!areaIds.has(goal.areaId)) {
       importFailure(`goal "${goal.id}" references missing area "${goal.areaId}".`);
+    }
+    if (
+      goal.completionSnapshot
+      && (
+        !goal.completedAt
+        || new Date(goal.completionSnapshot.completedAt).getTime() !== new Date(goal.completedAt).getTime()
+      )
+    ) {
+      importFailure(`goal "${goal.id}" completion snapshot does not match its first completion time.`);
     }
     const issue = goalProgressConfigurationIssue(goal);
     if (issue) importFailure(`goal "${goal.id}" is inconsistent: ${issue}`);

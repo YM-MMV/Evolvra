@@ -6,6 +6,10 @@ import {
 } from "./helpers";
 
 test("onboarding and primary workspace routes have no serious or critical axe violations", async ({ page }) => {
+  // This intentionally runs a full axe scan on onboarding, every primary
+  // route, a goal detail, and the evidence modal. Parallel release runs can
+  // exceed the suite's 30-second default even when every scan succeeds.
+  test.slow();
   await page.goto("/");
   let violations = await seriousAxeViolations(page);
   expect(violations, JSON.stringify(formatAxeViolations(violations), null, 2)).toEqual([]);
@@ -52,8 +56,14 @@ test("mobile navigation isolates the page, traps focus, and restores the menu tr
   await expect(closeButton).toBeFocused();
   await expect(page.locator(".app-main")).toHaveAttribute("inert", "");
   await expect(page.locator(".app-main")).toHaveAttribute("aria-hidden", "true");
+  await expect(page.locator(".skip-link")).toHaveAttribute("inert", "");
+  await expect(page.locator(".skip-link")).toHaveAttribute("aria-hidden", "true");
+  await expect(page.locator(".mobile-scrim")).toHaveAttribute("tabindex", "-1");
+  await expect(page.locator(".mobile-scrim")).toHaveAttribute("aria-hidden", "true");
   await expect(page.locator("body")).toHaveCSS("overflow", "hidden");
 
+  await page.locator(".mobile-scrim").evaluate((scrim: HTMLElement) => scrim.focus());
+  await expect(drawer).toBeFocused();
   await drawer.getByRole("link", { name: "Evolvra Personal OS" }).focus();
   await page.keyboard.press("Shift+Tab");
   await expect(drawer.getByRole("link", { name: "Customise" })).toBeFocused();
@@ -62,4 +72,6 @@ test("mobile navigation isolates the page, traps focus, and restores the menu tr
   await expect(menuButton).toBeFocused();
   await expect(page.locator(".app-main")).not.toHaveAttribute("inert", "");
   await expect(page.locator(".app-main")).not.toHaveAttribute("aria-hidden", "true");
+  await expect(page.locator(".skip-link")).not.toHaveAttribute("inert", "");
+  await expect(page.locator(".skip-link")).not.toHaveAttribute("aria-hidden", "true");
 });

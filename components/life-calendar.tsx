@@ -3,7 +3,7 @@
 import { useMemo } from "react";
 import Link from "next/link";
 import { CalendarRange } from "lucide-react";
-import { useApp } from "@/components/app-provider";
+import { useWorkspaceData } from "@/components/app-provider";
 import {
   completionAttribution,
   goalCompletionAttribution,
@@ -94,7 +94,7 @@ export function collectActivityMoments(state: AppState): ActivityMoment[] {
 }
 
 export function LifeCalendar() {
-  const { state } = useApp();
+  const { state } = useWorkspaceData();
   const { days, age, year, yearProgress, activeDays } = useMemo(() => {
     const now = new Date();
     const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());

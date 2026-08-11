@@ -511,6 +511,25 @@ describe("workspace state migration", () => {
     expect(recovered.metricEntries[0]).not.toHaveProperty("periodKey");
   });
 
+  it("normalizes parseable legacy calendar timestamps and derives a monthly anchor", () => {
+    const backup = validV2Backup();
+    Object.assign(backup.settings, { birthDate: "1992-05-09T23:30:00.000Z" });
+    backup.goals[0].targetDate = "2026-10-31T18:45:00.000Z";
+    const quest = backup.goals[0].quests[0];
+    quest.repeat = "monthly";
+    quest.dueDate = "2026-01-31T09:00:00.000Z";
+
+    const migrated = parseImportedState(backup, NOW);
+
+    expect(migrated.settings.birthDate).toBe("1992-05-09");
+    expect(migrated.goals[0].targetDate).toBe("2026-10-31");
+    expect(migrated.goals[0].quests[0]).toMatchObject({
+      dueDate: "2026-01-31",
+      repeat: "monthly",
+      monthlyAnchorDay: 31,
+    });
+  });
+
   it("removes retired scoring fields from an already-versioned v2 recovery snapshot", () => {
     const backup = validV2Backup() as unknown as Record<string, unknown>;
     const settings = backup.settings as Record<string, unknown>;
@@ -770,6 +789,35 @@ describe("strict backup imports", () => {
     expect(() => parseImportedState(state)).toThrow(message);
   });
 
+  it("requires calendar-only values for current birth, target, and due dates", () => {
+    const birthDate = parseImportedState(validV2Backup(), NOW);
+    birthDate.settings.birthDate = "1992-05-09T00:00:00.000Z";
+    expect(() => parseImportedState(birthDate, NOW)).toThrow(/birthDate must use the YYYY-MM-DD/i);
+
+    const targetDate = parseImportedState(validV2Backup(), NOW);
+    targetDate.goals[0].targetDate = "2026-10-31T00:00:00.000Z";
+    expect(() => parseImportedState(targetDate, NOW)).toThrow(/targetDate must use the YYYY-MM-DD/i);
+
+    const dueDate = parseImportedState(validV2Backup(), NOW);
+    dueDate.goals[0].quests[0].dueDate = "2026-07-19T00:00:00.000Z";
+    expect(() => parseImportedState(dueDate, NOW)).toThrow(/dueDate must use the YYYY-MM-DD/i);
+  });
+
+  it("validates monthly recurrence anchors without requiring them in older snapshots", () => {
+    const current = parseImportedState(validV2Backup(), NOW);
+    const quest = current.goals[0].quests[0];
+    quest.repeat = "monthly";
+    quest.monthlyAnchorDay = 31;
+    expect(() => parseImportedState(current, NOW)).not.toThrow();
+
+    quest.monthlyAnchorDay = 0;
+    expect(() => parseImportedState(current, NOW)).toThrow(/monthlyAnchorDay cannot be less than 1/i);
+
+    quest.monthlyAnchorDay = 31;
+    quest.repeat = "weekly";
+    expect(() => parseImportedState(current, NOW)).toThrow(/only supported for a monthly repeat/i);
+  });
+
   it("preserves unique additional goal links on actions and completion snapshots", () => {
     const backup = validV2Backup();
     const linkedGoal = addLinkedGoal(backup);
@@ -914,18 +962,18 @@ describe("strict backup imports", () => {
     const recovered = migrateState(backup, NOW);
     expect(recovered.settings).toMatchObject({
       reminderTime: "07:45",
-      dashboardOrder: ["goals", "life-map", "momentum", "qualities", "review"],
+      dashboardOrder: ["hero", "overview", "due-now", "goals", "life-map", "momentum", "qualities", "review"],
       hiddenDashboardSections: ["qualities"],
     });
 
     Object.assign(backup.settings, {
-      dashboardOrder: ["goals", "life-map", "momentum", "qualities", "review"],
-      hiddenDashboardSections: ["qualities", "review"],
+      dashboardOrder: ["overview", "hero", "due-now", "goals", "life-map", "momentum", "qualities", "review"],
+      hiddenDashboardSections: ["qualities", "review", "overview"],
     });
     expect(parseImportedState(backup).settings).toMatchObject({
       reminderTime: "07:45",
-      dashboardOrder: ["goals", "life-map", "momentum", "qualities", "review"],
-      hiddenDashboardSections: ["qualities", "review"],
+      dashboardOrder: ["overview", "hero", "due-now", "goals", "life-map", "momentum", "qualities", "review"],
+      hiddenDashboardSections: ["qualities", "review", "overview"],
     });
   });
 
@@ -1229,6 +1277,128 @@ describe("strict backup imports", () => {
       completedAt: NOW,
     });
     expect(() => parseImportedState(missingGoal)).toThrow(/history .* references missing goal/i);
+  });
+
+  it("preserves a valid goal outcome snapshot while live goal fields continue changing", () => {
+    const current = parseImportedState(validV2Backup(), NOW);
+    const goal = current.goals[0];
+    goal.completedAt = NOW;
+    goal.completionSnapshot = {
+      version: 1,
+      completedAt: NOW,
+      title: goal.title,
+      description: goal.description,
+      areaId: goal.areaId,
+      statIds: [...goal.statIds],
+      model: goal.model,
+      priority: goal.priority,
+      targetDate: goal.targetDate,
+      metricCount: goal.metrics.length,
+      milestoneCount: goal.milestones.length,
+      checkInCount: goal.checkIns.length,
+      metrics: goal.metrics.map((metric) => ({ ...metric })),
+      milestones: goal.milestones.map((milestone) => ({
+        id: milestone.id,
+        title: milestone.title,
+        weight: milestone.weight,
+        completed: milestone.completed,
+        ...(milestone.completedAt ? { completedAt: milestone.completedAt } : {}),
+      })),
+      checkIns: goal.checkIns.map((checkIn) => ({
+        id: checkIn.id,
+        createdAt: checkIn.createdAt,
+        note: checkIn.note,
+      })),
+    };
+    const savedOutcome = structuredClone(goal.completionSnapshot);
+    goal.title = "A later title";
+    goal.metrics[0].current = 11;
+    goal.checkIns.unshift({
+      id: "check-in-later",
+      createdAt: "2026-07-19T12:00:00.000Z",
+      note: "Written after reopening.",
+    });
+
+    const imported = parseImportedState(current, NOW);
+    expect(imported.goals[0].completionSnapshot).toEqual(savedOutcome);
+
+    const mismatched = structuredClone(current);
+    mismatched.goals[0].completionSnapshot!.completedAt = "2026-07-18T13:00:00.000Z";
+    expect(() => parseImportedState(mismatched, NOW)).toThrow(/does not match its first completion time/i);
+  });
+
+  it("enforces bounded, strict historical snapshot structures", () => {
+    const outcome = parseImportedState(validV2Backup(), NOW);
+    const goal = outcome.goals[0];
+    goal.completedAt = NOW;
+    goal.completionSnapshot = {
+      version: 1,
+      completedAt: NOW,
+      title: goal.title,
+      description: goal.description,
+      areaId: goal.areaId,
+      statIds: [...goal.statIds],
+      model: goal.model,
+      priority: goal.priority,
+      metricCount: 0,
+      milestoneCount: 0,
+      checkInCount: 201,
+      metrics: [],
+      milestones: [],
+      checkIns: Array.from({ length: 201 }, (_, index) => ({
+        id: `outcome-check-in-${index}`,
+        createdAt: NOW,
+        note: "Bounded context",
+      })),
+    };
+    expect(() => parseImportedState(outcome, NOW)).toThrow(/checkIns cannot contain more than 200 items/i);
+
+    const reviewState = parseImportedState(validV2Backup(), NOW);
+    reviewState.reviews.push({
+      id: "review-context",
+      cadence: "weekly",
+      createdAt: NOW,
+      answers: { movement: "Useful context" },
+      context: {
+        version: 1,
+        periodStartedAt: "2026-07-13T00:00:00.000Z",
+        periodEndedAt: NOW,
+        activeDays: 1,
+        questsCompleted: 1,
+        metricsUpdated: 0,
+        milestonesReached: 0,
+        checkInsRecorded: 0,
+        goalsCompleted: 0,
+        goalsWithActivity: 1,
+        sourceCount: 1,
+        sources: [{
+          sourceId: "deleted-source",
+          type: "quest",
+          title: "Historical action",
+          detail: "The live goal may have been deleted.",
+          occurredAt: NOW,
+          goalId: "goal-no-longer-present",
+        }],
+      },
+    });
+    expect(() => parseImportedState(reviewState, NOW)).not.toThrow();
+
+    const oversized = structuredClone(reviewState);
+    const context = oversized.reviews[0].context!;
+    context.sources.push(...Array.from({ length: 100 }, (_, index) => ({
+      sourceId: `source-${index}`,
+      type: "quest" as const,
+      title: `Historical action ${index}`,
+      detail: "Bounded context",
+      occurredAt: NOW,
+    })));
+    context.questsCompleted = 101;
+    context.sourceCount = 101;
+    expect(() => parseImportedState(oversized, NOW)).toThrow(/sources cannot contain more than 100 items/i);
+
+    const inconsistent = structuredClone(reviewState);
+    inconsistent.reviews[0].context!.sourceCount = 2;
+    expect(() => parseImportedState(inconsistent, NOW)).toThrow(/must equal the saved source-type totals/i);
   });
 
   it("keeps tolerant recovery separate from strict import validation", () => {

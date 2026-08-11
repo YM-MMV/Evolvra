@@ -1,8 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { createStarterGoals } from "@/lib/defaults";
+import { createStarterGoals, DEFAULT_AREAS, DEFAULT_STATS } from "@/lib/defaults";
 import {
+  applyAccountHandoffPersistence,
+  cleanupAbandonedEvidenceStaging,
+  deleteAccountPersistenceAtRevision,
+  deleteEvidenceBlob,
   LocalWorkspaceConflictError,
   PersistenceError,
+  cancelUnstartedAccountErasurePersistenceFence,
   evidenceKey,
   hasIndexedDbSupport,
   isEvidenceBlobRecord,
@@ -11,10 +16,25 @@ import {
   prepareLegacyWorkspaceImportCapture,
   prepareLegacyWorkspaceImportCommit,
   prepareLegacyWorkspaceImportDisable,
+  preparePortableArchiveWorkspaceWrite,
   prepareWorkspaceWrite,
   privacySafeWorkspaceExport,
+  readAccountPersistenceBackupBoundary,
+  readEvidenceBlob,
+  listEvidenceCleanupIntents,
+  markEvidenceCleanupRemoteComplete,
+  recoverLocalEvidenceCleanupIntents,
   readWorkspace,
+  requireAccountErasureWorkspaceRevision,
+  recoverEvidenceBlobRecord,
   recoverWorkspaceEnvelope,
+  serializeEvidenceBlobRecord,
+  stageEvidenceBlob,
+  stageEvidenceCleanupIntent,
+  storeEvidenceBlob,
+  rollbackStagedEvidenceBlob,
+  restoreEvidenceBlobs,
+  writeWorkspace,
   workspaceEnvelopeContentsEqual,
   workspaceKey,
   type WorkspaceEnvelope,
@@ -36,7 +56,7 @@ const state: AppState = {
     interfaceIntensity: "balanced",
     notifications: false,
     reminderTime: "18:00",
-    dashboardOrder: ["life-map", "momentum", "goals", "qualities", "review"],
+    dashboardOrder: ["hero", "overview", "due-now", "life-map", "momentum", "goals", "qualities", "review"],
     hiddenDashboardSections: [],
     terminology: {
       goals: "Goals",
@@ -66,6 +86,264 @@ const envelope: WorkspaceEnvelope = {
   savedAt: "2026-07-18T12:01:00.000Z",
 };
 
+interface AccountErasureIndexedDbFixture {
+  workspaces: Map<string, unknown>;
+  evidence: Map<string, unknown>;
+  staging: Map<string, unknown>;
+  scopes: Map<string, unknown>;
+  checkpoints: Map<string, unknown>;
+  close: () => void;
+}
+
+/** Minimal request/transaction fixture for the atomic account-fence tests. */
+function installAccountErasureIndexedDb(): AccountErasureIndexedDbFixture {
+  const original = Object.getOwnPropertyDescriptor(globalThis, "indexedDB");
+  const originalKeyRange = Object.getOwnPropertyDescriptor(globalThis, "IDBKeyRange");
+  const stores = new Map<string, Map<string, unknown>>([
+    ["workspaces", new Map()],
+    ["evidence", new Map()],
+    ["evidence-staging", new Map()],
+    ["account-scopes", new Map()],
+    ["account-erasure-checkpoints", new Map()],
+    ["account-reminders", new Map()],
+    ["legacy-import-claims", new Map()],
+  ]);
+  let database: IDBDatabase | null = null;
+
+  const objectStore = (
+    name: string,
+    transaction?: {
+      pending: number;
+      aborted: boolean;
+      completionTimer?: ReturnType<typeof setTimeout>;
+      oncomplete: ((event: Event) => void) | null;
+    },
+  ) => {
+    const records = stores.get(name);
+    if (!records) throw new Error(`Unknown fake object store: ${name}`);
+    const storageKey = (key: IDBValidKey) => (
+      name === "evidence" && Array.isArray(key)
+        ? JSON.stringify(key)
+        : String(key)
+    );
+    const valueKey = (value: Record<string, unknown>) => (
+      name === "evidence"
+        ? JSON.stringify([value.accountId, value.goalId, value.evidenceId])
+        : name === "evidence-staging"
+          ? String(value.token)
+        : String(value.accountId)
+    );
+    const request = <T,>(operation: () => T): IDBRequest<T> => {
+      const result = {} as IDBRequest<T>;
+      if (transaction) {
+        transaction.pending += 1;
+        if (transaction.completionTimer) clearTimeout(transaction.completionTimer);
+      }
+      queueMicrotask(() => {
+        if (transaction?.aborted) return;
+        try {
+          Object.defineProperty(result, "result", { value: operation() });
+          result.onsuccess?.(new Event("success"));
+        } catch (error) {
+          Object.defineProperty(result, "error", { value: error });
+          result.onerror?.(new Event("error"));
+        } finally {
+          if (transaction && !transaction.aborted) {
+            transaction.pending -= 1;
+            transaction.completionTimer = setTimeout(() => {
+              if (!transaction.aborted && transaction.pending === 0) {
+                transaction.oncomplete?.(new Event("complete"));
+              }
+            }, 0);
+          }
+        }
+      });
+      return result;
+    };
+    const cursorRequest = (
+      entries: Array<[string, Record<string, unknown>]>,
+    ): IDBRequest<IDBCursorWithValue | null> => {
+      const result = {} as IDBRequest<IDBCursorWithValue | null>;
+      let position = 0;
+      if (transaction) {
+        transaction.pending += 1;
+        if (transaction.completionTimer) clearTimeout(transaction.completionTimer);
+      }
+      const finish = () => {
+        if (!transaction || transaction.aborted) return;
+        transaction.pending -= 1;
+        transaction.completionTimer = setTimeout(() => {
+          if (!transaction.aborted && transaction.pending === 0) {
+            transaction.oncomplete?.(new Event("complete"));
+          }
+        }, 0);
+      };
+      const dispatch = () => queueMicrotask(() => {
+        if (transaction?.aborted) return;
+        const entry = entries[position];
+        if (!entry) {
+          Object.defineProperty(result, "result", {
+            configurable: true,
+            value: null,
+          });
+          result.onsuccess?.(new Event("success"));
+          finish();
+          return;
+        }
+        const [storedKey, value] = entry;
+        const primaryKey = name === "evidence" ? JSON.parse(storedKey) : storedKey;
+        const cursor = {
+          value,
+          primaryKey,
+          key: primaryKey,
+          continue: () => {
+            position += 1;
+            dispatch();
+          },
+          delete: () => request(() => {
+            records.delete(storedKey);
+            return undefined;
+          }),
+          update: (updated: Record<string, unknown>) => request(() => {
+            records.set(storedKey, updated);
+            return primaryKey;
+          }),
+        } as unknown as IDBCursorWithValue;
+        Object.defineProperty(result, "result", {
+          configurable: true,
+          value: cursor,
+        });
+        result.onsuccess?.(new Event("success"));
+      });
+      dispatch();
+      return result;
+    };
+    const queryValue = (query: unknown) => (
+      query && typeof query === "object" && "__only" in query
+        ? (query as { __only: unknown }).__only
+        : query
+    );
+    const indexedEntries = (indexName: string, query: unknown) => {
+      const expected = queryValue(query);
+      return [...records.entries()].filter(([, raw]) => {
+        if (!raw || typeof raw !== "object") return false;
+        const record = raw as Record<string, unknown>;
+        if (indexName === "by-account-goal") {
+          return Array.isArray(expected)
+            && record.accountId === expected[0]
+            && record.goalId === expected[1];
+        }
+        return record.accountId === expected;
+      }) as Array<[string, Record<string, unknown>]>;
+    };
+    return {
+      indexNames: { contains: () => true },
+      createIndex: () => undefined,
+      openCursor: () => cursorRequest(
+        [...records.entries()] as Array<[string, Record<string, unknown>]>,
+      ),
+      index: (indexName: string) => ({
+        getAll: (query: unknown) => request(() =>
+          indexedEntries(indexName, query).map(([, value]) => value)),
+        openCursor: (query: unknown) => cursorRequest(
+          indexedEntries(indexName, query),
+        ),
+      }),
+      get: (key: IDBValidKey) => request(() => records.get(storageKey(key))),
+      add: (value: Record<string, unknown>) => request(() => {
+        const key = valueKey(value);
+        if (records.has(key)) throw new Error("ConstraintError");
+        records.set(key, value);
+        return key;
+      }),
+      put: (value: Record<string, unknown>) => request(() => {
+        const key = valueKey(value);
+        records.set(key, value);
+        return key;
+      }),
+      delete: (key: IDBValidKey) => request(() => {
+        records.delete(storageKey(key));
+        return undefined;
+      }),
+    } as unknown as IDBObjectStore;
+  };
+
+  const makeTransaction = (): IDBTransaction => {
+    const state = {
+      pending: 0,
+      aborted: false,
+      completionTimer: undefined as ReturnType<typeof setTimeout> | undefined,
+      oncomplete: null as ((event: Event) => void) | null,
+      onabort: null as ((event: Event) => void) | null,
+    };
+    return {
+      get oncomplete() { return state.oncomplete; },
+      set oncomplete(value) { state.oncomplete = value; },
+      get onabort() { return state.onabort; },
+      set onabort(value) { state.onabort = value; },
+      error: null,
+      objectStore: (name: string) => objectStore(name, state),
+      abort: () => {
+        state.aborted = true;
+        if (state.completionTimer) clearTimeout(state.completionTimer);
+        queueMicrotask(() => state.onabort?.(new Event("abort")));
+      },
+    } as unknown as IDBTransaction;
+  };
+
+  const upgradeTransaction = {
+    objectStore: (name: string) => objectStore(name),
+  } as unknown as IDBTransaction;
+  const fakeDatabase = {
+    objectStoreNames: { contains: (name: string) => stores.has(name) },
+    createObjectStore: (name: string) => objectStore(name),
+    transaction: () => makeTransaction(),
+    close: () => undefined,
+    onversionchange: null,
+  } as unknown as IDBDatabase;
+  database = fakeDatabase;
+  Object.defineProperty(globalThis, "indexedDB", {
+    configurable: true,
+    value: {
+      open: () => {
+        const request = {
+          result: fakeDatabase,
+          transaction: upgradeTransaction,
+          error: null,
+          onupgradeneeded: null,
+          onblocked: null,
+          onerror: null,
+          onsuccess: null,
+        } as unknown as IDBOpenDBRequest;
+        queueMicrotask(() => {
+          request.onupgradeneeded?.(new Event("upgradeneeded") as IDBVersionChangeEvent);
+          queueMicrotask(() => request.onsuccess?.(new Event("success")));
+        });
+        return request;
+      },
+    },
+  });
+  Object.defineProperty(globalThis, "IDBKeyRange", {
+    configurable: true,
+    value: { only: (value: unknown) => ({ __only: value }) },
+  });
+
+  return {
+    workspaces: stores.get("workspaces")!,
+    evidence: stores.get("evidence")!,
+    staging: stores.get("evidence-staging")!,
+    scopes: stores.get("account-scopes")!,
+    checkpoints: stores.get("account-erasure-checkpoints")!,
+    close: () => {
+      database?.onversionchange?.(new Event("versionchange") as IDBVersionChangeEvent);
+      if (original) Object.defineProperty(globalThis, "indexedDB", original);
+      else Reflect.deleteProperty(globalThis, "indexedDB");
+      if (originalKeyRange) Object.defineProperty(globalThis, "IDBKeyRange", originalKeyRange);
+      else Reflect.deleteProperty(globalThis, "IDBKeyRange");
+    },
+  };
+}
+
 describe("persistence keys", () => {
   it("keeps evidence key parts separate without delimiter collisions", () => {
     expect(evidenceKey("account:one", "goal/two", "evidence|three")).toEqual([
@@ -78,6 +356,130 @@ describe("persistence keys", () => {
   it("rejects blank or padded account identifiers explicitly", () => {
     for (const value of ["", "   ", " account-1 "]) {
       expect(() => workspaceKey(value)).toThrow(PersistenceError);
+    }
+  });
+});
+
+describe("account-erasure backup revision fence", () => {
+  it("accepts only the exact persisted revision covered by the backup", () => {
+    expect(requireAccountErasureWorkspaceRevision(
+      envelope,
+      "account-1",
+      envelope.localRevision,
+    )).toBe(envelope.localRevision);
+
+    expect(() => requireAccountErasureWorkspaceRevision(
+      { ...envelope, localRevision: envelope.localRevision + 1 },
+      "account-1",
+      envelope.localRevision,
+    )).toThrow(LocalWorkspaceConflictError);
+  });
+
+  it("treats an absent workspace as revision zero and rejects malformed revisions", () => {
+    expect(requireAccountErasureWorkspaceRevision(
+      undefined,
+      "account-1",
+      0,
+    )).toBe(0);
+    expect(() => requireAccountErasureWorkspaceRevision(
+      undefined,
+      "account-1",
+      -1,
+    )).toThrow(PersistenceError);
+  });
+});
+
+describe("atomic cancellation of an unstarted account erasure", () => {
+  const timestamp = "2026-08-02T12:00:00.000Z";
+  const pendingCheckpoint = {
+    version: 2,
+    accountId: "account-1",
+    attemptId: "attempt-1",
+    cloud: "failed",
+    local: "pending",
+    session: "pending",
+    persistenceGeneration: 1,
+    backup: { workspaceRevision: 4, evidenceRevision: 7 },
+    owner: null,
+    updatedAt: timestamp,
+  };
+
+  it("atomically removes the exact checkpoint and rotates to a fresh writable generation", async () => {
+    const fixture = installAccountErasureIndexedDb();
+    fixture.scopes.set("account-1", {
+      accountId: "account-1",
+      generation: 1,
+      tombstoned: true,
+      updatedAt: timestamp,
+    });
+    fixture.checkpoints.set("account-1", pendingCheckpoint);
+    try {
+      await expect(cancelUnstartedAccountErasurePersistenceFence(
+        "account-1",
+        1,
+        "attempt-1",
+      )).resolves.toMatchObject({
+        accountId: "account-1",
+        generation: 2,
+        tombstoned: false,
+      });
+      expect(fixture.scopes.get("account-1")).toMatchObject({
+        generation: 2,
+        tombstoned: false,
+      });
+      expect(fixture.checkpoints.has("account-1")).toBe(false);
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("keeps the fence and checkpoint when the attempt identifier is not exact", async () => {
+    const fixture = installAccountErasureIndexedDb();
+    const scope = {
+      accountId: "account-1",
+      generation: 1,
+      tombstoned: true,
+      updatedAt: timestamp,
+    };
+    fixture.scopes.set("account-1", scope);
+    fixture.checkpoints.set("account-1", pendingCheckpoint);
+    try {
+      await expect(cancelUnstartedAccountErasurePersistenceFence(
+        "account-1",
+        1,
+        "another-attempt",
+      )).rejects.toMatchObject({ code: "invalid-data" });
+      expect(fixture.scopes.get("account-1")).toEqual(scope);
+      expect(fixture.checkpoints.get("account-1")).toEqual(pendingCheckpoint);
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("rejects a stale generation without changing exact durable bookkeeping", async () => {
+    const fixture = installAccountErasureIndexedDb();
+    const scope = {
+      accountId: "account-1",
+      generation: 2,
+      tombstoned: true,
+      updatedAt: timestamp,
+    };
+    const checkpoint = {
+      ...pendingCheckpoint,
+      persistenceGeneration: 2,
+    };
+    fixture.scopes.set("account-1", scope);
+    fixture.checkpoints.set("account-1", checkpoint);
+    try {
+      await expect(cancelUnstartedAccountErasurePersistenceFence(
+        "account-1",
+        1,
+        "attempt-1",
+      )).rejects.toMatchObject({ name: "AccountPersistenceScopeError" });
+      expect(fixture.scopes.get("account-1")).toEqual(scope);
+      expect(fixture.checkpoints.get("account-1")).toEqual(checkpoint);
+    } finally {
+      fixture.close();
     }
   });
 });
@@ -583,6 +985,21 @@ describe("workspace local compare-and-swap semantics", () => {
     })).toThrow(LocalWorkspaceConflictError);
   });
 
+  it("refuses to overflow the browser-local revision during an ordinary write", () => {
+    const exhausted = {
+      ...envelope,
+      localRevision: Number.MAX_SAFE_INTEGER,
+    };
+
+    expect(() => prepareWorkspaceWrite(exhausted, {
+      ...exhausted,
+      state: {
+        ...exhausted.state,
+        profile: { ...exhausted.state.profile, displayName: "Changed safely" },
+      },
+    })).toThrow(PersistenceError);
+  });
+
   it("exposes a typed, privacy-safe local conflict without embedding workspace data", () => {
     const error = new LocalWorkspaceConflictError("account-1", 3, 4);
 
@@ -597,6 +1014,643 @@ describe("workspace local compare-and-swap semantics", () => {
     });
     expect(error.message).not.toContain("account-1");
     expect(error.message).not.toContain(state.profile.displayName);
+  });
+});
+
+describe("portable archive compare-and-swap semantics", () => {
+  it("always advances the exact inspected revision, including identical metadata", () => {
+    expect(preparePortableArchiveWorkspaceWrite(null, {
+      ...envelope,
+      localRevision: 0,
+    })).toMatchObject({ localRevision: 1 });
+
+    expect(preparePortableArchiveWorkspaceWrite(envelope, envelope))
+      .toMatchObject({ localRevision: envelope.localRevision + 1 });
+  });
+
+  it("preserves an existing anonymous handoff acknowledgement", () => {
+    const anonymousHandoff = { generation: 3, localRevision: 9 };
+    const stored = preparePortableArchiveWorkspaceWrite({
+      ...envelope,
+      anonymousHandoff,
+    }, envelope);
+
+    expect(stored.anonymousHandoff).toEqual(anonymousHandoff);
+  });
+
+  it("rejects a stale revision with exact privacy-safe conflict metadata", () => {
+    try {
+      preparePortableArchiveWorkspaceWrite(envelope, {
+        ...envelope,
+        localRevision: envelope.localRevision - 1,
+      });
+      throw new Error("Expected the stale archive import to be refused.");
+    } catch (error) {
+      expect(error).toMatchObject({
+        name: "LocalWorkspaceConflictError",
+        accountId: envelope.accountId,
+        expectedLocalRevision: envelope.localRevision - 1,
+        actualLocalRevision: envelope.localRevision,
+      });
+      expect((error as Error).message).not.toContain(envelope.accountId);
+    }
+  });
+
+  it("refuses to overflow the browser-local revision", () => {
+    expect(() => preparePortableArchiveWorkspaceWrite({
+      ...envelope,
+      localRevision: Number.MAX_SAFE_INTEGER,
+    }, {
+      ...envelope,
+      localRevision: Number.MAX_SAFE_INTEGER,
+    })).toThrow(PersistenceError);
+  });
+});
+
+describe("atomic account handoff persistence", () => {
+  it("removes only evidence absent from the exact replacement workspace", async () => {
+    const fixture = installAccountErasureIndexedDb();
+    const targetAccountId = "target-account";
+    const goal = createStarterGoals()[0];
+    const retainedEvidenceId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const discardedEvidenceId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    const retainedKey = JSON.stringify([
+      targetAccountId,
+      goal.id,
+      retainedEvidenceId,
+    ]);
+    const discardedKey = JSON.stringify([
+      targetAccountId,
+      goal.id,
+      discardedEvidenceId,
+    ]);
+    const fileEvidence = (id: string, name: string) => ({
+      id,
+      type: "file" as const,
+      name,
+      mimeType: "text/plain" as const,
+      size: 5,
+    });
+    const currentState: AppState = {
+      ...state,
+      areas: DEFAULT_AREAS,
+      stats: DEFAULT_STATS,
+      goals: [{
+        ...goal,
+        evidence: [
+          fileEvidence(retainedEvidenceId, "keep.txt"),
+          fileEvidence(discardedEvidenceId, "discard.txt"),
+        ],
+      }],
+    };
+    const current: WorkspaceEnvelope = {
+      ...envelope,
+      accountId: targetAccountId,
+      state: currentState,
+      history: [],
+      localRevision: 0,
+    };
+    const requested: WorkspaceEnvelope = {
+      ...current,
+      state: {
+        ...currentState,
+        goals: [{
+          ...currentState.goals[0],
+          evidence: [fileEvidence(retainedEvidenceId, "keep.txt")],
+        }],
+      },
+    };
+    const storedEvidence = (evidenceId: string, contents: string) => ({
+      accountId: targetAccountId,
+      goalId: goal.id,
+      evidenceId,
+      bytes: new TextEncoder().encode(contents).buffer,
+      mimeType: "text/plain",
+      savedAt: "2026-08-09T12:00:00.000Z",
+      writeId: `write-${evidenceId}`,
+    });
+
+    try {
+      fixture.workspaces.set(targetAccountId, current);
+      const retained = storedEvidence(retainedEvidenceId, "keep!");
+      fixture.evidence.set(retainedKey, retained);
+      fixture.evidence.set(
+        discardedKey,
+        storedEvidence(discardedEvidenceId, "drop!"),
+      );
+
+      await expect(applyAccountHandoffPersistence({
+        envelope: requested,
+        evidence: [],
+        collisionPolicy: "replace-inspected-workspace",
+        replaceQuarantinedWorkspace: false,
+      }, 0)).resolves.toMatchObject({
+        envelope: { localRevision: 1 },
+      });
+
+      expect(fixture.evidence.get(retainedKey)).toBe(retained);
+      expect(fixture.evidence.get(discardedKey)).toBeUndefined();
+      expect(fixture.scopes.get(targetAccountId)).toMatchObject({
+        accountId: targetAccountId,
+        generation: 0,
+        evidenceRevision: 1,
+        tombstoned: false,
+      });
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("preserves a target committed after the handoff's initial evidence read", async () => {
+    const fixture = installAccountErasureIndexedDb();
+    const targetAccountId = "target-account";
+    const evidenceId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const goalId = "goal-1";
+    const evidenceStorageKey = JSON.stringify([
+      targetAccountId,
+      goalId,
+      evidenceId,
+    ]);
+    const requested: WorkspaceEnvelope = {
+      ...envelope,
+      accountId: targetAccountId,
+      state,
+      history: [],
+      localRevision: 0,
+      anonymousHandoff: { generation: 0, localRevision: 3 },
+    };
+    const concurrentlyCommitted: WorkspaceEnvelope = {
+      ...requested,
+      state: {
+        ...state,
+        profile: { ...state.profile, displayName: "Tab two" },
+      },
+      localRevision: 1,
+    };
+    const concurrentEvidence = {
+      accountId: targetAccountId,
+      goalId,
+      evidenceId,
+      bytes: new TextEncoder().encode("tab-two-exact-bytes").buffer,
+      mimeType: "text/plain",
+      savedAt: "2026-08-02T12:00:00.000Z",
+      writeId: "tab-two-write",
+    };
+
+    try {
+      // Tab one inspected an absent evidence key and workspace revision zero.
+      expect(fixture.evidence.get(evidenceStorageKey)).toBeUndefined();
+      expect(fixture.workspaces.get(targetAccountId)).toBeUndefined();
+
+      // Tab two then commits both its bytes and the workspace that references them.
+      fixture.evidence.set(evidenceStorageKey, concurrentEvidence);
+      fixture.workspaces.set(targetAccountId, concurrentlyCommitted);
+
+      await expect(applyAccountHandoffPersistence({
+        envelope: requested,
+        evidence: [{
+          accountId: targetAccountId,
+          goalId,
+          evidenceId,
+          blob: new Blob(["tab-one-bytes"], { type: "text/plain" }),
+          savedAt: "2026-08-02T12:01:00.000Z",
+        }],
+        collisionPolicy: "replace-inspected-workspace",
+        replaceQuarantinedWorkspace: false,
+      }, 0)).rejects.toBeInstanceOf(LocalWorkspaceConflictError);
+
+      // The failed handoff neither overwrites nor compensates over tab two.
+      expect(fixture.workspaces.get(targetAccountId)).toBe(concurrentlyCommitted);
+      expect(fixture.evidence.get(evidenceStorageKey)).toBe(concurrentEvidence);
+    } finally {
+      fixture.close();
+    }
+  });
+});
+
+describe("v4 staged evidence and revision fences", () => {
+  const accountId = "account-1";
+  const goalId = "goal-1";
+  const evidenceId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const initialEnvelope = (): WorkspaceEnvelope => ({
+    ...envelope,
+    accountId,
+    history: [],
+    localRevision: 0,
+    revision: 0,
+  });
+  const input = (contents: string) => ({
+    accountId,
+    goalId,
+    evidenceId,
+    blob: new Blob([contents], { type: "text/plain" }),
+    savedAt: "2026-08-02T12:00:00.000Z",
+  });
+
+  it("atomically sweeps an unreferenced evidence row that arrived just before replacement", async () => {
+    const fixture = installAccountErasureIndexedDb();
+    const goal = createStarterGoals()[0];
+    const referencedState: AppState = {
+      ...state,
+      areas: DEFAULT_AREAS,
+      stats: DEFAULT_STATS,
+      goals: [{
+        ...goal,
+        evidence: [{
+          id: evidenceId,
+          type: "file",
+          name: "proof.txt",
+          mimeType: "text/plain",
+          size: 4,
+        }],
+      }],
+    };
+    try {
+      const inspected = await writeWorkspace({
+        ...initialEnvelope(),
+        state: referencedState,
+      }, 0);
+
+      // This write represents the other tab landing after replacement cleanup
+      // was planned but before the replacement transaction starts.
+      await storeEvidenceBlob({
+        ...input("late"),
+        goalId: goal.id,
+      }, 0, inspected.localRevision);
+
+      const replaced = await writeWorkspace({
+        ...inspected,
+        state: { ...referencedState, goals: [] },
+        history: [],
+      }, 0, [], { removeUnreferencedEvidence: true });
+
+      expect(replaced.localRevision).toBe(inspected.localRevision + 1);
+      expect(await readEvidenceBlob(accountId, goal.id, evidenceId, 0)).toBeNull();
+      expect(fixture.scopes.get(accountId)).toMatchObject({
+        generation: 0,
+        evidenceRevision: 2,
+      });
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("advances the workspace CAS when an identical replacement sweeps evidence", async () => {
+    const fixture = installAccountErasureIndexedDb();
+    try {
+      const inspected = await writeWorkspace(initialEnvelope(), 0);
+      await storeEvidenceBlob(input("unreferenced"), 0, inspected.localRevision);
+
+      const replaced = await writeWorkspace(
+        inspected,
+        0,
+        [],
+        { removeUnreferencedEvidence: true },
+      );
+
+      expect(replaced.localRevision).toBe(inspected.localRevision + 1);
+      expect(await readEvidenceBlob(accountId, goalId, evidenceId, 0)).toBeNull();
+      await expect(storeEvidenceBlob(
+        input("stale-late-write"),
+        0,
+        inspected.localRevision,
+      )).rejects.toMatchObject({ code: "local-conflict" });
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it.each([
+    ["A then B", [0, 1]],
+    ["B then A", [1, 0]],
+  ] as const)("keeps live bytes unchanged when staged attempts roll back %s", async (_label, order) => {
+    const fixture = installAccountErasureIndexedDb();
+    try {
+      const committedWorkspace = await writeWorkspace(initialEnvelope(), 0);
+      const live = await storeEvidenceBlob(input("live"), 0, committedWorkspace.localRevision);
+      const attempts = await Promise.all([
+        stageEvidenceBlob(input("attempt-a"), 0),
+        stageEvidenceBlob(input("attempt-b"), 0),
+      ]);
+
+      for (const index of order) {
+        await expect(rollbackStagedEvidenceBlob(attempts[index], 0))
+          .resolves.toBe("rolled-back");
+      }
+
+      expect(fixture.staging.size).toBe(0);
+      const after = await readEvidenceBlob(accountId, goalId, evidenceId, 0);
+      expect(after?.writeId).toBe(live.writeId);
+      await expect(after?.blob.text()).resolves.toBe("live");
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("promotes one exact staging token atomically and leaves a conflicting attempt staged", async () => {
+    const fixture = installAccountErasureIndexedDb();
+    try {
+      const first = await stageEvidenceBlob(input("first"), 0);
+      const committedWorkspace = await writeWorkspace(initialEnvelope(), 0, [first]);
+
+      expect(fixture.staging.has(first.token)).toBe(false);
+      await expect(rollbackStagedEvidenceBlob(first, 0)).resolves.toBe("already-absent");
+      const live = await readEvidenceBlob(accountId, goalId, evidenceId, 0);
+      expect(live?.writeId).toEqual(expect.any(String));
+      await expect(live?.blob.text()).resolves.toBe("first");
+
+      const conflicting = await stageEvidenceBlob(input("second"), 0);
+      await expect(writeWorkspace(committedWorkspace, 0, [conflicting]))
+        .rejects.toMatchObject({ code: "local-conflict" });
+      expect(fixture.staging.has(conflicting.token)).toBe(true);
+      const unchanged = await readEvidenceBlob(accountId, goalId, evidenceId, 0);
+      expect(unchanged?.writeId).toBe(live?.writeId);
+      await expect(unchanged?.blob.text()).resolves.toBe("first");
+      await expect(rollbackStagedEvidenceBlob(conflicting, 0)).resolves.toBe("rolled-back");
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("cleans an abandoned staging token without exposing or deleting live evidence", async () => {
+    const fixture = installAccountErasureIndexedDb();
+    try {
+      const committedWorkspace = await writeWorkspace(initialEnvelope(), 0);
+      const live = await storeEvidenceBlob(input("live"), 0, committedWorkspace.localRevision);
+      const abandoned = await stageEvidenceBlob(input("abandoned"), 0);
+      const stored = fixture.staging.get(abandoned.token) as Record<string, unknown>;
+      fixture.staging.set(abandoned.token, {
+        ...stored,
+        stagedAt: "2026-07-01T00:00:00.000Z",
+      });
+
+      await expect(cleanupAbandonedEvidenceStaging(
+        accountId,
+        0,
+        "2026-08-01T00:00:00.000Z",
+      )).resolves.toBe(1);
+
+      expect(fixture.staging.size).toBe(0);
+      const after = await readEvidenceBlob(accountId, goalId, evidenceId, 0);
+      expect(after?.writeId).toBe(live.writeId);
+      await expect(after?.blob.text()).resolves.toBe("live");
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("recovers a crash after metadata commit by deleting only the journaled live write", async () => {
+    const fixture = installAccountErasureIndexedDb();
+    try {
+      const goal = createStarterGoals()[0];
+      const referencedState: AppState = {
+        ...state,
+        areas: DEFAULT_AREAS,
+        stats: DEFAULT_STATS,
+        goals: [{
+          ...goal,
+          evidence: [{
+            id: evidenceId,
+            type: "file",
+            name: "proof.txt",
+            mimeType: "text/plain",
+            size: 4,
+          }],
+        }],
+      };
+      const committed = await writeWorkspace({
+        ...initialEnvelope(),
+        state: referencedState,
+      }, 0);
+      const live = await storeEvidenceBlob({
+        ...input("live"),
+        goalId: goal.id,
+      }, 0, committed.localRevision);
+      const intent = await stageEvidenceCleanupIntent({
+        accountId,
+        goalId: goal.id,
+        evidenceId,
+        expectedWriteId: live.writeId,
+      }, 0);
+
+      await writeWorkspace({
+        ...committed,
+        state: {
+          ...referencedState,
+          goals: [{ ...referencedState.goals[0], evidence: [] }],
+        },
+      }, 0);
+
+      expect(fixture.staging.has(intent.token)).toBe(true);
+      await expect(recoverLocalEvidenceCleanupIntents(accountId, 0))
+        .resolves.toEqual({
+          deletedLive: 1,
+          cancelledReferenced: 0,
+          pendingRemote: 0,
+        });
+      expect(await readEvidenceBlob(accountId, goal.id, evidenceId, 0)).toBeNull();
+      expect(fixture.staging.has(intent.token)).toBe(false);
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("retains remote cleanup provenance until Storage deletion is confirmed", async () => {
+    const fixture = installAccountErasureIndexedDb();
+    try {
+      const committed = await writeWorkspace(initialEnvelope(), 0);
+      const live = await storeEvidenceBlob(input("live"), 0, committed.localRevision);
+      const intent = await stageEvidenceCleanupIntent({
+        accountId,
+        goalId,
+        evidenceId,
+        expectedWriteId: live.writeId,
+        remotePath: `${accountId}/${goalId}/${evidenceId}/attempt-proof.txt`,
+      }, 0);
+
+      await expect(recoverLocalEvidenceCleanupIntents(accountId, 0))
+        .resolves.toMatchObject({ deletedLive: 1, pendingRemote: 1 });
+      const [pending] = await listEvidenceCleanupIntents(accountId, 0);
+      expect(pending).toMatchObject({
+        token: intent.token,
+        expectedWriteId: undefined,
+        remotePath: intent.remotePath,
+      });
+      await expect(markEvidenceCleanupRemoteComplete(pending, 0))
+        .resolves.toBe("completed");
+      await expect(listEvidenceCleanupIntents(accountId, 0)).resolves.toEqual([]);
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("cancels crash cleanup when metadata still references the file", async () => {
+    const fixture = installAccountErasureIndexedDb();
+    try {
+      const goal = createStarterGoals()[0];
+      const referencedState: AppState = {
+        ...state,
+        areas: DEFAULT_AREAS,
+        stats: DEFAULT_STATS,
+        goals: [{
+          ...goal,
+          evidence: [{
+            id: evidenceId,
+            type: "file",
+            name: "proof.txt",
+            mimeType: "text/plain",
+            size: 4,
+          }],
+        }],
+      };
+      const committed = await writeWorkspace({
+        ...initialEnvelope(),
+        state: referencedState,
+      }, 0);
+      const live = await storeEvidenceBlob({
+        ...input("live"),
+        goalId: goal.id,
+      }, 0, committed.localRevision);
+      const intent = await stageEvidenceCleanupIntent({
+        accountId,
+        goalId: goal.id,
+        evidenceId,
+        expectedWriteId: live.writeId,
+      }, 0);
+
+      await expect(recoverLocalEvidenceCleanupIntents(accountId, 0))
+        .resolves.toEqual({
+          deletedLive: 0,
+          cancelledReferenced: 1,
+          pendingRemote: 0,
+        });
+      const after = await readEvidenceBlob(accountId, goal.id, evidenceId, 0);
+      expect(after?.writeId).toBe(live.writeId);
+      expect(fixture.staging.has(intent.token)).toBe(false);
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("preserves same-key local bytes while retaining cleanup for a superseded remote path", async () => {
+    const fixture = installAccountErasureIndexedDb();
+    try {
+      const goal = createStarterGoals()[0];
+      const oldPath = `${accountId}/${goal.id}/${evidenceId}/old-proof.txt`;
+      const nextPath = `${accountId}/${goal.id}/${evidenceId}/next-proof.txt`;
+      const withPath = (remotePath: string): AppState => ({
+        ...state,
+        areas: DEFAULT_AREAS,
+        stats: DEFAULT_STATS,
+        goals: [{
+          ...goal,
+          evidence: [{
+            id: evidenceId,
+            type: "file",
+            name: "proof.txt",
+            mimeType: "text/plain",
+            size: 4,
+            remotePath,
+          }],
+        }],
+      });
+      const committed = await writeWorkspace({
+        ...initialEnvelope(),
+        state: withPath(oldPath),
+      }, 0);
+      const live = await storeEvidenceBlob({
+        ...input("live"),
+        goalId: goal.id,
+      }, 0, committed.localRevision);
+      const intent = await stageEvidenceCleanupIntent({
+        accountId,
+        goalId: goal.id,
+        evidenceId,
+        expectedWriteId: live.writeId,
+        remotePath: oldPath,
+      }, 0);
+      await writeWorkspace({
+        ...committed,
+        state: withPath(nextPath),
+      }, 0);
+
+      await expect(recoverLocalEvidenceCleanupIntents(accountId, 0))
+        .resolves.toEqual({
+          deletedLive: 0,
+          cancelledReferenced: 0,
+          pendingRemote: 1,
+        });
+      expect((await readEvidenceBlob(accountId, goal.id, evidenceId, 0))?.writeId)
+        .toBe(live.writeId);
+      const [pending] = await listEvidenceCleanupIntents(accountId, 0);
+      expect(pending).toMatchObject({
+        token: intent.token,
+        expectedWriteId: undefined,
+        remotePath: oldPath,
+      });
+      await expect(markEvidenceCleanupRemoteComplete(pending, 0))
+        .resolves.toBe("completed");
+      await expect(listEvidenceCleanupIntents(accountId, 0)).resolves.toEqual([]);
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("rejects a reset receipt when an evidence write advances the backup boundary", async () => {
+    const fixture = installAccountErasureIndexedDb();
+    try {
+      const committedWorkspace = await writeWorkspace(initialEnvelope(), 0);
+      const boundary = await readAccountPersistenceBackupBoundary(accountId);
+      const live = await storeEvidenceBlob(input("newer"), 0, committedWorkspace.localRevision);
+
+      await expect(deleteAccountPersistenceAtRevision(
+        accountId,
+        boundary.generation,
+        boundary.workspaceLocalRevision,
+        boundary.evidenceRevision,
+      )).rejects.toMatchObject({ code: "local-conflict" });
+
+      const after = await readEvidenceBlob(accountId, goalId, evidenceId, 0);
+      expect(after?.writeId).toBe(live.writeId);
+      expect(fixture.workspaces.has(accountId)).toBe(true);
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("lets a newer replacement survive stale compare-delete and ABA restore receipts", async () => {
+    const fixture = installAccountErasureIndexedDb();
+    try {
+      const committedWorkspace = await writeWorkspace(initialEnvelope(), 0);
+      const first = await storeEvidenceBlob(input("first"), 0, committedWorkspace.localRevision);
+      const firstDelete = await deleteEvidenceBlob(first, 0, committedWorkspace.localRevision);
+      expect(firstDelete.kind).toBe("deleted");
+      if (firstDelete.kind !== "deleted") return;
+
+      const replacement = await storeEvidenceBlob(
+        input("replacement"),
+        0,
+        committedWorkspace.localRevision,
+      );
+      await expect(deleteEvidenceBlob(first, 0, committedWorkspace.localRevision))
+        .resolves.toEqual({ kind: "superseded" });
+      await expect(restoreEvidenceBlobs(firstDelete.receipt)).resolves.toBe("superseded");
+
+      const current = await readEvidenceBlob(accountId, goalId, evidenceId, 0);
+      expect(current?.writeId).toBe(replacement.writeId);
+      await expect(current?.blob.text()).resolves.toBe("replacement");
+
+      const replacementDelete = await deleteEvidenceBlob(
+        replacement,
+        0,
+        committedWorkspace.localRevision,
+      );
+      expect(replacementDelete.kind).toBe("deleted");
+      await expect(restoreEvidenceBlobs(firstDelete.receipt)).resolves.toBe("superseded");
+      expect(await readEvidenceBlob(accountId, goalId, evidenceId, 0)).toBeNull();
+    } finally {
+      fixture.close();
+    }
   });
 });
 
@@ -648,12 +1702,66 @@ describe("evidence record validation", () => {
     };
 
     expect(isEvidenceBlobRecord(record)).toBe(true);
+    expect(recoverEvidenceBlobRecord(record)).toBe(record);
+    expect(recoverEvidenceBlobRecord(null)).toBeNull();
     expect(isEvidenceBlobRecord({ ...record, accountId: " account-1" })).toBe(false);
     expect(isEvidenceBlobRecord({ ...record, blob: "proof" })).toBe(false);
     expect(isEvidenceBlobRecord({ ...record, blob: new Blob(["proof"], { type: "text/html" }) })).toBe(false);
     expect(isEvidenceBlobRecord({ ...record, blob: new Blob([new Uint8Array(10_485_761)], { type: "text/plain" }) })).toBe(false);
     expect(isEvidenceBlobRecord({ ...record, blob: new Blob(["proof"], { type: "text/plain;charset=utf-8" }) })).toBe(true);
     expect(isEvidenceBlobRecord({ ...record, savedAt: "sometime" })).toBe(false);
+  });
+
+  it("round-trips evidence through the cross-browser byte representation", async () => {
+    const record = {
+      accountId: "account-1",
+      goalId: "goal-1",
+      evidenceId: "evidence-1",
+      blob: new Blob(["proof"], { type: "text/plain" }),
+      savedAt: "2026-07-18T12:00:00.000Z",
+    };
+
+    const stored = await serializeEvidenceBlobRecord(record);
+    expect(stored).toMatchObject({
+      accountId: record.accountId,
+      goalId: record.goalId,
+      evidenceId: record.evidenceId,
+      mimeType: "text/plain",
+    });
+    expect(stored).not.toHaveProperty("blob");
+    expect(stored.bytes).toBeInstanceOf(ArrayBuffer);
+
+    const recovered = recoverEvidenceBlobRecord(stored);
+    expect(recovered).not.toBeNull();
+    expect(await recovered?.blob.text()).toBe("proof");
+    expect(recoverEvidenceBlobRecord({
+      ...stored,
+      mimeType: "text/html",
+    })).toBeNull();
+  });
+
+  it("rejects invalid and unstable evidence before device storage", async () => {
+    const base = {
+      accountId: "account-1",
+      goalId: "goal-1",
+      evidenceId: "evidence-1",
+      savedAt: "2026-07-18T12:00:00.000Z",
+    };
+
+    await expect(serializeEvidenceBlobRecord({
+      ...base,
+      blob: new Blob(["unsafe"], { type: "text/html" }),
+    })).rejects.toMatchObject({ code: "invalid-data", operation: "serialize-evidence" });
+
+    const unstableBlob = {
+      size: 5,
+      type: "text/plain",
+      arrayBuffer: async () => new Uint8Array([1, 2]).buffer,
+    } as Blob;
+    await expect(serializeEvidenceBlobRecord({
+      ...base,
+      blob: unstableBlob,
+    })).rejects.toMatchObject({ code: "invalid-data", operation: "serialize-evidence" });
   });
 });
 

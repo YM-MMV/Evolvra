@@ -3,7 +3,7 @@
 import { useState, type ReactNode } from "react";
 import Link from "next/link";
 import { ArrowRight, Check, ChevronRight, Flame, Plus, Sparkles, TrendingUp } from "lucide-react";
-import { useApp } from "@/components/app-provider";
+import { useWorkspaceData } from "@/components/app-provider";
 import { DynamicIcon } from "@/components/icons";
 import { GoalCard } from "@/components/goal-card";
 import { collectActivityMoments, LifeCalendar } from "@/components/life-calendar";
@@ -11,11 +11,11 @@ import { QuestCompletionForm } from "@/components/quest-completion-form";
 import { EmptyState, Panel } from "@/components/ui";
 import { terminologyForms } from "@/lib/terminology";
 import { timelineHref } from "@/lib/timeline";
-import type { DashboardSectionId } from "@/lib/types";
+import { DASHBOARD_SECTION_IDS, type DashboardSectionId } from "@/lib/types";
 import { getArea, isQuestAvailable, isQuestDue, localDateKey } from "@/lib/utils";
 
 export default function DashboardPage() {
-  const { state } = useApp();
+  const { state } = useWorkspaceData();
   const terms = terminologyForms(state.settings.terminology);
   const [completionTarget, setCompletionTarget] = useState<{ goalId: string; questId: string } | null>(null);
   const activeGoals = state.goals.filter((goal) => goal.status === "active");
@@ -58,6 +58,37 @@ export default function DashboardPage() {
   const canCompleteSelection = selectedGoal?.status === "active" && selectedQuest && isQuestAvailable(selectedQuest);
 
   const dashboardSections: Record<DashboardSectionId, ReactNode> = {
+    hero: (
+      <section id="dashboard-hero" className="hero-row">
+        <div>
+          <p className="eyebrow">{greeting}, {state.profile.displayName}</p>
+          <h1>What will move your life forward?</h1>
+          <p className="page-lead">Choose the next meaningful action. Quiet progress still counts.</p>
+        </div>
+        <div className="hero-actions"><Link href="/quests" className="button button-secondary">View today <ArrowRight size={17} aria-hidden="true" /></Link><Link href="/goals?new=true" className="button button-primary"><Plus size={17} aria-hidden="true" /> New {terms.goals.singularLower}</Link></div>
+      </section>
+    ),
+    overview: (
+      <section id="dashboard-overview" className="dashboard-kpis" aria-label="Progress overview">
+        <Link className="dashboard-kpi" href="/goals" aria-label={`Open current objectives: ${activeGoals.length} active`}><span>Active {terms.goals.pluralLower}</span><strong>{activeGoals.length}</strong><small>Open current objectives</small></Link>
+        <Link className="dashboard-kpi" href={timelineHref({ type: "quest" })} aria-label={`Inspect ${state.questCompletions.length} completed ${state.questCompletions.length === 1 ? terms.quests.singularLower : terms.quests.pluralLower}`}><span>{terms.quests.plural} completed</span><strong>{state.questCompletions.length}</strong><small>Inspect source records</small></Link>
+        <Link className="dashboard-kpi" href={timelineHref({ type: "milestone" })} aria-label={`Inspect ${milestoneCount} reached ${terms.milestones.pluralLower}`}><span>{terms.milestones.plural} reached</span><strong>{milestoneCount}</strong><small>Inspect source records</small></Link>
+        <Link className="dashboard-kpi" href={timelineHref({ type: "activity" })} aria-label={`Inspect ${activityDays} active days`}><span>Active days</span><strong>{activityDays}</strong><small>Inspect recorded moments</small></Link>
+      </section>
+    ),
+    "due-now": (
+      <Panel id="dashboard-due-now" className="today-panel">
+        <div className="section-heading compact"><div><p className="eyebrow">Due now</p><h2>Today &amp; overdue</h2></div><span className="count-badge">{todayQuests.length}</span></div>
+        <div className="quest-mini-list">
+          {todayQuests.slice(0, 5).map(({ quest, goal }) => {
+            const area = getArea(state, goal.areaId);
+            return <div className="quest-mini" key={`${goal.id}:${quest.id}`}><button type="button" onClick={() => setCompletionTarget({ goalId: goal.id, questId: quest.id })} aria-label={`Record completion of ${quest.title}`}><Check size={15} aria-hidden="true" /></button><div><strong>{quest.title}</strong><span><i style={{ background: area?.color }} aria-hidden="true" />{goal.title}</span></div><small>{quest.durationMinutes !== undefined ? `${quest.durationMinutes} planned min` : "Ready"}</small></div>;
+          })}
+          {!todayQuests.length && <div className="calm-empty"><Check size={20} aria-hidden="true" /><strong>Nothing due now</strong><p>Undated {terms.quests.pluralLower} stay in Anytime on the {terms.quests.pluralLower} board.</p></div>}
+        </div>
+        <Link href="/quests" className="panel-link">Open {terms.quests.singularLower} board <ArrowRight size={15} aria-hidden="true" /></Link>
+      </Panel>
+    ),
     "life-map": <div id="dashboard-life-map"><LifeCalendar /></div>,
     momentum: (
       <Panel id="dashboard-momentum" className="momentum-panel">
@@ -92,48 +123,25 @@ export default function DashboardPage() {
       </Panel>
     ),
   };
-  const defaultOrder: DashboardSectionId[] = ["life-map", "momentum", "goals", "qualities", "review"];
+  const defaultOrder: DashboardSectionId[] = [...DASHBOARD_SECTION_IDS];
   const orderedSections = [...state.settings.dashboardOrder, ...defaultOrder.filter((section) => !state.settings.dashboardOrder.includes(section))]
     .filter((section, index, sections) => sections.indexOf(section) === index)
     .filter((section) => !state.settings.hiddenDashboardSections.includes(section));
 
   return (
     <div className="dashboard-page">
-      <section className="hero-row">
-        <div>
-          <p className="eyebrow">{greeting}, {state.profile.displayName}</p>
-          <h1>What will move your life forward?</h1>
-          <p className="page-lead">Choose the next meaningful action. Quiet progress still counts.</p>
-        </div>
-        <div className="hero-actions"><Link href="/quests" className="button button-secondary">View today <ArrowRight size={17} aria-hidden="true" /></Link><Link href="/goals?new=true" className="button button-primary"><Plus size={17} aria-hidden="true" /> New {terms.goals.singularLower}</Link></div>
-      </section>
-
-      <section className="dashboard-kpis" aria-label="Progress overview">
-        <Link className="dashboard-kpi" href="/goals" aria-label={`Open current objectives: ${activeGoals.length} active`}><span>Active {terms.goals.pluralLower}</span><strong>{activeGoals.length}</strong><small>Open current objectives</small></Link>
-        <Link className="dashboard-kpi" href={timelineHref({ type: "quest" })} aria-label={`Inspect ${state.questCompletions.length} completed ${state.questCompletions.length === 1 ? terms.quests.singularLower : terms.quests.pluralLower}`}><span>{terms.quests.plural} completed</span><strong>{state.questCompletions.length}</strong><small>Inspect source records</small></Link>
-        <Link className="dashboard-kpi" href={timelineHref({ type: "milestone" })} aria-label={`Inspect ${milestoneCount} reached ${terms.milestones.pluralLower}`}><span>{terms.milestones.plural} reached</span><strong>{milestoneCount}</strong><small>Inspect source records</small></Link>
-        <Link className="dashboard-kpi" href={timelineHref({ type: "activity" })} aria-label={`Inspect ${activityDays} active days`}><span>Active days</span><strong>{activityDays}</strong><small>Inspect recorded moments</small></Link>
-      </section>
-
-      <div className="dashboard-command-grid">
-        <aside className="dashboard-command-rail">
-          <Panel className="today-panel">
-            <div className="section-heading compact"><div><p className="eyebrow">Due now</p><h2>Today &amp; overdue</h2></div><span className="count-badge">{todayQuests.length}</span></div>
-            <div className="quest-mini-list">
-              {todayQuests.slice(0, 5).map(({ quest, goal }) => {
-                const area = getArea(state, goal.areaId);
-                return <div className="quest-mini" key={`${goal.id}:${quest.id}`}><button type="button" onClick={() => setCompletionTarget({ goalId: goal.id, questId: quest.id })} aria-label={`Record completion of ${quest.title}`}><Check size={15} aria-hidden="true" /></button><div><strong>{quest.title}</strong><span><i style={{ background: area?.color }} aria-hidden="true" />{goal.title}</span></div><small>{quest.durationMinutes !== undefined ? `${quest.durationMinutes} planned min` : "Ready"}</small></div>;
-              })}
-              {!todayQuests.length && <div className="calm-empty"><Check size={20} aria-hidden="true" /><strong>Nothing due now</strong><p>Undated {terms.quests.pluralLower} stay in Anytime on the {terms.quests.pluralLower} board.</p></div>}
-            </div>
-            <Link href="/quests" className="panel-link">Open {terms.quests.singularLower} board <ArrowRight size={15} aria-hidden="true" /></Link>
-          </Panel>
-        </aside>
-
-        <div className="dashboard-command-main">
-          {orderedSections.map((section) => <div key={section}>{dashboardSections[section]}</div>)}
-          {!orderedSections.length && <Panel><div className="calm-empty"><Sparkles size={20} aria-hidden="true" /><strong>Your dashboard is clear</strong><p>Restore any section from dashboard arrangement in settings.</p><Link href="/settings" className="panel-link">Open settings <ArrowRight size={15} aria-hidden="true" /></Link></div></Panel>}
-        </div>
+      {state.settings.hiddenDashboardSections.includes("hero") && <h1 className="visually-hidden">Dashboard</h1>}
+      <div className="dashboard-sections">
+        {orderedSections.map((section) => (
+          <div
+            key={section}
+            className={`dashboard-section dashboard-section-${section}`}
+            data-dashboard-section={section}
+          >
+            {dashboardSections[section]}
+          </div>
+        ))}
+        {!orderedSections.length && <Panel className="dashboard-empty"><div className="calm-empty"><Sparkles size={20} aria-hidden="true" /><strong>Your dashboard is clear</strong><p>Restore any section from dashboard arrangement in settings.</p><Link href="/settings" className="panel-link">Open settings <ArrowRight size={15} aria-hidden="true" /></Link></div></Panel>}
       </div>
       {completionTarget && canCompleteSelection && selectedQuest && <QuestCompletionForm key={`${completionTarget.goalId}:${completionTarget.questId}`} goalId={completionTarget.goalId} quest={selectedQuest} open onClose={() => setCompletionTarget(null)} />}
     </div>

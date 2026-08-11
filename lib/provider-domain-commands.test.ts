@@ -1,14 +1,18 @@
 import { describe, expect, it } from "vitest";
 import { createStarterGoals, EMPTY_STATE } from "@/lib/defaults";
 import {
+  addCheckInDraft,
   addGoalDraft,
   addQuestDraft,
+  addReviewDraft,
   completeQuestDraft,
   deleteGoalRecordsDraft,
   normalizeSettingsPatch,
   setGoalFileEvidenceDraft,
+  setGoalStatusDraft,
   toggleMilestoneDraft,
   updateGoalDraft,
+  updateMetricDraft,
   updateSettingsDraft,
   type ProviderCommandRuntime,
 } from "@/lib/provider-domain-commands";
@@ -59,6 +63,42 @@ describe("provider domain commands", () => {
     expect(draft.metricEntries).toHaveLength(1);
   });
 
+  it("applies every finite default metric change from one reusable action", () => {
+    const draft = cloneWorkspaceValue(EMPTY_STATE);
+    draft.goals = createStarterGoals();
+    const goal = draft.goals.find((item) => item.model === "consistency")!;
+    const quest = goal.quests[0];
+    goal.metrics.push({
+      id: "metric-distance",
+      label: "Distance this month",
+      current: 10,
+      target: 50,
+      unit: "km",
+      weight: 50,
+      period: "month",
+      periodKey: goal.metrics[0].periodKey,
+    });
+    goal.metrics[0].weight = 50;
+    quest.metricDeltas = [
+      { metricId: goal.metrics[0].id, amount: 1 },
+      { metricId: "metric-distance", amount: 4.5 },
+    ];
+
+    completeQuestDraft(draft, goal.id, quest.id, {}, runtime());
+
+    expect(draft.questCompletions[0].metricDeltas).toEqual([
+      { metricId: goal.metrics[0].id, amount: 1 },
+      { metricId: "metric-distance", amount: 4.5 },
+    ]);
+    expect(goal.metrics.map((metric) => metric.current)).toEqual([4, 14.5]);
+    expect(draft.metricEntries).toHaveLength(2);
+    expect(draft.metricEntries).toEqual(expect.arrayContaining([
+      expect.objectContaining({ metricId: goal.metrics[0].id, previousValue: 3, value: 4 }),
+      expect.objectContaining({ metricId: "metric-distance", previousValue: 10, value: 14.5 }),
+    ]));
+    expect(() => parseImportedState(draft)).not.toThrow();
+  });
+
   it("keeps a newly added shared action and its completion canonical", () => {
     const draft = cloneWorkspaceValue(EMPTY_STATE);
     draft.goals = createStarterGoals();
@@ -107,6 +147,163 @@ describe("provider domain commands", () => {
     expect(milestone.completed).toBe(true);
     expect(milestone.completedAt).toBe("2026-07-18T12:00:00.000Z");
     expect(draft.timeline.filter((event) => event.type === "milestone")).toHaveLength(1);
+  });
+
+  it("retains one immutable first-completion outcome after later edits and reopening", () => {
+    const draft = cloneWorkspaceValue(EMPTY_STATE);
+    draft.goals = createStarterGoals();
+    const goal = draft.goals.find((item) => item.model === "consistency")!;
+    goal.metrics[0].periodKey = "month:2026-07";
+    const metric = goal.metrics[0];
+    const milestone = goal.milestones[0];
+    const commandRuntime = runtime();
+    addCheckInDraft(draft, goal.id, "Ready to close this chapter.", commandRuntime);
+
+    setGoalStatusDraft(draft, goal.id, "completed", commandRuntime);
+    const firstSnapshot = structuredClone(goal.completionSnapshot);
+
+    expect(firstSnapshot).toMatchObject({
+      version: 1,
+      completedAt: "2026-07-18T12:00:00.000Z",
+      title: goal.title,
+      model: "consistency",
+      metricCount: goal.metrics.length,
+      milestoneCount: goal.milestones.length,
+      checkInCount: 1,
+    });
+    expect(firstSnapshot?.metrics[0]).toMatchObject({
+      id: metric.id,
+      current: metric.current,
+      target: metric.target,
+    });
+    expect(firstSnapshot?.milestones[0]).toMatchObject({
+      id: milestone.id,
+      completed: false,
+    });
+    expect(firstSnapshot?.checkIns[0].note).toBe("Ready to close this chapter.");
+
+    setGoalStatusDraft(draft, goal.id, "active", commandRuntime);
+    updateMetricDraft(draft, goal.id, metric.id, metric.current + 5, commandRuntime);
+    toggleMilestoneDraft(draft, goal.id, milestone.id, commandRuntime);
+    addCheckInDraft(draft, goal.id, "This happened after reopening.", commandRuntime);
+    updateGoalDraft(draft, goal.id, {
+      title: "A later title",
+      completedAt: "2030-01-01T00:00:00.000Z",
+      completionSnapshot: {
+        ...goal.completionSnapshot!,
+        title: "Rewritten outcome",
+      },
+    }, commandRuntime);
+    setGoalStatusDraft(draft, goal.id, "completed", commandRuntime);
+
+    expect(goal.completedAt).toBe("2026-07-18T12:00:00.000Z");
+    expect(goal.completionSnapshot).toEqual(firstSnapshot);
+    expect(goal.title).toBe("A later title");
+    expect(() => parseImportedState(draft)).not.toThrow();
+  });
+
+  it("rolls stale consistency windows before recording the first-completion outcome", () => {
+    const draft = cloneWorkspaceValue(EMPTY_STATE);
+    draft.goals = createStarterGoals();
+    const goal = draft.goals.find((item) => item.model === "consistency")!;
+    goal.metrics[0] = {
+      ...goal.metrics[0],
+      current: 9,
+      period: "month",
+      periodKey: "month:2026-06",
+    };
+    const commandRuntime: ProviderCommandRuntime = {
+      now: () => "2026-07-18T12:00:00.000Z",
+      id: (prefix) => `${prefix}-period-roll`,
+    };
+
+    setGoalStatusDraft(draft, goal.id, "completed", commandRuntime);
+
+    expect(goal.metrics[0]).toMatchObject({
+      current: 0,
+      period: "month",
+      periodKey: "month:2026-07",
+    });
+    expect(goal.completionSnapshot?.metrics[0]).toMatchObject({
+      current: 0,
+      period: "month",
+      periodKey: "month:2026-07",
+    });
+    expect(() => parseImportedState(draft)).not.toThrow();
+  });
+
+  it("saves a bounded review context that survives deletion of its source goal", () => {
+    const draft = cloneWorkspaceValue(EMPTY_STATE);
+    draft.goals = createStarterGoals();
+    const goal = draft.goals[0];
+    const quest = goal.quests[0];
+    const commandRuntime = runtime();
+
+    completeQuestDraft(draft, goal.id, quest.id, {
+      durationMinutes: 20,
+      note: "A useful source detail.",
+    }, commandRuntime);
+    addCheckInDraft(draft, goal.id, "A source check-in.", commandRuntime);
+    addReviewDraft(draft, {
+      id: "review-one",
+      cadence: "weekly",
+      createdAt: "2026-07-18T12:00:00.000Z",
+      answers: { movement: "The next step is clearer." },
+    }, commandRuntime);
+
+    const savedContext = structuredClone(draft.reviews[0].context);
+    expect(savedContext).toMatchObject({
+      version: 1,
+      periodEndedAt: "2026-07-18T12:00:00.000Z",
+      questsCompleted: 1,
+      checkInsRecorded: 1,
+      sourceCount: 2,
+    });
+    expect(savedContext?.sources.map((item) => item.title)).toEqual(
+      expect.arrayContaining([quest.title, `Check-in for ${goal.title}`]),
+    );
+
+    deleteGoalRecordsDraft(draft, goal.id);
+    expect(draft.reviews[0].context).toEqual(savedContext);
+    expect(() => parseImportedState(draft)).not.toThrow();
+  });
+
+  it("keeps a monthly action anchored after February clamps its due date", () => {
+    const draft = cloneWorkspaceValue(EMPTY_STATE);
+    draft.goals = createStarterGoals();
+    const goal = draft.goals[0];
+    goal.quests = [{
+      id: "monthly-close",
+      kind: "task",
+      linkedGoalIds: [],
+      title: "Month-end close",
+      dueDate: "2028-01-31",
+      repeat: "monthly",
+      monthlyAnchorDay: 31,
+      completed: false,
+      metricDeltas: [],
+    }];
+    const dates = [
+      "2028-01-31T12:00:00.000Z",
+      "2028-01-31T12:00:00.000Z",
+      "2028-02-29T12:00:00.000Z",
+      "2028-02-29T12:00:00.000Z",
+    ];
+    const commandRuntime: ProviderCommandRuntime = {
+      now: () => dates.shift()!,
+      id: (prefix) => `${prefix}-${dates.length}`,
+    };
+
+    completeQuestDraft(draft, goal.id, "monthly-close", {}, commandRuntime);
+    expect(goal.quests[0]).toMatchObject({
+      dueDate: "2028-02-29",
+      monthlyAnchorDay: 31,
+    });
+    completeQuestDraft(draft, goal.id, "monthly-close", {}, commandRuntime);
+    expect(goal.quests[0]).toMatchObject({
+      dueDate: "2028-03-31",
+      monthlyAnchorDay: 31,
+    });
   });
 
   it("records the actual clamped metric movement and its causal completion", () => {

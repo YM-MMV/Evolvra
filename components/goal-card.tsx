@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { ArrowUpRight, CalendarDays, Flag } from "lucide-react";
-import { useApp } from "@/components/app-provider";
+import { useWorkspaceData } from "@/components/app-provider";
 import { DynamicIcon } from "@/components/icons";
 import { ProgressBar, Pill } from "@/components/ui";
 import { terminologyForms } from "@/lib/terminology";
@@ -10,7 +10,7 @@ import type { Area, Goal } from "@/lib/types";
 import { goalProgress, isQuestAvailable, shortDate } from "@/lib/utils";
 
 export function GoalCard({ goal, area }: { goal: Goal; area?: Area }) {
-  const { state } = useApp();
+  const { state } = useWorkspaceData();
   const terms = terminologyForms(state.settings.terminology);
   const progress = goalProgress(goal);
   const active = goal.status === "active";

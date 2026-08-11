@@ -7,10 +7,16 @@ import {
   type ReactNode,
 } from "react";
 import type { ProviderDomainActions } from "@/lib/provider-command-bindings";
+import type { AccountErasureCloudBackupBoundary } from "@/lib/account-erasure-checkpoint";
 import type {
   AccountPersistenceScope,
+  EvidenceBlobDeleteResult,
+  EvidenceBlobDeletionReceipt,
+  EvidenceBlobRecord,
+  EvidenceCleanupIntent,
   PersistenceScopeGeneration,
 } from "@/lib/persistence";
+import type { StagedEvidenceWrite } from "@/lib/provider-evidence";
 import type { CloudUser } from "@/lib/supabase";
 import type {
   AnonymousHandoffChoice,
@@ -55,6 +61,38 @@ export interface QuarantinedRecovery {
   rawJson?: string;
 }
 
+export interface PortableWorkspaceArchiveExport {
+  blob: Blob;
+  fileName: string;
+  evidenceFiles: number;
+  evidenceBytes: number;
+  /** Opaque proof that this exact device revision was included in the archive. */
+  resetReceiptToken: string;
+}
+
+export interface PortableWorkspaceArchiveExportOptions {
+  /** Require a cloud-stable, byte-complete archive suitable for account erasure. */
+  prepareForAccountErasure?: boolean;
+}
+
+export interface PortableWorkspaceArchiveImportPreview {
+  token: string;
+  archiveCreatedAt: string;
+  archiveWorkspaceUpdatedAt: string;
+  importedEvidenceFiles: number;
+  importedEvidenceBytes: number;
+}
+
+export type PortableWorkspaceArchiveImportChoice = "merge" | "replace";
+
+export interface PortableWorkspaceArchiveImportOutcome {
+  choice: PortableWorkspaceArchiveImportChoice;
+  importedEvidenceFiles: number;
+  importedEvidenceBytes: number;
+  removedSupersededEvidence: number;
+  cleanupWarning: string | null;
+}
+
 /**
  * The active workspace snapshot and the identities needed to scope async work.
  */
@@ -92,6 +130,48 @@ export interface AppActionsContextValue extends ProviderDomainActions {
     goalId: string,
     evidence: GoalEvidence[],
     expectedWorkspaceScopeKey: WorkspaceScopeKey,
+    stagedEvidence?: readonly StagedEvidenceWrite[],
+  ) => Promise<number>;
+  readGoalEvidenceBlob: (
+    goalId: string,
+    evidenceId: string,
+    expectedWorkspaceScopeKey: WorkspaceScopeKey,
+  ) => Promise<EvidenceBlobRecord | null>;
+  stageGoalEvidenceBlob: (
+    goalId: string,
+    evidenceId: string,
+    blob: Blob,
+    expectedWorkspaceScopeKey: WorkspaceScopeKey,
+  ) => Promise<StagedEvidenceWrite>;
+  rollbackGoalEvidenceStage: (
+    staged: StagedEvidenceWrite,
+    expectedWorkspaceScopeKey: WorkspaceScopeKey,
+  ) => Promise<void>;
+  cacheGoalEvidenceBlob: (
+    goalId: string,
+    evidenceId: string,
+    blob: Blob,
+    expectedWorkspaceScopeKey: WorkspaceScopeKey,
+  ) => Promise<EvidenceBlobRecord>;
+  deleteGoalEvidenceBlobs: (
+    snapshots: readonly EvidenceBlobRecord[],
+    committedWorkspaceLocalRevision: number | null,
+    expectedWorkspaceScopeKey: WorkspaceScopeKey,
+  ) => Promise<EvidenceBlobDeleteResult>;
+  restoreGoalEvidenceBlobs: (
+    receipt: EvidenceBlobDeletionReceipt,
+    expectedWorkspaceScopeKey: WorkspaceScopeKey,
+  ) => Promise<"restored" | "already-equal" | "superseded">;
+  stageGoalEvidenceCleanup: (
+    snapshot: EvidenceBlobRecord | null,
+    goalId: string,
+    evidenceId: string,
+    remotePath: string | undefined,
+    expectedWorkspaceScopeKey: WorkspaceScopeKey,
+  ) => Promise<EvidenceCleanupIntent | null>;
+  cancelGoalEvidenceCleanup: (
+    intent: EvidenceCleanupIntent,
+    expectedWorkspaceScopeKey: WorkspaceScopeKey,
   ) => Promise<void>;
   runWorkspaceFileOperation: <T>(
     expectedWorkspaceScopeKey: WorkspaceScopeKey,
@@ -100,7 +180,18 @@ export interface AppActionsContextValue extends ProviderDomainActions {
   reportPersistenceError: (message: string) => void;
   deleteGoal: (goalId: string) => Promise<void>;
   importState: (state: unknown) => Promise<void>;
-  resetWorkspace: () => Promise<void>;
+  exportPortableWorkspaceArchive: (
+    options?: PortableWorkspaceArchiveExportOptions,
+  ) => Promise<PortableWorkspaceArchiveExport>;
+  inspectPortableWorkspaceArchive: (
+    archive: Blob,
+  ) => Promise<PortableWorkspaceArchiveImportPreview>;
+  discardPortableWorkspaceArchiveImport: (token: string) => void;
+  applyPortableWorkspaceArchive: (
+    token: string,
+    choice: PortableWorkspaceArchiveImportChoice,
+  ) => Promise<PortableWorkspaceArchiveImportOutcome>;
+  resetWorkspace: (resetReceiptToken?: string) => Promise<void>;
   discardQuarantinedWorkspace: () => Promise<void>;
   undo: () => void;
   retrySync: () => Promise<void>;
@@ -110,9 +201,18 @@ export interface AppActionsContextValue extends ProviderDomainActions {
   signOut: () => Promise<void>;
   beginActiveAccountErasure: (
     expectedAccountId: string,
+    backupReceiptToken: string,
     armFence: (
       expectedGeneration: PersistenceScopeGeneration,
+      expectedLocalRevision: number,
+      expectedEvidenceRevision: number,
+      backup: AccountErasureCloudBackupBoundary,
     ) => Promise<AccountPersistenceScope>,
+  ) => Promise<AccountPersistenceScope>;
+  cancelActiveAccountErasure: (
+    expectedAccountId: string,
+    tombstonedGeneration: PersistenceScopeGeneration,
+    cancelFence: () => Promise<AccountPersistenceScope>,
   ) => Promise<AccountPersistenceScope>;
   adoptActiveAccountErasure: (
     expectedAccountId: string,

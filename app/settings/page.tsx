@@ -1,9 +1,11 @@
 "use client";
 
-import { ChangeEvent, useEffect, useRef, useState } from "react";
+import { ChangeEvent, useEffect, useMemo, useRef, useState } from "react";
 import {
+  AlertTriangle,
   ArrowDown,
   ArrowUp,
+  Archive,
   Check,
   Cloud,
   Database,
@@ -27,14 +29,26 @@ import {
   Upload,
   User,
 } from "lucide-react";
-import { useApp } from "@/components/app-provider";
+import {
+  useAppActions,
+  useProviderStatus,
+  useWorkspaceData,
+} from "@/components/app-provider";
+import type { PortableWorkspaceArchiveImportPreview } from "@/components/app-context";
 import { DynamicIcon, ICON_OPTIONS } from "@/components/icons";
 import { Button, Field, Modal, Panel, Pill } from "@/components/ui";
-import { CloudAccountErasureError, eraseConnectedAccount, getSupabase } from "@/lib/supabase";
+import {
+  CloudAccountErasureError,
+  eraseConnectedAccount,
+  getSupabase,
+  isStaleAccountErasureBackupError,
+  readAccountErasureBackupBoundary,
+} from "@/lib/supabase";
 import {
   actionableLocalErasureCheckpoint,
   advanceCloudAccountErasure,
   beginAccountErasureIntent,
+  cancelUnstartedAccountErasureIntent,
   eraseInactiveAccountLocalData,
   findAccountErasureCheckpoint,
   listAccountErasureCheckpoints,
@@ -42,6 +56,7 @@ import {
   type CloudErasureStatus,
 } from "@/lib/account-erasure";
 import { portableWorkspaceState } from "@/lib/provider-evidence";
+import { MAX_PORTABLE_WORKSPACE_ARCHIVE_BYTES } from "@/lib/portable-workspace-archive";
 import { settingsSyncStatusDescription } from "@/lib/provider-selectors";
 import { MAX_WORKSPACE_SERIALIZED_BYTES, WORKSPACE_TEXT_LIMITS } from "@/lib/state-schema";
 import type { AnonymousHandoffChoice } from "@/lib/sync-reconciliation";
@@ -49,15 +64,35 @@ import { terminologyForms, type TerminologyKey } from "@/lib/terminology";
 import { reconciledTimelineEvents } from "@/lib/timeline";
 import type { Area, DashboardSectionId, LifeStat } from "@/lib/types";
 import { downloadFile, escapeCsv, uid } from "@/lib/utils";
+import {
+  forecastWorkspaceCapacity,
+  formatWorkspaceBytes,
+  workspaceCapacityForecastText,
+} from "@/lib/workspace-capacity";
 
 type EditItem = { kind: "area"; value?: Area } | { kind: "stat"; value?: LifeStat } | null;
 const IMPORT_SUCCESS_NOTICE_KEY = "evolvra:notice:import-success";
 
+function downloadBlob(name: string, blob: Blob) {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = name;
+  link.click();
+  URL.revokeObjectURL(url);
+}
+
 export default function SettingsPage() {
+  const { state, workspaceScopeKey } = useWorkspaceData();
   const {
-    state, user, workspaceSwitching, terminalErasureAccountId, syncStatus, syncConflict, accountHandoff, cloudEnabled, updateProfile, updateSettings, upsertArea, reorderAreas, removeArea, upsertStat, reorderStats, removeStat,
-    importState, resetWorkspace, beginActiveAccountErasure, finishActiveAccountErasure, signIn, signOut, retrySync, resolveAccountHandoff, resolveSyncConflict,
-  } = useApp();
+    user, workspaceSwitching, terminalErasureAccountId, syncStatus, syncConflict, accountHandoff, cloudEnabled,
+  } = useProviderStatus();
+  const {
+    updateProfile, updateSettings, upsertArea, reorderAreas, removeArea, upsertStat, reorderStats, removeStat,
+    importState, exportPortableWorkspaceArchive, inspectPortableWorkspaceArchive,
+    discardPortableWorkspaceArchiveImport, applyPortableWorkspaceArchive,
+    resetWorkspace, beginActiveAccountErasure, cancelActiveAccountErasure, finishActiveAccountErasure, signIn, signOut, retrySync, resolveAccountHandoff, resolveSyncConflict,
+  } = useAppActions();
   const [active, setActive] = useState("profile");
   const [editItem, setEditItem] = useState<EditItem>(null);
   const [itemName, setItemName] = useState("");
@@ -66,17 +101,32 @@ export default function SettingsPage() {
   const [email, setEmail] = useState("");
   const [message, setMessage] = useState("");
   const [dangerOpen, setDangerOpen] = useState(false);
+  const [archiveOpen, setArchiveOpen] = useState(false);
+  const [archiving, setArchiving] = useState(false);
+  const [archivePreparedForReset, setArchivePreparedForReset] = useState<string | null>(null);
+  const [archivePreparedForErasure, setArchivePreparedForErasure] = useState<string | null>(null);
   const [erasing, setErasing] = useState(false);
   const [authPending, setAuthPending] = useState(false);
   const [handoffPending, setHandoffPending] = useState(false);
+  const [portableArchivePending, setPortableArchivePending] = useState(false);
+  const [portableImportPreview, setPortableImportPreview] =
+    useState<PortableWorkspaceArchiveImportPreview | null>(null);
   const [profileName, setProfileName] = useState(state.profile.displayName);
   const [profileChapter, setProfileChapter] = useState(state.profile.chapter);
   const [terminologyDraft, setTerminologyDraft] = useState(state.settings.terminology);
   const terminologyDraftRef = useRef(state.settings.terminology);
-  const importRef = useRef<HTMLInputElement>(null);
+  const recordsImportRef = useRef<HTMLInputElement>(null);
+  const portableImportRef = useRef<HTMLInputElement>(null);
   const term = state.settings.terminology;
   const terms = terminologyForms(term);
+  const capacity = useMemo(
+    () => forecastWorkspaceCapacity(state),
+    [state],
+  );
   const dashboardLabels: Record<DashboardSectionId, string> = {
+    hero: "Welcome and quick actions",
+    overview: "KPI overview",
+    "due-now": "Due now rail",
     "life-map": "Year life map",
     momentum: "Recent momentum",
     goals: `Current ${terms.goals.pluralLower}`,
@@ -97,6 +147,20 @@ export default function SettingsPage() {
     }
     return () => window.clearTimeout(noticeTimer);
   }, []);
+
+  useEffect(() => {
+    // A downloaded archive authorizes only the exact account and workspace
+    // revision that produced it. Close the confirmation as soon as either
+    // identity or visible workspace state changes.
+    let cancelled = false;
+    queueMicrotask(() => {
+      if (cancelled) return;
+      setArchivePreparedForErasure(null);
+      setDangerOpen(false);
+      setArchiveOpen(false);
+    });
+    return () => { cancelled = true; };
+  }, [state.updatedAt, user?.id, workspaceScopeKey]);
 
   const editTerminology = (key: TerminologyKey, value: string) => {
     const next = { ...terminologyDraftRef.current, [key]: value };
@@ -199,13 +263,66 @@ export default function SettingsPage() {
   };
   const exportJson = () => downloadFile(
     `evolvra-backup-${new Date().toISOString().slice(0, 10)}.json`,
-    JSON.stringify(portableWorkspaceState(state), null, 2),
+    JSON.stringify(portableWorkspaceState(state)),
   );
   const exportCsv = () => {
     const rows = [["date", "type", "title", "detail", "goal", "area"], ...reconciledTimelineEvents(state).map((event) => [event.at, event.type, event.title, event.detail, state.goals.find((goal) => goal.id === event.goalId)?.title ?? "", state.areas.find((area) => area.id === event.areaId)?.name ?? ""])];
     downloadFile(`evolvra-timeline-${new Date().toISOString().slice(0, 10)}.csv`, rows.map((row) => row.map((item) => escapeCsv(item)).join(",")).join("\n"), "text/csv");
   };
-  const onImport = (event: ChangeEvent<HTMLInputElement>) => {
+  const requestFullBackupDownload = async (prepareForAccountErasure = false) => {
+    const archive = await exportPortableWorkspaceArchive({
+      prepareForAccountErasure,
+    });
+    downloadBlob(archive.fileName, archive.blob);
+    return archive;
+  };
+  const exportFullBackup = async () => {
+    setPortableArchivePending(true);
+    setMessage("");
+    try {
+      const archive = await requestFullBackupDownload();
+      setMessage(
+        `Complete portable backup downloaded with ${archive.evidenceFiles.toLocaleString("en-GB")} evidence ${archive.evidenceFiles === 1 ? "file" : "files"} (${formatWorkspaceBytes(archive.evidenceBytes)}).`,
+      );
+    } catch (error) {
+      setMessage(error instanceof Error
+        ? error.message
+        : "A complete portable backup could not be created. No full-backup download was reported.");
+    } finally {
+      setPortableArchivePending(false);
+    }
+  };
+  const archiveAndReset = async () => {
+    setArchiving(true);
+    setMessage("");
+    try {
+      if (!user && archivePreparedForReset) {
+        await resetWorkspace(archivePreparedForReset);
+        setArchivePreparedForReset(null);
+        setArchiveOpen(false);
+        setMessage("The confirmed portable backup remains available and the anonymous workspace was reset.");
+        return;
+      }
+      const archive = await requestFullBackupDownload(Boolean(user));
+      if (user) {
+        setArchivePreparedForErasure(archive.resetReceiptToken);
+        setArchiveOpen(false);
+        setDangerOpen(true);
+        setMessage("Your complete portable backup download was requested. Confirm that it is available, then review the separate account-erasure confirmation.");
+        return;
+      }
+      setArchivePreparedForReset(archive.resetReceiptToken);
+      setMessage("Your complete portable backup download was requested. Confirm that the .evolvra file is available before resetting this workspace.");
+    } catch (error) {
+      setArchivePreparedForReset(null);
+      setMessage(error instanceof Error
+        ? `The workspace was not reset: ${error.message}`
+        : "The workspace was not reset. Export a backup and try again.");
+    } finally {
+      setArchiving(false);
+    }
+  };
+  const onRecordsImport = (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0]; if (!file) return;
     if (file.size > MAX_WORKSPACE_SERIALIZED_BYTES) { setMessage("That backup is too large to import safely. Choose a file no larger than 5 MB."); event.target.value = ""; return; }
     const reader = new FileReader();
@@ -228,6 +345,71 @@ export default function SettingsPage() {
       }
     };
     reader.readAsText(file); event.target.value = "";
+  };
+  const onPortableImport = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    if (file.size > MAX_PORTABLE_WORKSPACE_ARCHIVE_BYTES) {
+      setMessage("That portable backup exceeds the supported 1 GiB limit.");
+      return;
+    }
+    setPortableArchivePending(true);
+    setMessage("");
+    try {
+      const preview = await inspectPortableWorkspaceArchive(file);
+      setPortableImportPreview(preview);
+    } catch (error) {
+      setPortableImportPreview(null);
+      setMessage(error instanceof Error
+        ? error.message
+        : "That file is not a valid complete Evolvra portable backup.");
+    } finally {
+      setPortableArchivePending(false);
+    }
+  };
+  const closePortableImport = () => {
+    if (portableArchivePending) return;
+    if (portableImportPreview) {
+      discardPortableWorkspaceArchiveImport(portableImportPreview.token);
+    }
+    setPortableImportPreview(null);
+  };
+  const restorePortableArchive = async (choice: "merge" | "replace") => {
+    if (!portableImportPreview) return;
+    setPortableArchivePending(true);
+    setMessage("");
+    const action = choice === "merge"
+      ? "merged into this workspace"
+      : "replaced this workspace";
+    const successNotice = `Complete portable backup ${action} with ${portableImportPreview.importedEvidenceFiles.toLocaleString("en-GB")} evidence ${portableImportPreview.importedEvidenceFiles === 1 ? "file" : "files"}.`;
+    try {
+      try {
+        sessionStorage.setItem(IMPORT_SUCCESS_NOTICE_KEY, successNotice);
+      } catch {
+        // The durable import remains authoritative; this only survives its intentional remount.
+      }
+      const result = await applyPortableWorkspaceArchive(
+        portableImportPreview.token,
+        choice,
+      );
+      setPortableImportPreview(null);
+      setMessage(
+        `${successNotice}${result.cleanupWarning ? ` ${result.cleanupWarning}` : ""}`,
+      );
+    } catch (error) {
+      try {
+        sessionStorage.removeItem(IMPORT_SUCCESS_NOTICE_KEY);
+      } catch {
+        // No transient success notice was retained.
+      }
+      setPortableImportPreview(null);
+      setMessage(error instanceof Error
+        ? error.message
+        : "The portable backup was not restored.");
+    } finally {
+      setPortableArchivePending(false);
+    }
   };
   const chooseAccountWorkspace = async (choice: AnonymousHandoffChoice) => {
     setHandoffPending(true);
@@ -309,10 +491,24 @@ export default function SettingsPage() {
       let terminalFenceOwned = terminalErasureAccountId === accountId;
       if (!checkpoint) {
         let begun: Awaited<ReturnType<typeof beginAccountErasureIntent>> | null = null;
-        await beginActiveAccountErasure(accountId, async (expectedGeneration) => {
+        const backupReceiptToken = archivePreparedForErasure;
+        if (!backupReceiptToken) {
+          throw new Error("Download a fresh complete portable backup before erasing this connected account.");
+        }
+        // Mirror the provider's one-shot receipt consumption in the UI. A
+        // failed attempt must return through the full-backup flow instead of
+        // presenting a stale confirmation button again.
+        setArchivePreparedForErasure(null);
+        await beginActiveAccountErasure(accountId, backupReceiptToken, async (
+          expectedGeneration,
+          expectedLocalRevision,
+          expectedEvidenceRevision,
+          backup,
+        ) => {
           const result = await beginAccountErasureIntent(
             accountId,
             expectedGeneration,
+            { expectedLocalRevision, expectedEvidenceRevision, backup },
           );
           begun = result;
           return result.scope;
@@ -328,12 +524,39 @@ export default function SettingsPage() {
         checkpoint.cloud === "pending"
         || checkpoint.cloud === "failed"
       ) {
-        const result = await advanceCloudAccountErasure({
-          checkpoint,
-          eraseCloud: (onFinalDeletionStarting) => eraseConnectedAccount(supabase, accountId, {
-            onFinalDeletionStarting,
-          }),
-        });
+        const cloudBackupBoundary = checkpoint.backup;
+        if (!cloudBackupBoundary) {
+          throw new Error("This pending deletion has no verified cloud backup boundary. Contact support before retrying it.");
+        }
+        let result: Awaited<ReturnType<typeof advanceCloudAccountErasure>>;
+        try {
+          result = await advanceCloudAccountErasure({
+            checkpoint,
+            eraseCloud: (onFinalDeletionStarting) => eraseConnectedAccount(supabase, accountId, {
+              backupBoundary: cloudBackupBoundary,
+              onFinalDeletionStarting,
+            }),
+          });
+        } catch (error) {
+          if (isStaleAccountErasureBackupError(error) && terminalFenceOwned) {
+            // The PT409 is authoritative, but require one fresh authenticated
+            // active-lifecycle read before reopening local writers.
+            await readAccountErasureBackupBoundary(supabase, accountId);
+            const failed = await findAccountErasureCheckpoint(accountId);
+            if (!failed || failed.attemptId !== checkpoint.attemptId) {
+              throw new Error("The stale cloud backup was rejected, but its exact local checkpoint could not be verified for cancellation.");
+            }
+            await cancelActiveAccountErasure(
+              accountId,
+              failed.persistenceGeneration,
+              () => cancelUnstartedAccountErasureIntent(failed),
+            );
+            terminalFenceOwned = false;
+            setArchivePreparedForErasure(null);
+            setDangerOpen(false);
+          }
+          throw error;
+        }
         cloudStatus = result.cloud;
         cloudWarning = result.warning;
         cloudDeletionStarted = true;
@@ -439,14 +662,67 @@ export default function SettingsPage() {
           <div className="privacy-list"><div><ShieldCheck /><span><strong>Row-level security</strong><small>Every cloud record is restricted to the signed-in account.</small></span></div><div><Save /><span><strong>Indexed device storage</strong><small>Your account-scoped workspace and recent undo history stay available offline.</small></span></div><div><RotateCcw /><span><strong>Conflict-safe sync</strong><small>Concurrent device changes are never silently overwritten.</small></span></div></div>
         </Panel>}
 
-        {active === "data" && <Panel><SettingsHead eyebrow="Ownership & recovery" title="Your data" description="Export workspace records, restore a snapshot, or erase the workspace completely." /><div className="data-actions"><button onClick={exportJson}><span><Download /></span><div><strong>Workspace JSON backup</strong><p>Every {terms.goals.singularLower}, {terms.stats.singularLower}, review, setting, and event. File contents and private account locations are not embedded.</p></div></button><button onClick={exportCsv}><span><Download /></span><div><strong>Timeline CSV</strong><p>The same reconciled permanent record shown on the Timeline page, ready for a spreadsheet.</p></div></button><button onClick={() => importRef.current?.click()}><span><Upload /></span><div><strong>Restore workspace records</strong><p>Import a previous Evolvra JSON file. Evidence files must be attached again after restore.</p></div></button><input ref={importRef} hidden type="file" accept="application/json,.json" onChange={onImport} /></div><div className="danger-zone"><div><strong>Erase this workspace</strong><p>Delete local data, cloud snapshots, and the connected account. Export a backup first.</p></div><Button variant="danger" onClick={() => setDangerOpen(true)}><Trash2 size={15} /> Erase everything</Button></div></Panel>}
+        {active === "data" && <Panel>
+          <SettingsHead eyebrow="Ownership & recovery" title="Your data" description="Monitor workspace capacity, export records, restore a snapshot, or erase the workspace completely." />
+          <section
+            className={`capacity-card capacity-${capacity.severity}`}
+            role={capacity.severity === "healthy" ? "status" : "alert"}
+            aria-label="Workspace capacity"
+          >
+            <div className="capacity-summary">
+              <span>{capacity.severity === "healthy" ? <Database /> : <AlertTriangle />}</span>
+              <div>
+                <strong>Workspace capacity</strong>
+                <p>{formatWorkspaceBytes(capacity.serializedBytes)} of {formatWorkspaceBytes(capacity.limitBytes)} used · {Math.round(capacity.utilisationRatio * 100)}%</p>
+              </div>
+              <Pill>{capacity.severity === "critical" ? "Action needed" : capacity.severity === "watch" ? "Plan ahead" : "Healthy"}</Pill>
+            </div>
+            <progress
+              max={capacity.limitBytes}
+              value={capacity.serializedBytes}
+              aria-label={`${Math.round(capacity.utilisationRatio * 100)}% of workspace capacity used`}
+            />
+            <div className="capacity-guidance">
+              <p><strong>{capacity.severity === "critical" ? "Archive now to preserve room for new records." : capacity.severity === "watch" ? "Plan a backup and fresh workspace soon." : "There is comfortable room for new records."}</strong> {workspaceCapacityForecastText(capacity)}</p>
+              {capacity.estimatedAdditionalActivityRecords !== null && <small>Based on the recent average record size, about {capacity.estimatedAdditionalActivityRecords.toLocaleString("en-GB")} similar activity records would fit before the hard limit. This is an estimate, not a guarantee.</small>}
+            </div>
+            <Button variant="secondary" onClick={() => { setArchivePreparedForReset(null); setArchiveOpen(true); }}><Archive size={15} /> Archive and start fresh</Button>
+          </section>
+          <div className="data-actions">
+            <button disabled={portableArchivePending || workspaceSwitching} onClick={() => void exportFullBackup()}><span><HardDrive /></span><div><strong>Complete portable backup</strong><p>One checksummed .evolvra file with workspace records and every referenced evidence file. Missing referenced bytes stop the download; unreferenced orphan records are not included.</p></div></button>
+            <button
+              disabled={portableArchivePending || workspaceSwitching || Boolean(syncConflict) || Boolean(accountHandoff)}
+              title={syncConflict || accountHandoff ? "Resolve the active source-of-truth choice before restoring a portable backup." : undefined}
+              onClick={() => portableImportRef.current?.click()}
+            ><span><Upload /></span><div><strong>Restore complete portable backup</strong><p>{syncConflict || accountHandoff ? "Resolve the active source-of-truth choice first; export remains available." : "Inspect a .evolvra file first, then explicitly merge it or replace this workspace."}</p></div></button>
+            <input ref={portableImportRef} data-testid="portable-archive-input" disabled={Boolean(syncConflict) || Boolean(accountHandoff)} hidden type="file" accept=".evolvra,application/vnd.evolvra.workspace-archive" onChange={(event) => void onPortableImport(event)} />
+            <button onClick={exportJson}><span><Download /></span><div><strong>Records-only JSON backup</strong><p>Every {terms.goals.singularLower}, {terms.stats.singularLower}, review, setting, and event. Evidence file contents and private account locations are deliberately excluded.</p></div></button>
+            <button onClick={exportCsv}><span><Download /></span><div><strong>Timeline CSV</strong><p>The same reconciled permanent record shown on the Timeline page, ready for a spreadsheet.</p></div></button>
+            <button onClick={() => recordsImportRef.current?.click()}><span><Upload /></span><div><strong>Restore records-only JSON</strong><p>Import a previous Evolvra JSON file. Evidence files must be attached again after restore.</p></div></button>
+            <input ref={recordsImportRef} hidden type="file" accept="application/json,.json" onChange={onRecordsImport} />
+          </div>
+          <div className="danger-zone"><div><strong>Erase this workspace</strong><p>Delete local data, cloud snapshots, and the connected account. Export a backup first.</p></div><Button variant="danger" onClick={() => { setArchivePreparedForErasure(null); if (user) setArchiveOpen(true); else setDangerOpen(true); }}><Trash2 size={15} /> Erase everything</Button></div>
+        </Panel>}
 
         {message && <div className="toast-message" role="status" aria-live="polite"><Check size={16} />{message}<button aria-label="Dismiss message" onClick={() => setMessage("")}>×</button></div>}
       </div>
     </div>
 
     <Modal open={Boolean(editItem)} onClose={() => setEditItem(null)} eyebrow={editItem?.kind === "area" ? "Life structure" : `Personal ${terms.stats.singularLower}`} title={`${editItem?.value ? "Edit" : "Add"} ${editItem?.kind === "area" ? terms.areas.singularLower : editItem?.kind === "stat" ? terms.stats.singularLower : "item"}`}><div className="form-stack"><Field label="Name"><input data-modal-autofocus="true" maxLength={WORKSPACE_TEXT_LIMITS.areaOrQualityName} value={itemName} onChange={(e) => setItemName(e.target.value)} placeholder={editItem?.kind === "area" ? "Creative work" : "Leadership"} /></Field><div className="form-grid"><Field label="Colour"><div className="color-input"><input aria-label="Choose colour" type="color" value={itemColor} onChange={(e) => setItemColor(e.target.value)} /><input aria-label="Colour value" maxLength={WORKSPACE_TEXT_LIMITS.color} value={itemColor} onChange={(e) => setItemColor(e.target.value)} /></div></Field><Field label="Icon"><select value={itemIcon} onChange={(e) => setItemIcon(e.target.value)}>{ICON_OPTIONS.map((icon) => <option key={icon}>{icon}</option>)}</select></Field></div><div className="icon-preview" style={{ color: itemColor, background: `${itemColor}18` }}><DynamicIcon name={itemIcon} size={24} /><strong>{itemName || "Preview"}</strong></div><div className="button-row end"><Button variant="ghost" onClick={() => setEditItem(null)}>Cancel</Button><Button disabled={!itemName.trim()} onClick={saveItem}><Save size={15} /> Save</Button></div></div></Modal>
-    <Modal open={dangerOpen} onClose={() => { if (!erasing) setDangerOpen(false); }} eyebrow="Permanent action" title="Erase your Evolvra workspace?"><div className="danger-confirm"><span><Trash2 /></span><p>This removes all information in this workspace and, if connected, its cloud snapshot and account. Other account workspaces and the anonymous original stay separate on this device. Evolvra keeps an account-scoped cleanup checkpoint if cloud deletion finishes before device cleanup, so retry never depends on the deleted session.</p><div className="button-row end"><Button variant="ghost" disabled={erasing} onClick={() => setDangerOpen(false)}>Keep my data</Button><Button variant="danger" disabled={erasing} onClick={eraseEverything}>{erasing ? "Erasing…" : "Erase everything"}</Button></div></div></Modal>
+    <Modal open={Boolean(portableImportPreview)} onClose={closePortableImport} eyebrow="Verified portable backup" title="Merge or replace this workspace?">
+      {portableImportPreview && <div className="archive-confirm portable-import-choice">
+        <span><ShieldCheck /></span>
+        <p>The archive passed its format, schema, metadata, and SHA-256 integrity checks. It was created {new Date(portableImportPreview.archiveCreatedAt).toLocaleString("en-GB")} from workspace records last updated {new Date(portableImportPreview.archiveWorkspaceUpdatedAt).toLocaleString("en-GB")}.</p>
+        <p><strong>{portableImportPreview.importedEvidenceFiles.toLocaleString("en-GB")} evidence {portableImportPreview.importedEvidenceFiles === 1 ? "file" : "files"}</strong> · {formatWorkspaceBytes(portableImportPreview.importedEvidenceBytes)}</p>
+        <div className="portable-import-options">
+          <div><strong>Merge and preserve</strong><p>Keep this workspace and its device evidence. Imported records and files receive collision-free identifiers. Archive restore is a recovery operation and cannot be undone from recent history.</p><Button disabled={portableArchivePending || Boolean(syncConflict) || Boolean(accountHandoff)} onClick={() => void restorePortableArchive("merge")}>{portableArchivePending ? "Restoring…" : "Merge into this workspace"}</Button></div>
+          <div className="destructive-choice"><strong>Replace everything here</strong><p>Discard current workspace records and replace its device evidence in one durable transaction. This cannot be undone from recent history.</p><Button variant="danger" disabled={portableArchivePending || Boolean(syncConflict) || Boolean(accountHandoff)} onClick={() => void restorePortableArchive("replace")}>{portableArchivePending ? "Restoring…" : "Replace this workspace"}</Button></div>
+        </div>
+        <div className="button-row end"><Button variant="ghost" disabled={portableArchivePending} onClick={closePortableImport}>Cancel restore</Button></div>
+      </div>}
+    </Modal>
+    <Modal open={archiveOpen} onClose={() => { if (!archiving) { setArchiveOpen(false); setArchivePreparedForReset(null); } }} eyebrow="Capacity recovery" title="Archive this workspace and start fresh?"><div className="archive-confirm"><span><Archive /></span>{archivePreparedForReset && !user ? <><p><strong>Confirm the downloaded backup before resetting.</strong></p><p>Open your downloads and make sure the .evolvra file is available. Reset removes this anonymous workspace, its undo recovery, device evidence, and reminder metadata. If this workspace changed in any tab after the download, reset is refused and a fresh backup is required.</p></> : <><p>Evolvra will first create a complete, checksummed .evolvra backup containing workspace records and evidence file bytes. If any referenced file is unavailable on this device and in its verified private cloud location, the reset is refused.</p>{user ? <p>Your connected cloud copy would restore itself after a device-only reset. To avoid pretending that data is gone, the next step opens the separate account-erasure confirmation; nothing is erased from this dialog.</p> : <p>After the backup download is requested, Evolvra will ask you to confirm that the file is available before resetting anything.</p>}</>}<div className="button-row end"><Button variant="ghost" disabled={archiving} onClick={() => { setArchiveOpen(false); setArchivePreparedForReset(null); }}>Keep this workspace</Button><Button variant={user || archivePreparedForReset ? "danger" : "primary"} disabled={archiving} onClick={() => void archiveAndReset()}>{archiving ? archivePreparedForReset ? "Resetting…" : "Preparing full backup…" : user ? "Download full backup, then review erasure" : archivePreparedForReset ? "I have the backup — reset workspace" : "Download full backup"}</Button></div></div></Modal>
+    <Modal open={dangerOpen} onClose={() => { if (!erasing) { setDangerOpen(false); setArchivePreparedForErasure(null); } }} eyebrow="Permanent action" title="Erase your Evolvra workspace?"><div className="danger-confirm"><span><Trash2 /></span>{archivePreparedForErasure && <p>Your complete portable backup download was requested. Confirm that the .evolvra file is available before continuing. If this account or workspace changed after that download, erasure is refused.</p>}<p>This removes all information in this workspace and, if connected, its cloud snapshot and account. Other account workspaces and the anonymous original stay separate on this device. Evolvra keeps an account-scoped cleanup checkpoint if cloud deletion finishes before device cleanup, so retry never depends on the deleted session.</p><div className="button-row end"><Button variant="ghost" disabled={erasing} onClick={() => { setDangerOpen(false); setArchivePreparedForErasure(null); }}>Keep my data</Button><Button variant="danger" disabled={erasing || Boolean(user && !archivePreparedForErasure)} onClick={eraseEverything}>{erasing ? "Erasing…" : "Erase everything"}</Button></div></div></Modal>
   </div>;
 }
 

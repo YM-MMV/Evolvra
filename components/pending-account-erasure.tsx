@@ -2,13 +2,18 @@
 
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { ShieldCheck } from "lucide-react";
-import { useApp } from "@/components/app-provider";
+import {
+  useAppActions,
+  useProviderStatus,
+} from "@/components/app-provider";
+import { BlockingRecoveryScreen } from "@/components/blocking-recovery-screen";
 import { Button } from "@/components/ui";
 import {
   abandonExpiredFinalizingAccountErasure,
   accountErasureCheckpointNeedsRecovery,
   actionableLocalErasureCheckpoint,
   advanceCloudAccountErasure,
+  cancelUnstartedAccountErasureIntent,
   discardCorruptAccountErasureCheckpoint,
   eraseInactiveAccountLocalData,
   finalizingErasureLeaseExpired,
@@ -29,7 +34,11 @@ import {
   readRawWorkspace,
   recoverWorkspaceEnvelope,
 } from "@/lib/persistence";
-import { eraseConnectedAccount, getSupabase } from "@/lib/supabase";
+import {
+  eraseConnectedAccount,
+  getSupabase,
+  readAccountErasureBackupBoundary,
+} from "@/lib/supabase";
 import { ANONYMOUS_ACCOUNT_ID } from "@/lib/sync-reconciliation";
 
 const INITIATOR_GRACE_MS = 2_000;
@@ -259,37 +268,36 @@ export function AccountErasureBootstrapGate({ children }: { children: ReactNode 
 
   if (ready) return children;
   return (
-    <div
-      className="loading-screen"
-      role={failure ? "alertdialog" : "status"}
-      aria-live="polite"
-    >
-      <span className="brand-mark"><ShieldCheck /></span>
-      <div style={{ width: "min(560px, calc(100vw - 40px))", textAlign: "center" }}>
-        <h1 style={{ fontSize: "clamp(24px, 5vw, 34px)" }}>
-          {failure ? "Account cleanup must be resolved first" : "Checking private recovery state…"}
-        </h1>
+    <BlockingRecoveryScreen
+      layer="bootstrap"
+      mode={failure ? "alert" : "status"}
+      title={failure
+        ? "Account cleanup must be resolved first"
+        : "Checking private recovery state…"}
+      description={(
         <p>{failure ?? "Evolvra is verifying account-deletion fences before opening any workspace."}</p>
-        {failure && !repairBlocked && (
-          <div className="button-row" style={{ justifyContent: "center", marginTop: 22 }}>
-            <Button
-              variant={needsExplicitRepair ? "danger" : "primary"}
-              disabled={working}
-              onClick={() => {
-                if (needsExplicitRepair) void repairAndRestart();
-                else setRetryEpoch((value) => value + 1);
-              }}
-            >
-              {working
-                ? "Checking…"
-                : needsExplicitRepair
-                  ? "Discard damaged record and restart fenced cleanup"
-                  : "Retry safety check"}
-            </Button>
-          </div>
-        )}
-      </div>
-    </div>
+      )}
+      icon={<ShieldCheck />}
+    >
+      {failure && !repairBlocked && (
+        <div className="button-row" style={{ justifyContent: "center", marginTop: 22 }}>
+          <Button
+            variant={needsExplicitRepair ? "danger" : "primary"}
+            disabled={working}
+            onClick={() => {
+              if (needsExplicitRepair) void repairAndRestart();
+              else setRetryEpoch((value) => value + 1);
+            }}
+          >
+            {working
+              ? "Checking…"
+              : needsExplicitRepair
+                ? "Discard damaged record and restart fenced cleanup"
+                : "Retry safety check"}
+          </Button>
+        </div>
+      )}
+    </BlockingRecoveryScreen>
   );
 }
 
@@ -299,10 +307,13 @@ export function PendingAccountErasureRecovery() {
     user,
     workspaceSwitching,
     terminalErasureAccountId,
+  } = useProviderStatus();
+  const {
     adoptActiveAccountErasure,
+    cancelActiveAccountErasure,
     finishActiveAccountErasure,
     signIn,
-  } = useApp();
+  } = useAppActions();
   const [retryEpoch, setRetryEpoch] = useState(0);
   const [cloudRetryRequested, setCloudRetryRequested] = useState(false);
   const [abandonRequested, setAbandonRequested] = useState(false);
@@ -476,12 +487,60 @@ export function PendingAccountErasureRecovery() {
             return;
           }
           if (!supabase) throw new Error("Cloud connection is unavailable for the pending account deletion.");
+          // A successful boundary read proves the server is still active and
+          // no cloud deletion began. If that active boundary is no longer the
+          // archived one (or a legacy checkpoint has none), cancellation is
+          // the only safe recovery; a matching boundary may still be retried.
+          let liveBoundary: Awaited<ReturnType<
+            typeof readAccountErasureBackupBoundary
+          >> | null = null;
+          try {
+            liveBoundary = await readAccountErasureBackupBoundary(
+              supabase,
+              checkpoint.accountId,
+            );
+          } catch (error) {
+            // A deleting lifecycle rejects the read and must remain fenced.
+            // Transport ambiguity also stays fenced; the resume-only legacy
+            // RPC below cannot start deletion for an active account.
+            if (typeof navigator !== "undefined" && navigator.onLine === false) {
+              throw error;
+            }
+          }
+          if (
+            liveBoundary
+            && (
+              !checkpoint.backup
+              || checkpoint.backup.workspaceRevision
+                !== liveBoundary.workspaceRevision
+              || checkpoint.backup.evidenceRevision
+                !== liveBoundary.evidenceRevision
+            )
+          ) {
+            // Keep cancellation outside the boundary-read catch. A failed
+            // exact local rollback must remain visibly fenced and must never
+            // fall through into a cloud retry as though cancellation worked.
+            await cancelActiveAccountErasure(
+              checkpoint.accountId,
+              checkpoint.persistenceGeneration,
+              () => cancelUnstartedAccountErasureIntent(checkpoint!),
+            );
+            setWorking(false);
+            setCloudRetryRequested(false);
+            setRetryNeedsCloud(false);
+            setExportAccountId(null);
+            setFailure("Cloud deletion never started and the archived boundary is no longer usable, so the local fence was safely cancelled. Reconcile and download a fresh complete backup before trying again.");
+            return;
+          }
           const advanced = await advanceCloudAccountErasure({
             checkpoint,
             eraseCloud: (onFinalDeletionStarting) => eraseConnectedAccount(
               supabase,
               checkpoint!.accountId,
-              { onFinalDeletionStarting },
+              {
+                backupBoundary: checkpoint!.backup,
+                onFinalDeletionStarting,
+              },
             ),
           });
           checkpoint = advanced.checkpoint;
@@ -558,7 +617,7 @@ export function PendingAccountErasureRecovery() {
       cancelled = true;
       window.clearTimeout(retryTimer);
     };
-  }, [abandonRequested, adoptActiveAccountErasure, cloudRetryRequested, finishActiveAccountErasure, ready, retryEpoch, terminalErasureAccountId, user?.id, workspaceSwitching]);
+  }, [abandonRequested, adoptActiveAccountErasure, cancelActiveAccountErasure, cloudRetryRequested, finishActiveAccountErasure, ready, retryEpoch, terminalErasureAccountId, user?.id, workspaceSwitching]);
 
   const exportFencedWorkspace = async (accountId: string) => {
     try {
@@ -607,65 +666,61 @@ export function PendingAccountErasureRecovery() {
 
   if (!working && !failure) return null;
   return (
-    <div
-      className="loading-screen"
-      role={failure ? "alertdialog" : "status"}
-      aria-live="polite"
-      style={{ position: "fixed", inset: 0, zIndex: 1000, background: "var(--bg)" }}
-    >
-      <span className="brand-mark"><ShieldCheck /></span>
-      <div style={{ width: "min(560px, calc(100vw - 40px))", textAlign: "center" }}>
-        <h1 style={{ fontSize: "clamp(24px, 5vw, 34px)" }}>
-          {failure ? "Account cleanup needs attention" : "Finishing account cleanup…"}
-        </h1>
+    <BlockingRecoveryScreen
+      layer="terminal"
+      mode={failure ? "alert" : "status"}
+      title={failure ? "Account cleanup needs attention" : "Finishing account cleanup…"}
+      description={(
         <p>{failure ?? "Evolvra is removing only the previously deleted account's remaining private data."}</p>
-        {failure && retryNeedsCloud && exportAccountId && user?.id !== exportAccountId && (
-          <form
-            className="form-stack"
-            style={{ marginTop: 18, textAlign: "left" }}
-            onSubmit={(event) => {
-              event.preventDefault();
-              void requestExactAccountSignIn();
-            }}
-          >
-            <label>
-              <span>Email for the exact fenced account</span>
-              <input
-                type="email"
-                autoComplete="email"
-                required
-                value={recoveryEmail}
-                onChange={(event) => setRecoveryEmail(event.target.value)}
-              />
-            </label>
-            <Button type="submit" variant="secondary" disabled={authPending}>
-              {authPending ? "Sending secure link…" : "Send secure sign-in link"}
-            </Button>
-            {authMessage && <p role="status">{authMessage}</p>}
-          </form>
-        )}
-        {failure && (
-          <div className="button-row" style={{ justifyContent: "center", flexWrap: "wrap", marginTop: 22 }}>
-            {exportAccountId && (
-              <Button
-                variant="secondary"
-                onClick={() => void exportFencedWorkspace(exportAccountId)}
-              >Export privacy-safe device copy</Button>
-            )}
-            <Button onClick={() => {
-              attemptedCheckpoint.current = "";
-              setFailure(null);
-              if (retryNeedsCloud) setCloudRetryRequested(true);
-              if (retryNeedsAbandon) setAbandonRequested(true);
-              setRetryEpoch((value) => value + 1);
-            }}>{retryNeedsAbandon
-                ? "Confirm uncertain outcome and continue"
-                : retryNeedsCloud
-                  ? "Retry exact account deletion"
-                  : "Retry device cleanup"}</Button>
-          </div>
-        )}
-      </div>
-    </div>
+      )}
+      icon={<ShieldCheck />}
+    >
+      {failure && retryNeedsCloud && exportAccountId && user?.id !== exportAccountId && (
+        <form
+          className="form-stack"
+          style={{ marginTop: 18, textAlign: "left" }}
+          onSubmit={(event) => {
+            event.preventDefault();
+            void requestExactAccountSignIn();
+          }}
+        >
+          <label>
+            <span>Email for the exact fenced account</span>
+            <input
+              type="email"
+              autoComplete="email"
+              required
+              value={recoveryEmail}
+              onChange={(event) => setRecoveryEmail(event.target.value)}
+            />
+          </label>
+          <Button type="submit" variant="secondary" disabled={authPending}>
+            {authPending ? "Sending secure link…" : "Send secure sign-in link"}
+          </Button>
+          {authMessage && <p role="status">{authMessage}</p>}
+        </form>
+      )}
+      {failure && (
+        <div className="button-row" style={{ justifyContent: "center", flexWrap: "wrap", marginTop: 22 }}>
+          {exportAccountId && (
+            <Button
+              variant="secondary"
+              onClick={() => void exportFencedWorkspace(exportAccountId)}
+            >Export privacy-safe device copy</Button>
+          )}
+          <Button onClick={() => {
+            attemptedCheckpoint.current = "";
+            setFailure(null);
+            if (retryNeedsCloud) setCloudRetryRequested(true);
+            if (retryNeedsAbandon) setAbandonRequested(true);
+            setRetryEpoch((value) => value + 1);
+          }}>{retryNeedsAbandon
+              ? "Confirm uncertain outcome and continue"
+              : retryNeedsCloud
+                ? "Retry exact account deletion"
+                : "Retry device cleanup"}</Button>
+        </div>
+      )}
+    </BlockingRecoveryScreen>
   );
 }

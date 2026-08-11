@@ -2,6 +2,9 @@ name: CI
 
 on:
   workflow_dispatch:
+  schedule:
+    # Weekly disposable-stack recovery/conflict/erasure rehearsal.
+    - cron: "41 4 * * 0"
   pull_request:
   push:
     branches:
@@ -50,14 +53,23 @@ jobs:
       - name: Prevent AI integration from entering this release
         run: npm run check:no-ai
 
+      - name: Keep provider consumers on narrow contexts
+        run: npm run check:contexts
+
       - name: Require current state-v3 database fixtures
         run: npm run check:sql-fixtures
+
+      - name: Validate PWA icon sizes and maskable safe zone
+        run: npm run check:pwa-icons
 
       - name: Lint
         run: npm run lint
 
       - name: Test
         run: npm test
+
+      - name: Enforce safety-critical coverage
+        run: npm run test:coverage
 
       - name: Check service-worker safety
         run: npm run check:sw
@@ -68,8 +80,8 @@ jobs:
       - name: Enforce JavaScript bundle budget
         run: npm run check:bundle
 
-      - name: Install browser for end-to-end tests
-        run: npx playwright install --with-deps chromium
+      - name: Install browsers for end-to-end tests
+        run: npx playwright install --with-deps chromium firefox webkit
 
       - name: Run browser release gate
         run: npm run test:e2e:run

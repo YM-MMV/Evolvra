@@ -25,7 +25,8 @@ Source repository: [github.com/YM-MMV/Evolvra](https://github.com/YM-MMV/Evolvra
 - Daily, weekly, and monthly reflective reviews with traceable source records
 - Permanent searchable, filterable, and paginated timeline
 - Custom terminology, themes, and visual intensity
-- JSON backup and restore, timeline CSV export, and workspace erase controls
+- complete checksummed `.evolvra` backup/restore with evidence bytes, distinct
+  records-only JSON and timeline CSV exports, and workspace erase controls
 - Last-valid-history recovery, corruption quarantine/export/restore/erase choices, crash-safe legacy migration, and explicit anonymous-to-account local/account/merge consent
 - Safe PWA caching, offline fallbacks, install/update prompts, and production icons
 - Optional in-browser daily reminders while an Evolvra tab or installed app window is open
@@ -57,17 +58,18 @@ Only the public anonymous key belongs in the browser. Never add a service-role k
 npm run typecheck
 npm run lint
 npm test
+npm run audit:dependencies
 npm run check:gamification
 npm run check:no-ai
 npm run check:sql-fixtures
 npm run check:sw
 npm run build
 npm run check:bundle
-npx playwright install chromium # first browser-test run only
+npx playwright install chromium firefox webkit # first browser-test run only
 npm run test:e2e
 ```
 
-`npm run check` runs the complete local release gate, including the production Playwright and accessibility checks after the build.
+`npm run check` runs the complete local release gate, including the production dependency audit and the production Playwright and accessibility checks after the build.
 
 GitHub Actions also boots a pinned local Supabase stack, applies the immutable migration chain from both fresh and seeded legacy starting points, asserts legacy data preservation/backfills, and runs the two-account RLS/account-erasure regression.
 
@@ -79,7 +81,7 @@ The application can be deployed through Vercel. Configure the two public Supabas
 
 - Without Supabase configuration, account-scoped state and undo recovery stay in IndexedDB on the current device.
 - With Supabase configured and a user signed in, the application can store an atomic workspace snapshot in a protected per-user row.
-- The migration also provides normalised domain tables for future integrations and server-side analytics.
+- The migration also provides reserved normalised domain tables for a future, separately designed integration or server-side analytics migration. The application does not dual-write them; `workspace_snapshots` is the only authoritative cloud workspace.
 - Postgres RLS restricts every application table and evidence object to `auth.uid()`.
 - Workspace-record export and erase controls are available from the application itself. Device-only evidence file bodies are not embedded in the JSON export.
 

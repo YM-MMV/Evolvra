@@ -3,9 +3,10 @@
 import Link from "next/link";
 import { useMemo, useState } from "react";
 import { BookOpenCheck, CalendarCheck, Check, ChevronDown, Clock3, Sparkles } from "lucide-react";
-import { useApp } from "@/components/app-provider";
+import { useAppActions, useWorkspaceData } from "@/components/app-provider";
 import { Button, EmptyState, Field, Panel } from "@/components/ui";
 import { completionAreaShares, completionGoalIds, completionStatIds, metricEntryStatIds } from "@/lib/activity-attribution";
+import { buildReviewMetricMovements } from "@/lib/review-metric-movements";
 import { timelineHref, type TimelineFilters } from "@/lib/timeline";
 import { reviewPromptLabel, reviewPromptsFor } from "@/lib/review-prompts";
 import { WORKSPACE_TEXT_LIMITS } from "@/lib/state-schema";
@@ -66,20 +67,9 @@ type ReviewSourceRecord = {
   href: string;
 };
 
-type MetricMovement = {
-  key: string;
-  goalId: string;
-  goalTitle: string;
-  label: string;
-  unit: string;
-  from: number;
-  to: number;
-  updates: number;
-  href: string;
-};
-
 export default function ReviewsPage() {
-  const { state, addReview } = useApp();
+  const { state } = useWorkspaceData();
+  const { addReview } = useAppActions();
   const [cadence, setCadence] = useState<ReviewCadence>("weekly");
   const [answers, setAnswers] = useState<Record<string, string>>({});
   const [saved, setSaved] = useState(false);
@@ -148,33 +138,12 @@ export default function ReviewsPage() {
       .filter((item) => item.minutes > 0)
       .sort((a, b) => b.minutes - a.minutes || a.area.order - b.area.order);
 
-    const movementByMetric = new Map<string, MetricMovement>();
-    [...weeklyMetrics]
-      .sort((left, right) => left.recordedAt.localeCompare(right.recordedAt))
-      .forEach((entry) => {
-        const goal = state.goals.find((item) => item.id === entry.goalId);
-        if (!goal) return;
-        const metric = goal.metrics.find((item) => item.id === entry.metricId);
-        const key = `${entry.goalId}|${entry.metricId}`;
-        const label = entry.label || metric?.label || "Measurement";
-        const existing = movementByMetric.get(key);
-        movementByMetric.set(key, {
-          key,
-          goalId: goal.id,
-          goalTitle: goal.title,
-          label,
-          unit: entry.unit ?? metric?.unit ?? "",
-          from: existing?.from ?? entry.previousValue,
-          to: entry.value,
-          updates: (existing?.updates ?? 0) + 1,
-          href: timelineHref(
-            { ...weekRange, type: "metric", goalId: goal.id, query: label },
-            `event-record-metric-${entry.id}`,
-          ),
-        });
-      });
-    const weeklyMetricMovements = [...movementByMetric.values()]
-      .sort((left, right) => Math.abs(right.to - right.from) - Math.abs(left.to - left.from) || left.goalTitle.localeCompare(right.goalTitle));
+    const weeklyMetricMovements = buildReviewMetricMovements(
+      weeklyMetrics,
+      state.metricEntries,
+      state.goals,
+      weekRange,
+    );
 
     const weeklySourceRecords: ReviewSourceRecord[] = [
       ...weeklyQuests.map((completion) => ({
@@ -419,7 +388,7 @@ export default function ReviewsPage() {
         </Panel>
         {cadence === "weekly" ? <Panel>
           <div className="section-heading compact"><div><p className="eyebrow">Measured movement</p><h2>How {terms.goals.toLowerCase()} changed this week</h2></div><CalendarCheck size={19} /></div>
-          {reviewContext.weeklyMetricMovements.length ? <div className="activity-list" role="list" aria-label={`Measured ${goalTerm.toLowerCase()} movement this week`}>{reviewContext.weeklyMetricMovements.map((movement) => <div key={movement.key} role="listitem"><span className="event-dot type-metric" /><div><Link href={movement.href}><strong>{movement.label} · {movement.goalTitle}</strong></Link><small>{movement.updates} recorded {movement.updates === 1 ? "update" : "updates"}; open the underlying timeline record</small></div><b>{formatMeasurement(movement.from, movement.unit)} → {formatMeasurement(movement.to, movement.unit)}</b></div>)}</div> : <p className="supportive-copy">No measurement values changed this week. Completed {termLabels.quests.pluralLower} and reflections remain available in the source records below.</p>}
+          {reviewContext.weeklyMetricMovements.length ? <div className="activity-list" role="list" aria-label={`Measured ${goalTerm.toLowerCase()} movement this week`}>{reviewContext.weeklyMetricMovements.map((movement) => <div key={movement.key} role="listitem"><span className="event-dot type-metric" /><div><Link href={movement.href}><strong>{movement.label} · {movement.goalTitle}</strong></Link><small>{movement.updates} recorded {movement.updates === 1 ? "update" : "updates"}{movement.startsAfterUnitChange ? "; this segment begins after the recorded unit changed" : ""}; open the underlying timeline record</small></div><b>{movement.from === undefined ? `Recorded ${formatMeasurement(movement.to, movement.unit)}` : `${formatMeasurement(movement.from, movement.unit)} → ${formatMeasurement(movement.to, movement.unit)}`}</b></div>)}</div> : <p className="supportive-copy">No measurement values changed this week. Completed {termLabels.quests.pluralLower} and reflections remain available in the source records below.</p>}
         </Panel> : null}
         {cadence === "weekly" && reviewContext.weeklyTimeByArea.length ? <Panel>
           <div className="section-heading compact"><div><p className="eyebrow">Time context</p><h2>Time recorded by {areaTerm.toLowerCase()}</h2></div><Clock3 size={19} /></div>
@@ -444,7 +413,30 @@ export default function ReviewsPage() {
           {reviewContext.monthlyLifecycle.length ? <div className="activity-list" role="list" aria-label={`${goalTerm} and ${milestoneTerm.toLowerCase()} lifecycle changes this month`}>{reviewContext.monthlyLifecycle.map((record) => <div key={record.id} role="listitem"><span className="event-dot type-goal" /><div><Link href={record.href}><strong>{record.title}</strong></Link><small>{record.detail} · open the underlying record</small></div><b>{formatDate(record.at)}</b></div>)}</div> : <p className="supportive-copy">No {terms.goals.toLowerCase()} started or completed and no {terms.milestones.toLowerCase()} were reached this month.</p>}
         </Panel></> : null}
         <div className="section-heading compact"><div><p className="eyebrow">Permanent record</p><h2>Review history</h2></div><CalendarCheck size={19} /></div>
-        {sortedReviews.length ? <>{sortedReviews.slice(0, visibleReviews).map((review) => <details key={review.id} className="review-history-card panel"><summary><span className={`review-cadence ${review.cadence}`}>{review.cadence.slice(0, 1).toUpperCase()}</span><div><strong>{review.cadence[0].toUpperCase() + review.cadence.slice(1)} review</strong><small><Clock3 size={12} /> {formatDate(review.createdAt)}</small></div><ChevronDown size={16} /></summary><div>{Object.entries(review.answers).filter(([, answer]) => answer).map(([key, answer]) => <section key={key}><small>{reviewPromptLabel(prompts, review.cadence, key)}</small><p>{answer}</p></section>)}</div></details>)}{visibleReviews < sortedReviews.length ? <button className="button button-secondary history-load-more" onClick={() => setVisibleReviews((count) => count + 12)}>Load older reviews ({sortedReviews.length - visibleReviews} remaining)</button> : null}</> : <EmptyState icon={<BookOpenCheck />} title="Your first reflection awaits" body="A review creates context around the numbers and preserves what you learned." />}
+        {sortedReviews.length ? <>
+          {sortedReviews.slice(0, visibleReviews).map((review) => <details key={review.id} className="review-history-card panel">
+            <summary><span className={`review-cadence ${review.cadence}`}>{review.cadence.slice(0, 1).toUpperCase()}</span><div><strong>{review.cadence[0].toUpperCase() + review.cadence.slice(1)} review</strong><small><Clock3 size={12} /> {formatDate(review.createdAt)}</small></div><ChevronDown size={16} /></summary>
+            <div>
+              {Object.entries(review.answers).filter(([, answer]) => answer).map(([key, answer]) => <section key={key}><small>{reviewPromptLabel(prompts, review.cadence, key)}</small><p>{answer}</p></section>)}
+              {review.context ? <section className="review-saved-context" aria-label="Context saved with this review">
+                <div className="review-saved-context-head"><div><small>Context at save time</small><strong>{formatDate(review.context.periodStartedAt)} – {formatDate(review.context.periodEndedAt)}</strong></div><span>{review.context.sourceCount} source {review.context.sourceCount === 1 ? "record" : "records"}</span></div>
+                <div className="review-saved-totals">{[
+                  ["Active days", review.context.activeDays],
+                  [termLabels.quests.plural, review.context.questsCompleted],
+                  ["Measurements", review.context.metricsUpdated],
+                  [terms.milestones, review.context.milestonesReached],
+                  ["Check-ins", review.context.checkInsRecorded],
+                  [terms.goals, review.context.goalsWithActivity],
+                ].map(([label, value]) => <span key={label}><b>{value}</b>{label}</span>)}</div>
+                {review.context.sources.length ? <div className="review-saved-sources" role="list" aria-label="Source records saved with this review">
+                  {review.context.sources.map((item) => <div key={`${item.type}-${item.sourceId}`} role="listitem"><span>{item.type}</span><div><strong>{item.title}</strong><small>{item.detail} · {formatDate(item.occurredAt)}</small></div></div>)}
+                </div> : <p className="supportive-copy">No source activity fell inside this saved review window.</p>}
+                {review.context.sourceCount > review.context.sources.length ? <small className="review-source-omission">{review.context.sourceCount - review.context.sources.length} older source records are represented in the totals but omitted from this bounded snapshot.</small> : null}
+              </section> : <section className="review-saved-context legacy"><small>Saved context is unavailable for this earlier review.</small></section>}
+            </div>
+          </details>)}
+          {visibleReviews < sortedReviews.length ? <button className="button button-secondary history-load-more" onClick={() => setVisibleReviews((count) => count + 12)}>Load older reviews ({sortedReviews.length - visibleReviews} remaining)</button> : null}
+        </> : <EmptyState icon={<BookOpenCheck />} title="Your first reflection awaits" body="A review creates context around the numbers and preserves what you learned." />}
       </aside>
     </div>
   </div>;

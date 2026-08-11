@@ -1,4 +1,5 @@
-import { expect, test } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
+import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import { completeOnboarding, readAnonymousWorkspaceState } from "./helpers";
 import {
   cloudAdmin,
@@ -11,6 +12,130 @@ import {
   signInCloudTestAccount,
   waitForCloudProfile,
 } from "./cloud-helpers";
+
+async function readLocalAccountErasureFence(page: Page, accountId: string) {
+  return page.evaluate(async (targetAccountId) => {
+    return await new Promise<{
+      checkpoint: unknown;
+      scope: unknown;
+    }>((resolve, reject) => {
+      const open = indexedDB.open("evolvra-persistence");
+      open.onerror = () => reject(open.error ?? new Error("IndexedDB could not be opened."));
+      open.onsuccess = () => {
+        const database = open.result;
+        const transaction = database.transaction(
+          ["account-scopes", "account-erasure-checkpoints"],
+          "readonly",
+        );
+        const scopeRequest = transaction.objectStore("account-scopes").get(targetAccountId);
+        const checkpointRequest = transaction
+          .objectStore("account-erasure-checkpoints")
+          .get(targetAccountId);
+        transaction.onerror = () => reject(
+          transaction.error ?? new Error("Local account-erasure state could not be read."),
+        );
+        transaction.onabort = () => reject(
+          transaction.error ?? new Error("Local account-erasure state read was aborted."),
+        );
+        transaction.oncomplete = () => {
+          database.close();
+          resolve({
+            checkpoint: checkpointRequest.result ?? null,
+            scope: scopeRequest.result ?? null,
+          });
+        };
+      };
+    });
+  }, accountId);
+}
+
+async function accountCloudClient(page: Page, accountId: string) {
+  const session = await page.evaluate((targetAccountId) => {
+    for (let index = 0; index < localStorage.length; index += 1) {
+      const key = localStorage.key(index);
+      if (!key?.startsWith("sb-") || !key.endsWith("-auth-token")) continue;
+      const rawValue = localStorage.getItem(key);
+      if (!rawValue) continue;
+      try {
+        const candidate = JSON.parse(rawValue) as {
+          access_token?: unknown;
+          refresh_token?: unknown;
+          user?: { id?: unknown };
+        };
+        if (
+          candidate.user?.id === targetAccountId
+          && typeof candidate.access_token === "string"
+          && typeof candidate.refresh_token === "string"
+        ) {
+          return {
+            accessToken: candidate.access_token,
+            refreshToken: candidate.refresh_token,
+          };
+        }
+      } catch {
+        // Ignore unrelated localStorage values and keep looking for the session.
+      }
+    }
+    return null;
+  }, accountId);
+  if (!session) throw new Error("The exact browser account session was not available.");
+
+  const apiUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
+  const anonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+  if (!apiUrl || !anonKey) throw new Error("Cloud E2E credentials are unavailable.");
+  const client = createClient(apiUrl, anonKey, {
+    auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false },
+  });
+  const { error } = await client.auth.setSession({
+    access_token: session.accessToken,
+    refresh_token: session.refreshToken,
+  });
+  if (error) throw error;
+  return client;
+}
+
+async function accountErasureBoundary(client: SupabaseClient, accountId: string) {
+  const { data, error } = await client.rpc("read_account_erasure_backup_boundary", {
+    p_expected_account_id: accountId,
+  });
+  if (error) throw error;
+  const row = Array.isArray(data) ? data[0] : data;
+  if (
+    !row
+    || typeof row.workspace_revision !== "number"
+    || typeof row.evidence_revision !== "number"
+  ) {
+    throw new Error("The cloud returned an invalid account-erasure boundary.");
+  }
+  return {
+    workspaceRevision: row.workspace_revision,
+    evidenceRevision: row.evidence_revision,
+  };
+}
+
+async function claimEvidenceCleanup(
+  client: SupabaseClient,
+  accountId: string,
+  remotePaths: string[],
+) {
+  const { data, error } = await client.rpc("claim_evidence_cleanup", {
+    p_expected_account_id: accountId,
+    p_remote_paths: remotePaths,
+  });
+  if (error) throw error;
+  const row = Array.isArray(data) ? data[0] : data;
+  if (
+    !row
+    || typeof row.claimed !== "boolean"
+    || typeof row.workspace_revision !== "number"
+  ) {
+    throw new Error("The cloud returned an invalid evidence-cleanup claim.");
+  }
+  return {
+    claimed: row.claimed,
+    workspaceRevision: row.workspace_revision,
+  };
+}
 
 test.describe("local Supabase browser integration", () => {
   test.setTimeout(90_000);
@@ -231,6 +356,153 @@ test.describe("local Supabase browser integration", () => {
     }
   });
 
+  test("a same-path Storage overwrite advances only the evidence backup boundary", async ({ page }, testInfo) => {
+    const baseURL = requireCloudBaseURL(testInfo.project.use.baseURL);
+    const account = await createCloudTestAccount("evidence-overwrite-boundary");
+    accountIds.add(account.id);
+    await signInCloudTestAccount(page, account, baseURL);
+
+    const client = await accountCloudClient(page, account.id);
+    const bucket = client.storage.from("evidence");
+    const path = `${account.id}/overwrite-goal/overwrite-${globalThis.crypto.randomUUID()}/proof.txt`;
+    const original = Buffer.alloc(64, "A");
+    const replacement = Buffer.alloc(64, "B");
+    try {
+      const before = await accountErasureBoundary(client, account.id);
+      const { error: uploadError } = await bucket.upload(path, original, {
+        contentType: "text/plain",
+        upsert: false,
+      });
+      if (uploadError) throw uploadError;
+
+      const afterUpload = await accountErasureBoundary(client, account.id);
+      expect(afterUpload.workspaceRevision).toBe(before.workspaceRevision);
+      expect(afterUpload.evidenceRevision).toBeGreaterThan(before.evidenceRevision);
+
+      const { error: overwriteError } = await bucket.upload(path, replacement, {
+        contentType: "text/plain",
+        upsert: true,
+      });
+      if (overwriteError) throw overwriteError;
+
+      const afterOverwrite = await accountErasureBoundary(client, account.id);
+      expect(afterOverwrite.workspaceRevision).toBe(before.workspaceRevision);
+      expect(afterOverwrite.evidenceRevision).toBeGreaterThan(afterUpload.evidenceRevision);
+
+      const { data: downloaded, error: downloadError } = await bucket.download(path);
+      if (downloadError || !downloaded) throw downloadError ?? new Error("Overwritten evidence could not be downloaded.");
+      expect(Buffer.from(await downloaded.arrayBuffer())).toEqual(replacement);
+    } finally {
+      const { error } = await bucket.remove([path]);
+      if (error) {
+        const { error: adminError } = await cloudAdmin().storage.from("evidence").remove([path]);
+        if (adminError) throw adminError;
+      }
+    }
+  });
+
+  test("cleanup claims prevent evidence resurrection and authorize only the claimed delete", async ({ page }, testInfo) => {
+    const baseURL = requireCloudBaseURL(testInfo.project.use.baseURL);
+    const account = await createCloudTestAccount("evidence-cleanup-claim");
+    accountIds.add(account.id);
+    await signInCloudTestAccount(page, account, baseURL);
+
+    const client = await accountCloudClient(page, account.id);
+    const bucket = client.storage.from("evidence");
+    const goalId = globalThis.crypto.randomUUID();
+    const evidenceId = globalThis.crypto.randomUUID();
+    const path = `${account.id}/${goalId}/${evidenceId}/proof.txt`;
+    const referencedState = {
+      version: 3,
+      goals: [{
+        evidence: [{ id: evidenceId, type: "file", remotePath: path }],
+      }],
+    };
+    const unreferencedState = { version: 3, goals: [] };
+
+    try {
+      const before = await accountErasureBoundary(client, account.id);
+      const { error: uploadError } = await bucket.upload(
+        path,
+        Buffer.from("Claim these private evidence bytes"),
+        { contentType: "text/plain", upsert: false },
+      );
+      if (uploadError) throw uploadError;
+
+      const { data: referencedSave, error: referencedSaveError } = await client.rpc(
+        "save_workspace_snapshot",
+        {
+          p_expected_account_id: account.id,
+          p_state: referencedState,
+          p_expected_revision: before.workspaceRevision,
+        },
+      );
+      if (referencedSaveError) throw referencedSaveError;
+      const referencedRow = Array.isArray(referencedSave) ? referencedSave[0] : referencedSave;
+      expect(referencedRow?.revision).toBe(before.workspaceRevision + 1);
+
+      const referencedClaim = await claimEvidenceCleanup(client, account.id, [path]);
+      expect(referencedClaim).toEqual({
+        claimed: false,
+        workspaceRevision: before.workspaceRevision + 1,
+      });
+
+      const { data: unreferencedSave, error: unreferencedSaveError } = await client.rpc(
+        "save_workspace_snapshot",
+        {
+          p_expected_account_id: account.id,
+          p_state: unreferencedState,
+          p_expected_revision: before.workspaceRevision + 1,
+        },
+      );
+      if (unreferencedSaveError) throw unreferencedSaveError;
+      const unreferencedRow = Array.isArray(unreferencedSave) ? unreferencedSave[0] : unreferencedSave;
+      expect(unreferencedRow?.revision).toBe(before.workspaceRevision + 2);
+
+      const wrongOwnerPath = `00000000-0000-0000-0000-000000000001/${goalId}/${evidenceId}/proof.txt`;
+      const { error: wrongOwnerError } = await client.rpc("claim_evidence_cleanup", {
+        p_expected_account_id: account.id,
+        p_remote_paths: [wrongOwnerPath],
+      });
+      expect(wrongOwnerError?.code).toBe("22023");
+
+      const claim = await claimEvidenceCleanup(client, account.id, [path]);
+      expect(claim).toEqual({
+        claimed: true,
+        workspaceRevision: before.workspaceRevision + 2,
+      });
+      await expect(claimEvidenceCleanup(client, account.id, [path])).resolves.toEqual(claim);
+
+      const { error: resurrectionError } = await client.rpc("save_workspace_snapshot", {
+        p_expected_account_id: account.id,
+        p_state: referencedState,
+        p_expected_revision: before.workspaceRevision + 2,
+      });
+      expect(resurrectionError?.code).toBe("PT409");
+
+      const { error: overwriteError } = await bucket.upload(
+        path,
+        Buffer.from("A claimed path cannot be overwritten"),
+        { contentType: "text/plain", upsert: true },
+      );
+      expect(overwriteError).toBeTruthy();
+
+      const { error: removeError } = await bucket.remove([path]);
+      if (removeError) throw removeError;
+      await expect.poll(() => listCloudEvidencePaths(account.id)).toEqual([]);
+
+      const { error: resurrectionUploadError } = await bucket.upload(
+        path,
+        Buffer.from("A claimed path cannot be uploaded again"),
+        { contentType: "text/plain", upsert: false },
+      );
+      expect(resurrectionUploadError).toBeTruthy();
+    } finally {
+      const { error } = await cloudAdmin().storage.from("evidence").remove([path]);
+      if (error) throw error;
+    }
+  });
+
   test("private evidence survives a second device, supports lifecycle operations, and is erased with the account", async ({ browser, page }, testInfo) => {
     const baseURL = requireCloudBaseURL(testInfo.project.use.baseURL);
     const account = await createCloudTestAccount("evidence");
@@ -248,6 +520,7 @@ test.describe("local Supabase browser integration", () => {
     });
     await expect(page.getByText("proof.txt")).toBeVisible();
     await expect.poll(() => listCloudEvidencePaths(account.id), { timeout: 20_000 }).toHaveLength(1);
+    const originalRemotePaths = await listCloudEvidencePaths(account.id);
 
     const secondContext = await browser.newContext({ serviceWorkers: "allow" });
     const secondPage = await secondContext.newPage();
@@ -264,9 +537,14 @@ test.describe("local Supabase browser integration", () => {
       secondPage.once("dialog", (dialog) => void dialog.accept("renamed-proof.txt"));
       await secondPage.getByRole("button", { name: "Rename proof.txt" }).click();
       await expect(secondPage.getByText("renamed-proof.txt")).toBeVisible();
-      await expect.poll(() => listCloudEvidencePaths(account.id)).toEqual([
-        expect.stringMatching(/\/renamed-proof\.txt$/),
-      ]);
+      await expect(secondPage.getByRole("button", {
+        name: "Rename renamed-proof.txt",
+      })).toBeEnabled();
+      // Remote paths are immutable object identities. A user-facing rename
+      // changes only workspace metadata and must not copy or move cloud bytes.
+      await expect.poll(() => listCloudEvidencePaths(account.id)).toEqual(
+        originalRemotePaths,
+      );
 
       await secondPage.getByRole("button", { name: "Remove renamed-proof.txt" }).click();
       await expect(secondPage.getByText("renamed-proof.txt")).toBeHidden();
@@ -280,8 +558,23 @@ test.describe("local Supabase browser integration", () => {
       await expect.poll(() => listCloudEvidencePaths(account.id)).toHaveLength(1);
       await secondPage.goto("/settings");
       await secondPage.getByRole("button", { name: "Data & recovery" }).click();
+      await expect(secondPage.getByText("Private sync up to date", { exact: true })).toBeVisible();
       await secondPage.getByRole("button", { name: "Erase everything" }).click();
+      const archive = secondPage.getByRole("dialog", {
+        name: "Archive this workspace and start fresh?",
+      });
+      await expect(archive).toBeVisible();
+      const [backup] = await Promise.all([
+        secondPage.waitForEvent("download"),
+        archive.getByRole("button", {
+          name: "Download full backup, then review erasure",
+        }).click(),
+      ]);
+      expect(backup.suggestedFilename()).toMatch(
+        /^evolvra-full-backup-\d{4}-\d{2}-\d{2}\.evolvra$/,
+      );
       const confirmation = secondPage.getByRole("dialog", { name: "Erase your Evolvra workspace?" });
+      await expect(confirmation).toContainText("complete portable backup download was requested");
       await confirmation.getByRole("button", { name: "Erase everything" }).click();
       await expect(secondPage.getByRole("heading", { name: "Build a life you can see evolving." })).toBeVisible();
 
@@ -291,6 +584,115 @@ test.describe("local Supabase browser integration", () => {
       }, { timeout: 20_000 }).toBe(true);
       await expect.poll(() => listCloudEvidencePaths(account.id)).toEqual([]);
       accountIds.delete(account.id);
+    } finally {
+      await secondContext.close();
+    }
+  });
+
+  test("a cross-device change after backup keeps the account, cloud state, evidence, and local scope active", async ({ browser, page }, testInfo) => {
+    const baseURL = requireCloudBaseURL(testInfo.project.use.baseURL);
+    const account = await createCloudTestAccount("stale-erasure-backup");
+    accountIds.add(account.id);
+    await signInCloudTestAccount(page, account, baseURL);
+    await completeOnboarding(page, {
+      name: "Stale Backup Owner",
+      starter: true,
+      accountId: account.id,
+    });
+    await waitForCloudProfile(account.id, "Stale Backup Owner");
+
+    await page.goto("/goals");
+    await page.getByRole("link", {
+      name: "Open goal: Build dependable cardiovascular fitness",
+    }).click();
+    await page.locator('input[type="file"][accept*="text/plain"]').setInputFiles({
+      name: "before-backup.txt",
+      mimeType: "text/plain",
+      buffer: Buffer.from("This evidence is present in the complete backup"),
+    });
+    await expect(page.getByText("before-backup.txt")).toBeVisible();
+    await expect.poll(() => listCloudEvidencePaths(account.id), { timeout: 20_000 }).toHaveLength(1);
+
+    const secondContext = await browser.newContext({ serviceWorkers: "allow" });
+    const secondPage = await secondContext.newPage();
+    try {
+      await signInCloudTestAccount(secondPage, account, baseURL);
+      await secondPage.goto("/goals");
+      await secondPage.getByRole("link", {
+        name: "Open goal: Build dependable cardiovascular fitness",
+      }).click();
+      await expect(secondPage.getByText("before-backup.txt")).toBeVisible({ timeout: 20_000 });
+
+      await page.goto("/settings");
+      await page.getByRole("button", { name: "Data & recovery" }).click();
+      await expect(page.getByText("Private sync up to date", { exact: true })).toBeVisible();
+      await page.getByRole("button", { name: "Erase everything" }).click();
+      const archive = page.getByRole("dialog", {
+        name: "Archive this workspace and start fresh?",
+      });
+      const [backup] = await Promise.all([
+        page.waitForEvent("download"),
+        archive.getByRole("button", {
+          name: "Download full backup, then review erasure",
+        }).click(),
+      ]);
+      expect(backup.suggestedFilename()).toMatch(
+        /^evolvra-full-backup-\d{4}-\d{2}-\d{2}\.evolvra$/,
+      );
+      const confirmation = page.getByRole("dialog", {
+        name: "Erase your Evolvra workspace?",
+      });
+      await expect(confirmation).toBeVisible();
+
+      await secondPage.locator('input[type="file"][accept*="text/plain"]').setInputFiles({
+        name: "after-backup.txt",
+        mimeType: "text/plain",
+        buffer: Buffer.from("This newer evidence must survive a stale erasure request"),
+      });
+      await expect(secondPage.getByText("after-backup.txt")).toBeVisible();
+      await expect.poll(() => listCloudEvidencePaths(account.id), { timeout: 20_000 }).toEqual(
+        expect.arrayContaining([expect.stringMatching(/-after-backup\.txt$/)]),
+      );
+      await expect.poll(async () => {
+        const cloud = await cloudWorkspaceState(account.id);
+        const goals = cloud.state.goals as Array<{
+          evidence?: Array<{ name?: string }>;
+        }>;
+        return goals.some((goal) => goal.evidence?.some(
+          (item) => item.name === "after-backup.txt",
+        ));
+      }, { timeout: 20_000 }).toBe(true);
+
+      await confirmation.getByRole("button", { name: "Erase everything" }).click();
+      await expect(page.getByText(/fresh (complete |full )?backup/i)).toBeVisible({ timeout: 20_000 });
+
+      await expect.poll(async () => {
+        const { data, error } = await cloudAdmin().auth.admin.getUserById(account.id);
+        return error ? null : data.user?.id;
+      }, { timeout: 20_000 }).toBe(account.id);
+      await expect.poll(async () => {
+        const { data, error } = await cloudAdmin()
+          .from("account_lifecycle")
+          .select("status")
+          .eq("user_id", account.id)
+          .single();
+        if (error) return `error:${error.message}`;
+        return data.status;
+      }, { timeout: 20_000 }).toBe("active");
+      await expect.poll(() => listCloudEvidencePaths(account.id)).toEqual(
+        expect.arrayContaining([expect.stringMatching(/-after-backup\.txt$/)]),
+      );
+      await expect.poll(async () => {
+        const cloud = await cloudWorkspaceState(account.id);
+        return JSON.stringify(cloud.state).includes("after-backup.txt");
+      }).toBe(true);
+
+      const localFence = await readLocalAccountErasureFence(page, account.id);
+      expect(localFence.checkpoint).toBeNull();
+      expect(localFence.scope).toEqual(expect.objectContaining({
+        accountId: account.id,
+        tombstoned: false,
+      }));
     } finally {
       await secondContext.close();
     }

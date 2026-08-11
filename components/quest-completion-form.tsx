@@ -2,7 +2,7 @@
 
 import { useMemo, useState } from "react";
 import { CheckCircle2 } from "lucide-react";
-import { useApp } from "@/components/app-provider";
+import { useAppActions, useWorkspaceData } from "@/components/app-provider";
 import { Button, Field, Modal } from "@/components/ui";
 import { WORKSPACE_TEXT_LIMITS } from "@/lib/state-schema";
 import { terminologyForms } from "@/lib/terminology";
@@ -20,7 +20,8 @@ export function QuestCompletionForm({
   open: boolean;
   onClose: () => void;
 }) {
-  const { state, completeQuest } = useApp();
+  const { state } = useWorkspaceData();
+  const { completeQuest } = useAppActions();
   const goal = state.goals.find((item) => item.id === goalId);
   const terms = terminologyForms(state.settings.terminology);
   const [duration, setDuration] = useState(quest.durationMinutes === undefined ? "" : String(quest.durationMinutes));

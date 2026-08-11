@@ -57,7 +57,8 @@ begin
       ('quest_completions', 'metric_deltas'),
       ('quest_completions', 'linked_goal_ids'),
       ('user_settings', 'interface_intensity'),
-      ('workspace_snapshots', 'revision')
+      ('workspace_snapshots', 'revision'),
+      ('account_lifecycle', 'evidence_revision')
   ) as expected(table_name, column_name)
   where not exists (
     select 1
@@ -72,8 +73,9 @@ begin
   end if;
 
   if to_regclass('public.goal_check_ins') is null
-     or to_regclass('public.account_lifecycle') is null then
-    raise exception 'current history or lifecycle tables are missing';
+     or to_regclass('public.account_lifecycle') is null
+     or to_regclass('private.evidence_cleanup_claims') is null then
+    raise exception 'current history, lifecycle, or evidence cleanup claim tables are missing';
   end if;
 
   if not exists (
@@ -249,8 +251,9 @@ begin
     where user_id = '90000000-0000-0000-0000-000000000001'
       and status = 'active'
       and deletion_started_at is null
+      and evidence_revision = 0
   ) then
-    raise exception 'existing account did not receive an active lifecycle row';
+    raise exception 'existing account did not receive an active lifecycle row and evidence boundary';
   end if;
 
   if not exists (
@@ -274,8 +277,73 @@ begin
   ) then
     raise exception 'workspace updated-at trigger is missing';
   end if;
+
+  if not exists (
+    select 1
+    from pg_trigger
+    where tgrelid = 'storage.objects'::regclass
+      and tgname = 'bump_evolvra_evidence_revision'
+      and not tgisinternal
+  ) then
+    raise exception 'evidence revision trigger is missing after the upgrade';
+  end if;
+
+  if to_regprocedure('public.read_account_erasure_backup_boundary(uuid)') is null
+     or to_regprocedure('public.begin_account_deletion(uuid,bigint,bigint)') is null
+     or to_regprocedure('public.begin_account_deletion(uuid)') is null
+     or to_regprocedure('public.claim_evidence_cleanup(uuid,text[])') is null
+     or to_regprocedure('public.save_workspace_snapshot(uuid,jsonb,bigint)') is null
+     or to_regprocedure('public.save_workspace_snapshot(jsonb,bigint)') is null
+     or to_regprocedure('private.evidence_path_writes_allowed(text,text)') is null
+     or to_regprocedure('private.evidence_deletes_allowed(text,text)') is null
+     or to_regprocedure('private.workspace_state_references_evidence_path(jsonb,text)') is null then
+    raise exception 'account-bound snapshot, cleanup claim, erasure boundary, or policy helper is missing after the upgrade';
+  end if;
+
+  if to_regprocedure('private.evidence_writes_allowed()') is not null
+     or to_regprocedure('private.evidence_deletes_allowed()') is not null then
+    raise exception 'retired zero-argument evidence policy helpers survived the upgrade';
+  end if;
+
+  if has_table_privilege('anon', 'private.evidence_cleanup_claims', 'select')
+     or has_table_privilege('authenticated', 'private.evidence_cleanup_claims', 'select')
+     or has_table_privilege('authenticated', 'private.evidence_cleanup_claims', 'insert')
+     or has_table_privilege('authenticated', 'private.evidence_cleanup_claims', 'update')
+     or has_table_privilege('authenticated', 'private.evidence_cleanup_claims', 'delete') then
+    raise exception 'upgraded evidence cleanup claims are not RPC-only for clients';
+  end if;
+
+  if not has_table_privilege('service_role', 'private.evidence_cleanup_claims', 'select')
+     or has_table_privilege('service_role', 'private.evidence_cleanup_claims', 'insert')
+     or has_table_privilege('service_role', 'private.evidence_cleanup_claims', 'update')
+     or has_table_privilege('service_role', 'private.evidence_cleanup_claims', 'delete')
+     or has_table_privilege('service_role', 'private.evidence_cleanup_claims', 'truncate')
+     or has_table_privilege('service_role', 'private.evidence_cleanup_claims', 'references')
+     or has_table_privilege('service_role', 'private.evidence_cleanup_claims', 'trigger') then
+    raise exception 'upgraded service-role evidence cleanup claim privileges are not SELECT only';
+  end if;
+
+  if has_function_privilege('anon', 'public.claim_evidence_cleanup(uuid,text[])', 'execute')
+     or not has_function_privilege('authenticated', 'public.claim_evidence_cleanup(uuid,text[])', 'execute')
+     or has_function_privilege('authenticated', 'private.workspace_state_references_evidence_path(jsonb,text)', 'execute') then
+    raise exception 'upgraded cleanup claim function privileges did not converge';
+  end if;
+
+  if exists (
+    select 1
+    from private.evidence_cleanup_claims
+    where user_id = '90000000-0000-0000-0000-000000000001'
+  ) then
+    raise exception 'the legacy fixture unexpectedly received an evidence cleanup claim';
+  end if;
 end;
 $$;
+
+insert into private.evidence_cleanup_claims (user_id, remote_path)
+values (
+  '90000000-0000-0000-0000-000000000001',
+  '90000000-0000-0000-0000-000000000001/legacy-goal/legacy-evidence/proof.txt'
+);
 
 delete from auth.users
 where id = '90000000-0000-0000-0000-000000000001';
@@ -293,6 +361,10 @@ begin
   ) or exists (
     select 1
     from public.account_lifecycle
+    where user_id = '90000000-0000-0000-0000-000000000001'
+  ) or exists (
+    select 1
+    from private.evidence_cleanup_claims
     where user_id = '90000000-0000-0000-0000-000000000001'
   ) then
     raise exception 'legacy fixture cleanup did not cascade';

@@ -1,4 +1,4 @@
-const WORKER_VERSION = "2026-07-28.1";
+const WORKER_VERSION = "2026-08-02.3";
 const CACHE_PREFIX = "evolvra-";
 const PRECACHE_NAME = `${CACHE_PREFIX}precache-${WORKER_VERSION}`;
 const NAVIGATION_CACHE_NAME = `${CACHE_PREFIX}navigation-${WORKER_VERSION}`;
@@ -30,6 +30,7 @@ const OFFLINE_FALLBACK_URL = "/__evolvra_offline__";
 const INTERNAL_WORKER_PATH = "/__evolvra_worker__";
 const CLIENT_MANIFEST_PATH_PREFIX = `${INTERNAL_WORKER_PATH}/client/`;
 const ROUTE_UNION_PATH = `${INTERNAL_WORKER_PATH}/route-union`;
+const UPDATE_CUTOVER_PATH = `${INTERNAL_WORKER_PATH}/update-cutover`;
 
 const SHELL_ROUTES = ["/", "/goals", "/quests", "/stats", "/reviews", "/timeline", "/settings"];
 const PUBLIC_ASSETS = [
@@ -697,6 +698,43 @@ async function notifyWindowClients(message) {
   windowClients.forEach((client) => client.postMessage(message));
 }
 
+async function refreshWindowClientsAfterUpdate() {
+  const windowClients = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
+  await Promise.all(windowClients.map(async (client) => {
+    if (typeof client.navigate !== "function") return;
+    let clientUrl;
+    try {
+      clientUrl = new URL(client.url);
+    } catch {
+      return;
+    }
+    if (clientUrl.origin !== self.location.origin) return;
+    try {
+      await client.navigate(clientUrl.href);
+    } catch {
+      // A closing or browser-owned window may refuse navigation. Other tabs
+      // still move to the compatible bundle, and this client will load the
+      // current version on its next real navigation.
+    }
+  }));
+}
+
+async function markUpdateCutoverRequested() {
+  const cache = await caches.open(WORKSPACE_MANIFEST_CACHE_NAME);
+  await cache.put(internalWorkerRequest(UPDATE_CUTOVER_PATH), new Response("1", {
+    status: 200,
+    headers: { "cache-control": "no-store", "content-type": "text/plain" },
+  }));
+}
+
+async function consumeUpdateCutoverRequest() {
+  const cache = await caches.open(WORKSPACE_MANIFEST_CACHE_NAME);
+  const request = internalWorkerRequest(UPDATE_CUTOVER_PATH);
+  const requested = Boolean(await cache.match(request));
+  if (requested) await cache.delete(request);
+  return requested;
+}
+
 let workspaceRouteUpdateQueue = Promise.resolve();
 
 function queueWorkspaceGoalRouteSync(source, paths) {
@@ -717,13 +755,24 @@ self.addEventListener("activate", (event) => {
       .filter((name) => name.startsWith(CACHE_PREFIX) && !CURRENT_CACHES.has(name))
       .map((name) => caches.delete(name)));
     await self.clients.claim();
+    if (await consumeUpdateCutoverRequest()) {
+      await refreshWindowClientsAfterUpdate();
+    }
     await notifyWindowClients({ type: "EVOLVRA_OFFLINE_READY", version: WORKER_VERSION });
   })());
 });
 
 self.addEventListener("message", (event) => {
   if (event.data?.type === "SKIP_WAITING") {
-    event.waitUntil(self.skipWaiting());
+    // A user-approved update is an origin-wide compatibility cutover. The
+    // currently deployed client only reloads the tab that clicked Update now,
+    // so the activating worker must navigate every open window itself before
+    // old IndexedDB/schema clients can keep running beside the new bundle. The
+    // marker survives a worker process restart between message and activation.
+    event.waitUntil((async () => {
+      await markUpdateCutoverRequested();
+      await self.skipWaiting();
+    })());
     return;
   }
   if (event.data?.type !== "SYNC_WORKSPACE_GOAL_ROUTES") return;

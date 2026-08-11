@@ -1,0 +1,34 @@
+name: Production synthetics
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 */6 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-synthetics
+  cancel-in-progress: true
+
+jobs:
+  read-only-production-smoke:
+    name: Read-only production smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      EVOLVRA_PRODUCTION_URL: https://evolvra-seven.vercel.app
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version-file: .nvmrc
+
+      - name: Check routes, headers, PWA assets, and privacy boundaries
+        run: npm run check:production

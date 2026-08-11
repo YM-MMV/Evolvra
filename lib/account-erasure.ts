@@ -1,5 +1,6 @@
 import {
   beginAccountErasurePersistenceFence,
+  cancelUnstartedAccountErasurePersistenceFence,
   disableLegacyWorkspaceImport,
   deleteRawAccountErasureCheckpoint,
   eraseAccountPersistenceWithTombstone,
@@ -8,50 +9,55 @@ import {
   listRawAccountErasureCheckpoints,
   mutateRawAccountErasureCheckpoint,
   readRawAccountErasureCheckpoint,
-  workspaceKey,
   LEGACY_WORKSPACE_STORAGE_KEY,
   type AccountPersistenceScope,
   type LegacyWorkspaceImportJournal,
   type PersistenceScopeGeneration,
 } from "@/lib/persistence";
+import {
+  ACCOUNT_ERASURE_CHECKPOINT_VERSION,
+  ACCOUNT_ERASURE_FUTURE_TOLERANCE_MS,
+  ACCOUNT_ERASURE_OWNER_LEASE_MS,
+  accountErasureCheckpointNeedsRecovery,
+  actionableLocalErasureCheckpoint,
+  finalizingErasureLeaseExpired,
+  parseAccountErasureCheckpoint,
+  parseLegacyAccountErasureCheckpoints,
+  updateAccountErasureCheckpoint as nextCheckpoint,
+  validateAccountErasureAccountId as validatedAccountId,
+  validateAccountErasureIdentifier as validatedIdentifier,
+  type AccountErasureCheckpoint,
+  type AccountErasureCloudBackupBoundary,
+  type CloudErasureStatus,
+} from "@/lib/account-erasure-checkpoint";
 import { LEGACY_LAST_REMINDER_KEY, reminderStorageKey } from "@/lib/reminders";
 import { ANONYMOUS_ACCOUNT_ID } from "@/lib/sync-reconciliation";
 import { CloudAccountErasureError } from "@/lib/supabase";
 
+export {
+  ACCOUNT_ERASURE_CHECKPOINT_VERSION,
+  ACCOUNT_ERASURE_FUTURE_TOLERANCE_MS,
+  ACCOUNT_ERASURE_OWNER_LEASE_MS,
+  accountErasureCheckpointNeedsRecovery,
+  actionableLocalErasureCheckpoint,
+  finalizingErasureLeaseExpired,
+  parseAccountErasureCheckpoint,
+  parseLegacyAccountErasureCheckpoints,
+};
+export type {
+  AccountErasureCheckpoint,
+  AccountErasureCloudBackupBoundary,
+  AccountErasureOwnerLease,
+  CloudErasureStatus,
+  LocalErasureStatus,
+  SessionErasureStatus,
+} from "@/lib/account-erasure-checkpoint";
+
 /** Retained only to detect and explicitly migrate or discard v1 browser data. */
 export const LEGACY_ACCOUNT_ERASURE_CHECKPOINT_KEY =
   "evolvra:account-erasure-checkpoints:v1";
-export const ACCOUNT_ERASURE_CHECKPOINT_VERSION = 2;
-export const ACCOUNT_ERASURE_OWNER_LEASE_MS = 30_000;
-export const ACCOUNT_ERASURE_FUTURE_TOLERANCE_MS = 5 * 60_000;
 export const ACCOUNT_ERASURE_CHANGE_EVENT = "evolvra:account-erasure-change";
 const ACCOUNT_ERASURE_BROADCAST_CHANNEL = "evolvra-account-erasure-v2";
-
-export type CloudErasureStatus =
-  | "pending"
-  | "finalizing"
-  | "failed"
-  | "ambiguous"
-  | "complete";
-export type LocalErasureStatus = "pending" | "complete";
-export type SessionErasureStatus = "pending" | "complete";
-
-export interface AccountErasureOwnerLease {
-  id: string;
-  leaseExpiresAt: string;
-}
-
-export interface AccountErasureCheckpoint {
-  version: 2;
-  accountId: string;
-  attemptId: string;
-  cloud: CloudErasureStatus;
-  local: LocalErasureStatus;
-  session: SessionErasureStatus;
-  persistenceGeneration: PersistenceScopeGeneration;
-  owner: AccountErasureOwnerLease | null;
-  updatedAt: string;
-}
 
 export interface CorruptAccountErasureCheckpoint {
   key: IDBValidKey;
@@ -66,18 +72,6 @@ export interface AccountErasureCheckpointInventory {
 export interface BegunAccountErasureIntent {
   checkpoint: AccountErasureCheckpoint;
   scope: AccountPersistenceScope;
-}
-
-interface LegacyAccountErasureCheckpoint {
-  accountId: string;
-  cloud: "pending" | "finalizing" | "ambiguous" | "complete";
-  local: LocalErasureStatus;
-  updatedAt: string;
-}
-
-interface LegacyAccountErasureEnvelope {
-  version: 1;
-  checkpoints: LegacyAccountErasureCheckpoint[];
 }
 
 export class AccountErasureAttemptReplacedError extends Error {
@@ -95,148 +89,6 @@ export class AccountErasureAttemptReplacedError extends Error {
 }
 
 const activeLocalCleanups = new Map<string, Promise<void>>();
-
-function validatedAccountId(value: unknown): string {
-  if (typeof value !== "string" || value.length > 256) {
-    throw new Error("The pending account-erasure record contains an invalid account identifier.");
-  }
-  return workspaceKey(value);
-}
-
-function validatedIdentifier(value: unknown, label: string): string {
-  if (
-    typeof value !== "string"
-    || value.length === 0
-    || value.length > 256
-    || value !== value.trim()
-  ) {
-    throw new Error(`The pending account-erasure record contains an invalid ${label}.`);
-  }
-  return value;
-}
-
-function validGeneration(value: unknown): value is number {
-  return Number.isSafeInteger(value) && Number(value) >= 0;
-}
-
-function parsedTimestamp(
-  value: unknown,
-  label: string,
-  now: number,
-): { value: string; time: number } {
-  if (typeof value !== "string" || !value.length) {
-    throw new Error(`The pending account-erasure record has an invalid ${label}.`);
-  }
-  const time = Date.parse(value);
-  if (!Number.isFinite(time) || time > now + ACCOUNT_ERASURE_FUTURE_TOLERANCE_MS) {
-    throw new Error(`The pending account-erasure record has an invalid or future ${label}.`);
-  }
-  return { value, time };
-}
-
-export function parseAccountErasureCheckpoint(
-  value: unknown,
-  expectedAccountId?: string,
-  now = Date.now(),
-): AccountErasureCheckpoint {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error("A pending account-erasure checkpoint is invalid.");
-  }
-  const candidate = value as Record<string, unknown>;
-  if (candidate.version !== ACCOUNT_ERASURE_CHECKPOINT_VERSION) {
-    throw new Error("The pending account-erasure checkpoint uses an unsupported format.");
-  }
-  const accountId = validatedAccountId(candidate.accountId);
-  if (expectedAccountId !== undefined && accountId !== validatedAccountId(expectedAccountId)) {
-    throw new Error("The pending account-erasure checkpoint belongs to another account scope.");
-  }
-  const attemptId = validatedIdentifier(candidate.attemptId, "attempt identifier");
-  if (
-    !["pending", "finalizing", "failed", "ambiguous", "complete"].includes(
-      String(candidate.cloud),
-    )
-    || !["pending", "complete"].includes(String(candidate.local))
-    || !["pending", "complete"].includes(String(candidate.session))
-    || !validGeneration(candidate.persistenceGeneration)
-  ) {
-    throw new Error("A pending account-erasure checkpoint has an invalid state.");
-  }
-  const updated = parsedTimestamp(candidate.updatedAt, "updated timestamp", now);
-  let owner: AccountErasureOwnerLease | null = null;
-  if (candidate.owner !== null) {
-    if (!candidate.owner || typeof candidate.owner !== "object" || Array.isArray(candidate.owner)) {
-      throw new Error("The pending account-erasure checkpoint has an invalid owner lease.");
-    }
-    const rawOwner = candidate.owner as Record<string, unknown>;
-    const id = validatedIdentifier(rawOwner.id, "owner identifier");
-    const lease = parsedTimestamp(rawOwner.leaseExpiresAt, "owner lease", now);
-    if (
-      candidate.cloud !== "finalizing"
-      || lease.time < updated.time
-      || lease.time > updated.time + ACCOUNT_ERASURE_OWNER_LEASE_MS * 2
-    ) {
-      throw new Error("The pending account-erasure checkpoint has an invalid owner lease.");
-    }
-    owner = { id, leaseExpiresAt: lease.value };
-  } else if (candidate.cloud === "finalizing") {
-    throw new Error("A finalizing account-erasure checkpoint has no owner lease.");
-  }
-
-  return {
-    version: 2,
-    accountId,
-    attemptId,
-    cloud: candidate.cloud as CloudErasureStatus,
-    local: candidate.local as LocalErasureStatus,
-    session: candidate.session as SessionErasureStatus,
-    persistenceGeneration: Number(candidate.persistenceGeneration),
-    owner,
-    updatedAt: updated.value,
-  };
-}
-
-/** Strictly validates the retired localStorage checkpoint format. */
-export function parseLegacyAccountErasureCheckpoints(
-  value: unknown,
-  now = Date.now(),
-): LegacyAccountErasureEnvelope {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error("The legacy account-erasure checkpoint root is invalid.");
-  }
-  const candidate = value as Record<string, unknown>;
-  if (candidate.version !== 1 || !Array.isArray(candidate.checkpoints)) {
-    throw new Error("The legacy account-erasure checkpoint uses an unsupported format.");
-  }
-  const seen = new Set<string>();
-  const checkpoints = candidate.checkpoints.map((raw) => {
-    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
-      throw new Error("A legacy account-erasure checkpoint is invalid.");
-    }
-    const item = raw as Record<string, unknown>;
-    const accountId = validatedAccountId(item.accountId);
-    if (accountId === ANONYMOUS_ACCOUNT_ID) {
-      throw new Error("The anonymous workspace cannot be an account-erasure target.");
-    }
-    if (seen.has(accountId)) {
-      throw new Error("The legacy account-erasure checkpoint repeats an account identifier.");
-    }
-    seen.add(accountId);
-    if (
-      !["pending", "finalizing", "ambiguous", "complete"].includes(String(item.cloud))
-      || !["pending", "complete"].includes(String(item.local))
-    ) {
-      throw new Error("A legacy account-erasure checkpoint has an invalid state.");
-    }
-    const updatedAt = parsedTimestamp(item.updatedAt, "legacy updated timestamp", now).value;
-    return {
-      accountId,
-      cloud: item.cloud as LegacyAccountErasureCheckpoint["cloud"],
-      local: item.local as LocalErasureStatus,
-      updatedAt,
-    };
-  });
-  return { version: 1, checkpoints };
-}
 
 /**
  * Moves every valid v1 entry behind an IDB tombstone before deleting the old
@@ -276,6 +128,7 @@ export async function migrateLegacyAccountErasureCheckpoints(
       cloud: mappedCloud,
       local: item.local,
       session: "pending",
+      backup: null,
       owner: item.cloud === "finalizing"
         ? {
             id: "legacy-v1-owner",
@@ -453,7 +306,13 @@ async function mutateCheckpoint(
 export async function beginAccountErasureIntent(
   accountId: string,
   expectedGeneration: PersistenceScopeGeneration,
-  options: { attemptId?: string; now?: number } = {},
+  options: {
+    attemptId?: string;
+    now?: number;
+    expectedLocalRevision?: number;
+    expectedEvidenceRevision?: number;
+    backup?: AccountErasureCloudBackupBoundary;
+  } = {},
 ): Promise<BegunAccountErasureIntent> {
   const target = validatedAccountId(accountId);
   if (target === ANONYMOUS_ACCOUNT_ID) {
@@ -467,6 +326,7 @@ export async function beginAccountErasureIntent(
     cloud: "pending",
     local: "pending",
     session: "pending",
+    backup: options.backup ?? null,
     owner: null,
     updatedAt: new Date(now).toISOString(),
   };
@@ -474,10 +334,35 @@ export async function beginAccountErasureIntent(
     target,
     expectedGeneration,
     checkpoint,
+    options.expectedLocalRevision !== undefined
+      && options.expectedEvidenceRevision !== undefined
+      ? {
+        expectedBackupBoundary: {
+          accountId: target,
+          generation: expectedGeneration,
+          workspaceLocalRevision: options.expectedLocalRevision,
+          evidenceRevision: options.expectedEvidenceRevision,
+        },
+      }
+      : { expectedLocalRevision: options.expectedLocalRevision },
   );
   const parsed = parseAccountErasureCheckpoint(armed.checkpoint, target, now);
   notifyAccountErasureChanged(target);
   return { checkpoint: parsed, scope: armed.scope };
+}
+
+/** Cancels a locally fenced attempt only after the caller proves cloud is active. */
+export async function cancelUnstartedAccountErasureIntent(
+  checkpoint: AccountErasureCheckpoint,
+): Promise<AccountPersistenceScope> {
+  const target = validatedAccountId(checkpoint.accountId);
+  const scope = await cancelUnstartedAccountErasurePersistenceFence(
+    target,
+    checkpoint.persistenceGeneration,
+    checkpoint.attemptId,
+  );
+  notifyAccountErasureChanged(target);
+  return scope;
 }
 
 /**
@@ -503,6 +388,7 @@ export async function recoverOrphanedAccountErasureIntent(
     cloud: "ambiguous",
     local: "pending",
     session: "pending",
+    backup: null,
     owner: null,
     updatedAt: new Date(now).toISOString(),
   };
@@ -514,18 +400,6 @@ export async function recoverOrphanedAccountErasureIntent(
   const parsed = parseAccountErasureCheckpoint(recovered.checkpoint, target, now);
   notifyAccountErasureChanged(target);
   return { checkpoint: parsed, scope: recovered.scope };
-}
-
-function nextCheckpoint(
-  current: AccountErasureCheckpoint,
-  patch: Partial<Pick<AccountErasureCheckpoint, "cloud" | "local" | "session" | "owner">>,
-  now: number,
-): AccountErasureCheckpoint {
-  return {
-    ...current,
-    ...patch,
-    updatedAt: new Date(now).toISOString(),
-  };
 }
 
 async function markFinalizing(
@@ -660,33 +534,6 @@ export async function prepareAmbiguousAccountErasureRetry(
   }, now);
   if (!updated) throw new Error("No ambiguous account-erasure checkpoint was found.");
   return updated;
-}
-
-export function finalizingErasureLeaseExpired(
-  checkpoint: AccountErasureCheckpoint,
-  now = Date.now(),
-): boolean {
-  return checkpoint.cloud === "finalizing"
-    && checkpoint.owner !== null
-    && Date.parse(checkpoint.owner.leaseExpiresAt) <= now;
-}
-
-export function actionableLocalErasureCheckpoint(
-  checkpoints: AccountErasureCheckpoint[],
-): AccountErasureCheckpoint | null {
-  return checkpoints.find((checkpoint) =>
-    checkpoint.local === "pending"
-    && (checkpoint.cloud === "ambiguous" || checkpoint.cloud === "complete")) ?? null;
-}
-
-export function accountErasureCheckpointNeedsRecovery(
-  checkpoint: AccountErasureCheckpoint,
-): boolean {
-  return checkpoint.cloud === "pending"
-    || checkpoint.cloud === "finalizing"
-    || checkpoint.cloud === "failed"
-    || checkpoint.local === "pending"
-    || checkpoint.session === "pending";
 }
 
 export interface AdvanceCloudAccountErasureOptions {

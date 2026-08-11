@@ -254,7 +254,7 @@ test("keyboard-only goal editing, completion, review, export, and deletion remai
   await dataSection.focus();
   await page.keyboard.press("Enter");
   const backupDownload = page.waitForEvent("download");
-  const backupButton = page.getByRole("button", { name: /Workspace JSON backup/ });
+  const backupButton = page.getByRole("button", { name: /Records-only JSON backup/ });
   await backupButton.focus();
   await page.keyboard.press("Enter");
   await expect((await backupDownload).suggestedFilename()).toMatch(/^evolvra-backup-\d{4}-\d{2}-\d{2}\.json$/);
@@ -358,7 +358,7 @@ test("mobile layouts retain goal, quest, review, settings, import, export, and d
   await page.getByRole("dialog", { name: "Primary navigation" }).getByRole("link", { name: "Customise settings" }).click();
   await page.getByRole("button", { name: "Data & recovery" }).click();
   const mobileDownload = page.waitForEvent("download");
-  await page.getByRole("button", { name: /Workspace JSON backup/ }).click();
+  await page.getByRole("button", { name: /Records-only JSON backup/ }).click();
   await expect((await mobileDownload).suggestedFilename()).toMatch(/^evolvra-backup-/);
   await page.locator('input[type="file"][accept*="json"]').setInputFiles({
     name: "mobile-evolvra-backup.json",

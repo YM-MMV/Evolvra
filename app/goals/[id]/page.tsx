@@ -5,7 +5,12 @@ import Image from "next/image";
 import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
 import { ArrowDown, ArrowLeft, ArrowUp, CalendarDays, Check, CheckCircle2, Circle, Download, Edit3, Eye, FileText, Flag, MoreHorizontal, Pause, Play, Plus, Save, Sparkles, Target, Trash2 } from "lucide-react";
-import { remoteEvidencePath, useApp } from "@/components/app-provider";
+import {
+  remoteEvidencePath,
+  useAppActions,
+  useProviderStatus,
+  useWorkspaceData,
+} from "@/components/app-provider";
 import { DynamicIcon } from "@/components/icons";
 import { QuestForm } from "@/components/quest-form";
 import { QuestCompletionForm } from "@/components/quest-completion-form";
@@ -24,9 +29,14 @@ import {
   normalizedEvidenceBlob,
 } from "@/lib/goal-evidence";
 import { goalProgressConfigurationIssue, metricsForGoalModel } from "@/lib/goal-progress";
-import { deleteEvidenceBlob, readEvidenceBlob, storeEvidenceBlob } from "@/lib/persistence";
+import {
+  commitGoalEvidenceRemoteUpload,
+  GoalEvidenceLocalCommitRetainedError,
+  removeSingleGoalEvidenceWithCompensation,
+  requireEvidenceDeletionReceipt,
+} from "@/lib/provider-goal-evidence";
 import { WORKSPACE_TEXT_LIMITS } from "@/lib/state-schema";
-import { getSupabase } from "@/lib/supabase";
+import { claimPrivateEvidenceCleanup, getSupabase } from "@/lib/supabase";
 import type { ConsistencyPeriod, GoalEvidence, GoalFileEvidence, GoalModel, Milestone, Priority, ProgressMetric, TimelineEvent } from "@/lib/types";
 import { activePeriodKey, formatDate, getArea, goalProgress, isFiniteWorkspaceNumber, isQuestAvailable, MAX_WORKSPACE_NUMBER, rollMetricPeriod, singularizeTerm, uid } from "@/lib/utils";
 
@@ -37,8 +47,6 @@ interface EvidencePreview {
   objectUrl?: string;
   text?: string;
 }
-
-const evidenceAccountId = (userId?: string) => userId ?? "anonymous";
 
 function downloadBlob(blob: Blob, filename: string) {
   const url = URL.createObjectURL(blob);
@@ -80,19 +88,26 @@ export default function GoalDetailPage() {
   const router = useRouter();
   const {
     state,
-    user,
-    cloudWriteAllowed,
     workspaceScopeKey,
-    persistenceScopeGeneration,
+  } = useWorkspaceData();
+  const { user, cloudWriteAllowed } = useProviderStatus();
+  const {
     runWorkspaceFileOperation,
     setGoalFileEvidence,
+    readGoalEvidenceBlob,
+    stageGoalEvidenceBlob,
+    rollbackGoalEvidenceStage,
+    cacheGoalEvidenceBlob,
+    deleteGoalEvidenceBlobs,
+    stageGoalEvidenceCleanup,
+    cancelGoalEvidenceCleanup,
     updateGoal,
     setGoalStatus,
     deleteGoal,
     toggleMilestone,
     updateMetric,
     addCheckIn,
-  } = useApp();
+  } = useAppActions();
   const goal = state.goals.find((item) => item.id === params.id);
   const [questOpen, setQuestOpen] = useState(false);
   const [editingQuestId, setEditingQuestId] = useState<string | null>(null);
@@ -191,6 +206,9 @@ export default function GoalDetailPage() {
     metrics: editMetrics,
   }, goalTerm.toLowerCase());
   const totalWeight = goal.milestones.reduce((sum, milestone) => sum + milestone.weight, 0);
+  const snapshotArea = goal.completionSnapshot
+    ? state.areas.find((item) => item.id === goal.completionSnapshot?.areaId)
+    : undefined;
 
   const addMilestone = () => {
     if (!milestoneTitle.trim()) return;
@@ -314,15 +332,13 @@ export default function GoalDetailPage() {
     if (!isAllowedEvidenceMimeType(meta.mimeType)) {
       throw new Error("This evidence type is not allowed for preview or download.");
     }
-    const accountId = evidenceAccountId(user?.id);
-    let record = await readEvidenceBlob(
-      accountId,
+    let record = await readGoalEvidenceBlob(
       goal.id,
       meta.id,
-      persistenceScopeGeneration,
+      workspaceScopeKey,
     );
     if (record && !normalizedEvidenceBlob(record.blob, meta)) {
-      await deleteEvidenceBlob(accountId, goal.id, meta.id, persistenceScopeGeneration);
+      await deleteGoalEvidenceBlobs([record], null, workspaceScopeKey);
       record = null;
     }
     if (!record && user && meta.remotePath) {
@@ -334,9 +350,11 @@ export default function GoalDetailPage() {
       if (error || !data) throw error ?? new Error("The private file could not be downloaded.");
       const verified = normalizedEvidenceBlob(data, meta);
       if (!verified) throw new Error("The private cloud file did not match its recorded type and size, so it was not cached or opened.");
-      record = await storeEvidenceBlob(
-        { accountId, goalId: goal.id, evidenceId: meta.id, blob: verified },
-        persistenceScopeGeneration,
+      record = await cacheGoalEvidenceBlob(
+        goal.id,
+        meta.id,
+        verified,
+        workspaceScopeKey,
       );
     }
     if (!record) throw new Error("This file is not available on the current device and has no cloud copy.");
@@ -377,55 +395,117 @@ export default function GoalDetailPage() {
     setEvidenceBusy(true);
     setEvidenceMessage("");
     const id = uid("evidence");
-    const accountId = evidenceAccountId(user?.id);
     const operationScopeKey = workspaceScopeKey;
     try {
       await runWorkspaceFileOperation(operationScopeKey, async () => {
-        let localStored = false;
-        let uploadedPath: string | undefined;
-        let metadataCommitted = false;
+        let stagedLocal: Awaited<ReturnType<typeof stageGoalEvidenceBlob>> | null = null;
+        let localCommitted = false;
         try {
-          await storeEvidenceBlob(
-            { accountId, goalId: goal.id, evidenceId: id, blob: verifiedFile },
-            persistenceScopeGeneration,
+          stagedLocal = await stageGoalEvidenceBlob(
+            goal.id,
+            id,
+            verifiedFile,
+            operationScopeKey,
           );
-          localStored = true;
           if (user) {
             const supabase = await getSupabase();
-            const safeName = evidenceName.replace(/[^a-zA-Z0-9._-]+/g, "-").slice(-120) || "evidence";
-            const path = `${user.id}/${goal.id}/${id}/${safeName}`;
-            const { error } = await supabase?.storage.from("evidence").upload(path, verifiedFile, { contentType: mimeType, upsert: false }) ?? { error: new Error("Cloud storage is unavailable.") };
-            if (!error) uploadedPath = path;
-            else setEvidenceMessage("The file is safe on this device, but its private cloud upload will need to be retried from this device.");
-          }
-          await setGoalFileEvidence(goal.id, [
-            ...goal.evidence,
-            {
-              id,
-              type: "file",
-              name: evidenceName,
-              mimeType,
-              size: file.size,
-              ...(uploadedPath ? { remotePath: uploadedPath } : {}),
-            },
-          ], operationScopeKey);
-          metadataCommitted = true;
-        } catch (error) {
-          if (!metadataCommitted) {
-            if (uploadedPath && user) {
-              const supabase = await getSupabase();
-              await supabase?.storage.from("evidence").remove([uploadedPath]);
-            }
-            if (localStored) {
-              await deleteEvidenceBlob(
-                accountId,
+            const safeName = evidenceName.replace(/[^a-zA-Z0-9._-]+/g, "-").slice(-80) || "evidence";
+            const path = `${user.id}/${goal.id}/${id}/${globalThis.crypto.randomUUID()}-${safeName}`;
+            const bucket = supabase?.storage.from("evidence");
+            const outcome = await commitGoalEvidenceRemoteUpload({
+              remotePath: path,
+              blob: verifiedFile,
+              allowLocalOnly: true,
+              stageCleanup: () => stageGoalEvidenceCleanup(
+                null,
                 goal.id,
                 id,
-                persistenceScopeGeneration,
-              );
+                path,
+                operationScopeKey,
+              ),
+              upload: async () => {
+                if (!bucket) throw new Error("Cloud storage is unavailable.");
+                const uploaded = await bucket.upload(path, verifiedFile, {
+                  contentType: mimeType,
+                  upsert: false,
+                });
+                if (uploaded.error) throw uploaded.error;
+              },
+              download: async () => {
+                if (!bucket) throw new Error("Cloud storage is unavailable.");
+                const existing = await bucket.download(path);
+                if (existing.error || !existing.data) {
+                  throw existing.error ?? new Error("The private upload could not be verified.");
+                }
+                return existing.data;
+              },
+              commitMetadata: async (remotePath) => {
+                await setGoalFileEvidence(goal.id, [
+                  ...goal.evidence,
+                  {
+                    id,
+                    type: "file",
+                    name: evidenceName,
+                    mimeType,
+                    size: file.size,
+                    ...(remotePath ? { remotePath } : {}),
+                  },
+                ], operationScopeKey, [stagedLocal!]);
+              },
+              remove: async () => {
+                if (!supabase || !bucket) throw new Error("Cloud storage is unavailable.");
+                const claim = await claimPrivateEvidenceCleanup(
+                  supabase,
+                  user.id,
+                  [path],
+                );
+                if (claim.kind === "referenced") {
+                  throw new Error("The current cloud workspace references this private evidence path.");
+                }
+                const removed = await bucket.remove([path]);
+                if (removed.error) throw removed.error;
+              },
+              cancelCleanup: (intent) => cancelGoalEvidenceCleanup(
+                intent,
+                operationScopeKey,
+              ),
+            });
+            localCommitted = true;
+            if (outcome.localCommitRetainedError) {
+              setEvidenceMessage(outcome.uploadNeedsRetry
+                ? `${outcome.localCommitRetainedError.message} Its private upload still needs retrying from this device.`
+                : outcome.localCommitRetainedError.message);
+            } else if (outcome.uploadNeedsRetry) {
+              setEvidenceMessage("The file is safe on this device, but its private cloud upload will need to be retried from this device.");
+            } else if (outcome.cleanupPending) {
+              setEvidenceMessage("Private cloud copy saved. Its durable cleanup journal will be reconciled automatically.");
+            }
+          } else {
+            try {
+              await setGoalFileEvidence(goal.id, [
+                ...goal.evidence,
+                {
+                  id,
+                  type: "file",
+                  name: evidenceName,
+                  mimeType,
+                  size: file.size,
+                },
+              ], operationScopeKey, [stagedLocal]);
+              localCommitted = true;
+            } catch (error) {
+              if (error instanceof GoalEvidenceLocalCommitRetainedError) {
+                localCommitted = true;
+                setEvidenceMessage(error.message);
+              } else {
+                throw error;
+              }
             }
           }
-          throw error;
+        } finally {
+          if (stagedLocal && !localCommitted) {
+            await rollbackGoalEvidenceStage(stagedLocal, operationScopeKey);
+          }
         }
       });
     } catch (error) {
@@ -497,46 +577,78 @@ export default function GoalDetailPage() {
     const operationScopeKey = workspaceScopeKey;
     try {
       await runWorkspaceFileOperation(operationScopeKey, async () => {
-        const record = await readEvidenceBlob(
-          evidenceAccountId(user.id),
+        const record = await readGoalEvidenceBlob(
           goal.id,
           meta.id,
-          persistenceScopeGeneration,
+          operationScopeKey,
         );
         if (!record) throw new Error("Open this file on the device where it was added before retrying its cloud upload.");
         const verifiedBlob = normalizedEvidenceBlob(record.blob, meta);
         if (!verifiedBlob) {
-          await deleteEvidenceBlob(
-            evidenceAccountId(user.id),
-            goal.id,
-            meta.id,
-            persistenceScopeGeneration,
-          );
+          await deleteGoalEvidenceBlobs([record], null, operationScopeKey);
           throw new Error("The device copy did not match its recorded type and size, so it was removed instead of uploaded.");
         }
         const supabase = await getSupabase();
-        const safeName = meta.name.replace(/[^a-zA-Z0-9._-]+/g, "-").slice(-120) || "evidence";
-        const safeRemotePath = `${user.id}/${goal.id}/${meta.id}/${safeName}`;
+        const safeName = meta.name.replace(/[^a-zA-Z0-9._-]+/g, "-").slice(-80) || "evidence";
+        const safeRemotePath = `${user.id}/${goal.id}/${meta.id}/${globalThis.crypto.randomUUID()}-${safeName}`;
         const bucket = supabase?.storage.from("evidence");
         if (!bucket) throw new Error("Cloud storage is unavailable.");
-        const { error } = await bucket.upload(safeRemotePath, verifiedBlob, { contentType: meta.mimeType, upsert: false });
-        let createdRemote = !error;
-        if (error) {
-          // A previous retry may already have completed remotely. Adopt it only
-          // after exact byte metadata validation; never overwrite it blindly.
-          const existing = await bucket.download(safeRemotePath);
-          if (existing.error || !existing.data || !normalizedEvidenceBlob(existing.data, meta)) throw error;
-          createdRemote = false;
+        const outcome = await commitGoalEvidenceRemoteUpload({
+          remotePath: safeRemotePath,
+          blob: verifiedBlob,
+          allowLocalOnly: false,
+          stageCleanup: () => stageGoalEvidenceCleanup(
+            null,
+            goal.id,
+            meta.id,
+            safeRemotePath,
+            operationScopeKey,
+          ),
+          upload: async () => {
+            const uploaded = await bucket.upload(safeRemotePath, verifiedBlob, {
+              contentType: meta.mimeType,
+              upsert: false,
+            });
+            if (uploaded.error) throw uploaded.error;
+          },
+          download: async () => {
+            const existing = await bucket.download(safeRemotePath);
+            if (existing.error || !existing.data) {
+              throw existing.error ?? new Error("The private upload could not be verified.");
+            }
+            return existing.data;
+          },
+          commitMetadata: async (remotePath) => {
+            if (!remotePath) throw new Error("The private upload could not be verified.");
+            await setGoalFileEvidence(goal.id, goal.evidence.map((value) => value.id === meta.id
+              ? { ...meta, remotePath }
+              : value), operationScopeKey);
+          },
+          remove: async () => {
+            if (!supabase) throw new Error("Cloud storage is unavailable.");
+            const claim = await claimPrivateEvidenceCleanup(
+              supabase,
+              user.id,
+              [safeRemotePath],
+            );
+            if (claim.kind === "referenced") {
+              throw new Error("The current cloud workspace references this private evidence path.");
+            }
+            const removed = await bucket.remove([safeRemotePath]);
+            if (removed.error) throw removed.error;
+          },
+          cancelCleanup: (intent) => cancelGoalEvidenceCleanup(
+            intent,
+            operationScopeKey,
+          ),
+        });
+        if (outcome.localCommitRetainedError) {
+          setEvidenceMessage(outcome.localCommitRetainedError.message);
+        } else if (outcome.cleanupPending) {
+          setEvidenceMessage("Private cloud copy saved. Its durable cleanup journal will be reconciled automatically.");
+        } else {
+          setEvidenceMessage("Private cloud copy saved.");
         }
-        try {
-          await setGoalFileEvidence(goal.id, goal.evidence.map((value) => value.id === meta.id
-            ? { ...meta, remotePath: safeRemotePath }
-            : value), operationScopeKey);
-        } catch (error) {
-          if (createdRemote) await bucket.remove([safeRemotePath]);
-          throw error;
-        }
-        setEvidenceMessage("Private cloud copy saved.");
       });
     } catch (error) {
       setEvidenceMessage(error instanceof Error ? error.message : "The private cloud upload could not be completed.");
@@ -560,75 +672,69 @@ export default function GoalDetailPage() {
     const operationScopeKey = workspaceScopeKey;
     try {
       await runWorkspaceFileOperation(operationScopeKey, async () => {
-        const accountId = evidenceAccountId(user?.id);
-        const backup = await resolveEvidenceBlob(item);
         const safeRemotePath = user && item.remotePath
           ? remoteEvidencePath(item, user.id, goal.id)
           : undefined;
+        if (user && item.remotePath && !safeRemotePath) {
+          throw new Error("This file's private cloud reference is invalid. No metadata or bytes were removed.");
+        }
         const supabase = safeRemotePath ? await getSupabase() : null;
         const bucket = supabase?.storage.from("evidence");
-        let remoteRemoved = false;
-        let localRemoved = false;
-        let metadataCommitted = false;
-        try {
-          await setGoalFileEvidence(
+        if (safeRemotePath && (!supabase || !bucket)) {
+          throw new Error("Cloud storage is unavailable.");
+        }
+        const localSnapshot = await readGoalEvidenceBlob(
+          goal.id,
+          item.id,
+          operationScopeKey,
+        );
+        const outcome = await removeSingleGoalEvidenceWithCompensation({
+          stageCleanup: () => stageGoalEvidenceCleanup(
+            localSnapshot,
+            goal.id,
+            item.id,
+            safeRemotePath,
+            operationScopeKey,
+          ),
+          commitMetadataDeletion: () => setGoalFileEvidence(
             goal.id,
             goal.evidence.filter((value) => value.id !== item.id),
             operationScopeKey,
-          );
-          metadataCommitted = true;
-          if (safeRemotePath) {
-            if (!bucket) throw new Error("Cloud storage is unavailable.");
-            const { error } = await bucket.remove([safeRemotePath]);
-            if (error) throw error;
-            remoteRemoved = true;
-          }
-          await deleteEvidenceBlob(
-            accountId,
-            goal.id,
-            item.id,
-            persistenceScopeGeneration,
-          );
-          localRemoved = true;
-        } catch (error) {
-          const rollbackFailures: unknown[] = [];
-          if (localRemoved) {
-            try {
-              await storeEvidenceBlob(
-                { accountId, goalId: goal.id, evidenceId: item.id, blob: backup },
-                persistenceScopeGeneration,
-              );
-            } catch (rollbackError) {
-              rollbackFailures.push(rollbackError);
-            }
-          }
-          if (remoteRemoved && safeRemotePath && bucket) {
-            try {
-              const restored = await bucket.upload(safeRemotePath, backup, {
-                contentType: item.mimeType,
-                upsert: false,
-              });
-              if (restored.error) {
-                const existing = await bucket.download(safeRemotePath);
-                if (existing.error || !existing.data || !normalizedEvidenceBlob(existing.data, item)) {
-                  throw restored.error;
-                }
-              }
-            } catch (rollbackError) {
-              rollbackFailures.push(rollbackError);
-            }
-          }
-          if (metadataCommitted) {
-            try {
-              await setGoalFileEvidence(goal.id, goal.evidence, operationScopeKey);
-            } catch (rollbackError) {
-              rollbackFailures.push(rollbackError);
-            }
-          }
-          if (rollbackFailures.length) {
-            throw new AggregateError([error, ...rollbackFailures], "Evidence removal failed and one or more storage copies could not be restored.");
-          }
-          throw error;
+          ),
+          ...(safeRemotePath ? {
+            claimRemote: async () => {
+              if (!supabase) throw new Error("Cloud storage is unavailable.");
+              return (await claimPrivateEvidenceCleanup(
+                supabase,
+                user!.id,
+                [safeRemotePath],
+              )).kind;
+            },
+            removeRemote: async () => {
+              if (!bucket) throw new Error("Cloud storage is unavailable.");
+              const removed = await bucket.remove([safeRemotePath]);
+              if (removed.error) throw removed.error;
+            },
+          } : {}),
+          ...(localSnapshot ? {
+            removeLocal: async (committedWorkspaceLocalRevision: number) => requireEvidenceDeletionReceipt(
+              await deleteGoalEvidenceBlobs(
+                [localSnapshot],
+                committedWorkspaceLocalRevision,
+                operationScopeKey,
+              ),
+            ),
+          } : {}),
+          restoreMetadata: async () => {
+            await setGoalFileEvidence(goal.id, goal.evidence, operationScopeKey);
+          },
+          cancelCleanup: (intent) => cancelGoalEvidenceCleanup(
+            intent,
+            operationScopeKey,
+          ),
+        });
+        if (outcome.cleanupPending) {
+          setEvidenceMessage("Evidence removed. Its durable cleanup journal will finish automatically.");
         }
       });
     } catch (error) {
@@ -655,52 +761,11 @@ export default function GoalDetailPage() {
     const operationScopeKey = workspaceScopeKey;
     try {
       await runWorkspaceFileOperation(operationScopeKey, async () => {
-        const originalRemotePath = user && meta.remotePath
-          ? remoteEvidencePath(meta, user.id, goal.id)
-          : undefined;
-        let nextRemotePath = originalRemotePath;
-        let candidateCreated = false;
-        let bucket: ReturnType<NonNullable<ReturnType<typeof getSupabase>>["storage"]["from"]> | null = null;
-        if (user && originalRemotePath) {
-          const safeName = requested.replace(/[^a-zA-Z0-9._-]+/g, "-").slice(-120) || "evidence";
-          const candidatePath = `${originalRemotePath.slice(0, originalRemotePath.lastIndexOf("/") + 1)}${safeName}`;
-          if (candidatePath !== originalRemotePath) {
-            const supabase = await getSupabase();
-            bucket = supabase?.storage.from("evidence") ?? null;
-            if (!bucket) throw new Error("Cloud storage is unavailable.");
-            const blob = await resolveEvidenceBlob(meta);
-            const uploaded = await bucket.upload(candidatePath, blob, {
-              contentType: meta.mimeType,
-              upsert: false,
-            });
-            if (uploaded.error) {
-              const existing = await bucket.download(candidatePath);
-              if (existing.error || !existing.data || !normalizedEvidenceBlob(existing.data, meta)) {
-                throw uploaded.error;
-              }
-            } else {
-              candidateCreated = true;
-            }
-            nextRemotePath = candidatePath;
-          }
-        }
-        try {
-          await setGoalFileEvidence(goal.id, goal.evidence.map((value) => value.id === meta.id
-            ? { ...meta, name: requested, ...(nextRemotePath ? { remotePath: nextRemotePath } : {}) }
-            : value), operationScopeKey);
-          if (bucket && originalRemotePath && nextRemotePath && nextRemotePath !== originalRemotePath) {
-            const removed = await bucket.remove([originalRemotePath]);
-            if (removed.error) {
-              await setGoalFileEvidence(goal.id, goal.evidence, operationScopeKey);
-              throw removed.error;
-            }
-          }
-        } catch (error) {
-          if (candidateCreated && bucket && nextRemotePath && nextRemotePath !== originalRemotePath) {
-            await bucket.remove([nextRemotePath]);
-          }
-          throw error;
-        }
+        // Storage paths are immutable object identities. Renaming changes only
+        // user-facing metadata and never copies, overwrites, or deletes bytes.
+        await setGoalFileEvidence(goal.id, goal.evidence.map((value) => value.id === meta.id
+          ? { ...meta, name: requested }
+          : value), operationScopeKey);
         setEvidenceMessage("Evidence file renamed.");
       });
     } catch (error) {
@@ -728,6 +793,47 @@ export default function GoalDetailPage() {
       </div>
     </section>
 
+    {goal.completionSnapshot && <Panel className="goal-outcome-snapshot" aria-labelledby="first-completion-record-title">
+      <div className="goal-outcome-heading">
+        <div>
+          <p className="eyebrow">Permanent outcome history</p>
+          <h2 id="first-completion-record-title">First-completion record</h2>
+          <p>This immutable snapshot shows what this {goalTerm.toLowerCase()} said and measured when it was first completed. Reopening or editing the live {goalTerm.toLowerCase()} does not rewrite it.</p>
+        </div>
+        <Pill>Recorded {formatDate(goal.completionSnapshot.completedAt)}</Pill>
+      </div>
+      <div className="goal-outcome-copy">
+        <span>{snapshotArea
+          ? `${snapshotArea.name} · current label for the retained ${areaTerm.toLowerCase()} reference`
+          : `Original ${areaTerm.toLowerCase()} retained by reference`}</span>
+        <strong>{goal.completionSnapshot.title}</strong>
+        <p>{goal.completionSnapshot.description}</p>
+      </div>
+      <div className="goal-outcome-facts">
+        <div><span>Progress model</span><strong>{goal.completionSnapshot.model}</strong></div>
+        <div><span>Importance</span><strong>{goal.completionSnapshot.priority}</strong></div>
+        <div><span>Measurements</span><strong>{goal.completionSnapshot.metricCount}</strong></div>
+        <div><span>{terms.milestones}</span><strong>{goal.completionSnapshot.milestoneCount}</strong></div>
+        <div><span>Check-ins</span><strong>{goal.completionSnapshot.checkInCount}</strong></div>
+        {goal.completionSnapshot.targetDate && <div><span>Original target</span><strong>{formatDate(goal.completionSnapshot.targetDate)}</strong></div>}
+      </div>
+      {(goal.completionSnapshot.metrics.length || goal.completionSnapshot.milestones.length || goal.completionSnapshot.checkIns.length) ? <details className="goal-outcome-details">
+        <summary>Inspect the recorded measurements and stages</summary>
+        {goal.completionSnapshot.metrics.length ? <section aria-label="First-completion measurements">
+          <h3>Measurements at completion</h3>
+          <div className="goal-outcome-list">{goal.completionSnapshot.metrics.map((metric) => <div key={metric.id}><strong>{metric.label}</strong><span>{metric.current.toLocaleString()} / {metric.target.toLocaleString()} {metric.unit}</span></div>)}</div>
+        </section> : null}
+        {goal.completionSnapshot.milestones.length ? <section aria-label={`First-completion ${terms.milestones.toLowerCase()}`}>
+          <h3>{terms.milestones} at completion</h3>
+          <div className="goal-outcome-list">{goal.completionSnapshot.milestones.map((milestone) => <div key={milestone.id}><strong>{milestone.title}</strong><span>{milestone.completed ? `Reached${milestone.completedAt ? ` ${formatDate(milestone.completedAt)}` : ""}` : "Not reached at first completion"}</span></div>)}</div>
+        </section> : null}
+        {goal.completionSnapshot.checkIns.length ? <section aria-label="First-completion check-ins">
+          <h3>Check-ins retained at completion</h3>
+          <div className="goal-outcome-list">{goal.completionSnapshot.checkIns.map((item) => <div key={item.id}><strong>{formatDate(item.createdAt)}</strong><span>{item.note}</span></div>)}</div>
+        </section> : null}
+      </details> : null}
+    </Panel>}
+
     <div className="goal-detail-grid">
       <div className="goal-detail-main">
         <Panel>
@@ -738,7 +844,7 @@ export default function GoalDetailPage() {
 
         <Panel>
           <div className="section-heading"><div><p className="eyebrow">Meaningful stages</p><h2>{milestoneTerm} path</h2></div><Button variant="secondary" onClick={() => openMilestone()}><Plus size={15} /> Add</Button></div>
-          {goal.model === "weighted" && <div className={`weight-notice ${Math.round(totalWeight) === 100 ? "valid" : ""}`}><span>{milestoneTerm} weight</span><strong>{Math.round(totalWeight)}%</strong><small>{Math.round(totalWeight) === 100 ? "Balanced" : `Adjust ${terms.milestones.toLowerCase()} to total 100%`}</small></div>}
+          {goal.model === "weighted" && <div className="weight-notice valid"><span>{milestoneTerm} weight</span><strong>{Math.round(totalWeight)}%</strong><small>{Math.abs(totalWeight - 100) < 1e-9 ? "Fully allocated" : totalWeight > 0 ? `Relative weights are normalized across the defined ${terms.milestones.toLowerCase()}; completing all reaches 100%` : `Zero-weight ${terms.milestones.toLowerCase()} share progress evenly; completing all reaches 100%`}</small></div>}
           <div className="milestone-list">{goal.milestones.map((milestone, index) => <div key={milestone.id} className={milestone.completed ? "milestone-item completed" : "milestone-item"}><button className="milestone-toggle" aria-label={milestone.completed ? `Reopen ${milestone.title}` : `Complete ${milestone.title}`} onClick={() => toggleMilestone(goal.id, milestone.id)}><span className="milestone-line" /><span className="milestone-check">{milestone.completed ? <Check size={16} /> : <Circle size={16} />}</span><div><small>Stage {index + 1}{goal.model === "weighted" ? ` · ${Math.round(milestone.weight)}%` : ""}</small><strong>{milestone.title}</strong><span>{milestone.completed ? `Reached ${formatDate(milestone.completedAt)}` : milestone.completedAt ? `First reached ${formatDate(milestone.completedAt)} · currently reopened` : "Not reached yet"}</span></div></button><div className="item-actions"><button aria-label={`Move ${milestone.title} up`} disabled={index === 0} onClick={() => updateGoal(goal.id, { milestones: reorder(goal.milestones, index, -1) })}><ArrowUp size={14} /></button><button aria-label={`Move ${milestone.title} down`} disabled={index === goal.milestones.length - 1} onClick={() => updateGoal(goal.id, { milestones: reorder(goal.milestones, index, 1) })}><ArrowDown size={14} /></button><button aria-label={`Edit ${milestone.title}`} onClick={() => openMilestone(milestone)}><Edit3 size={14} /></button><button className="danger" aria-label={`Delete ${milestone.title}`} onClick={() => { if (window.confirm(`Delete ${milestone.title}?`)) updateGoal(goal.id, { milestones: goal.milestones.filter((item) => item.id !== milestone.id) }); }}><Trash2 size={14} /></button></div></div>)}</div>
           {!goal.milestones.length && <EmptyState icon={<Target />} title={`No ${terms.milestones.toLowerCase()} yet`} body={`Split this ${goalTerm.toLowerCase()} into stages that would feel meaningfully different.`} />}
         </Panel>
@@ -812,7 +918,7 @@ export default function GoalDetailPage() {
         <div className="evidence-preview-footer"><span>{evidencePreview.mimeType}</span><Button variant="secondary" onClick={() => downloadBlob(evidencePreview.blob, evidencePreview.name)}><Download size={15} /> Download file</Button></div>
       </div>}
     </Modal>
-    <Modal open={milestoneOpen} onClose={() => { setMilestoneOpen(false); setEditingMilestoneId(null); setMilestoneError(""); }} title={editingMilestoneId ? `Edit ${milestoneTerm.toLowerCase()}` : `Add a ${milestoneTerm.toLowerCase()}`} eyebrow="Meaningful stage"><div className="form-stack"><Field label={milestoneTerm}><input data-modal-autofocus="true" maxLength={WORKSPACE_TEXT_LIMITS.milestoneTitle} value={milestoneTitle} onChange={(e) => setMilestoneTitle(e.target.value)} placeholder="Pass the A2 assessment" /></Field>{goal.model === "weighted" && <Field label={`${goalTerm} weight`} hint={`Weighted ${terms.milestones.toLowerCase()} must total no more than 100%`}><input type="number" min="0" max="100" value={milestoneWeight} onChange={(e) => { const next = Number(e.target.value); setMilestoneWeight(isFiniteWorkspaceNumber(next, 0, 100) ? next : 0); setMilestoneError(""); }} /></Field>}{milestoneError && <p className="evidence-message" role="alert">{milestoneError}</p>}<div className="button-row end"><Button variant="ghost" onClick={() => setMilestoneOpen(false)}>Cancel</Button><Button disabled={!milestoneTitle.trim() || (goal.model === "weighted" && !isFiniteWorkspaceNumber(milestoneWeight, 0, 100))} onClick={addMilestone}><Save size={16} /> Save {milestoneTerm.toLowerCase()}</Button></div></div></Modal>
+    <Modal open={milestoneOpen} onClose={() => { setMilestoneOpen(false); setEditingMilestoneId(null); setMilestoneError(""); }} title={editingMilestoneId ? `Edit ${milestoneTerm.toLowerCase()}` : `Add a ${milestoneTerm.toLowerCase()}`} eyebrow="Meaningful stage"><div className="form-stack"><Field label={milestoneTerm}><input data-modal-autofocus="true" maxLength={WORKSPACE_TEXT_LIMITS.milestoneTitle} value={milestoneTitle} onChange={(e) => setMilestoneTitle(e.target.value)} placeholder="Pass the A2 assessment" /></Field>{goal.model === "weighted" && <Field label={`${goalTerm} weight`} hint={`Relative weights may total less than 100% and are normalized across the defined ${terms.milestones.toLowerCase()}; the total cannot exceed 100%.`}><input type="number" min="0" max="100" value={milestoneWeight} onChange={(e) => { const next = Number(e.target.value); setMilestoneWeight(isFiniteWorkspaceNumber(next, 0, 100) ? next : 0); setMilestoneError(""); }} /></Field>}{milestoneError && <p className="evidence-message" role="alert">{milestoneError}</p>}<div className="button-row end"><Button variant="ghost" onClick={() => setMilestoneOpen(false)}>Cancel</Button><Button disabled={!milestoneTitle.trim() || (goal.model === "weighted" && !isFiniteWorkspaceNumber(milestoneWeight, 0, 100))} onClick={addMilestone}><Save size={16} /> Save {milestoneTerm.toLowerCase()}</Button></div></div></Modal>
     <Modal open={metricOpen} onClose={() => { setMetricOpen(false); setEditingMetricId(null); setMetricError(""); }} title={editingMetricId ? "Edit metric" : "Add a metric"} eyebrow="Real-world measurement"><div className="form-stack"><Field label="Metric"><input data-modal-autofocus="true" maxLength={WORKSPACE_TEXT_LIMITS.metricLabel} value={metricLabel} onChange={(e) => setMetricLabel(e.target.value)} placeholder="Applications submitted" /></Field><div className="form-grid"><Field label="Target"><input type="number" min="0.0000000001" max={MAX_WORKSPACE_NUMBER} value={metricTarget} onChange={(e) => { const next = Number(e.target.value); setMetricTarget(isFiniteWorkspaceNumber(next, Number.MIN_VALUE) ? next : 0); setMetricError(""); }} /></Field><Field label="Unit"><input maxLength={WORKSPACE_TEXT_LIMITS.metricUnit} value={metricUnit} onChange={(e) => setMetricUnit(e.target.value)} placeholder="applications, £, sessions…" /></Field></div><Field label="Relative weight" hint={`Used when this ${goalTerm.toLowerCase()} has multiple metrics`}><input type="number" min="0" max="100" value={metricWeight} onChange={(e) => { const next = Number(e.target.value); setMetricWeight(isFiniteWorkspaceNumber(next, 0, 100) ? next : 0); setMetricError(""); }} /></Field>{goal.model === "consistency" && <Field label="Reset this count every"><select value={metricPeriod} onChange={(e) => setMetricPeriod(e.target.value as ConsistencyPeriod)}><option value="week">Week</option><option value="month">Month</option><option value="quarter">Quarter</option><option value="year">Year</option></select></Field>}{metricError && <p className="evidence-message" role="alert">{metricError}</p>}<div className="button-row end"><Button variant="ghost" onClick={() => setMetricOpen(false)}>Cancel</Button><Button disabled={!metricLabel.trim() || !isFiniteWorkspaceNumber(metricTarget, Number.MIN_VALUE) || !isFiniteWorkspaceNumber(metricWeight, 0, 100)} onClick={saveMetric}><Save size={16} /> Save metric</Button></div></div></Modal>
     <Modal open={goalEditOpen} onClose={() => setGoalEditOpen(false)} title={`Edit ${goalTerm.toLowerCase()}`} eyebrow="Direction and connections" wide><div className="form-stack"><Field label={`${goalTerm} title`}><input data-modal-autofocus="true" maxLength={WORKSPACE_TEXT_LIMITS.goalTitle} value={editTitle} onChange={(e) => setEditTitle(e.target.value)} /></Field><Field label="Why this matters"><textarea rows={3} maxLength={WORKSPACE_TEXT_LIMITS.goalDescription} value={editDescription} onChange={(e) => setEditDescription(e.target.value)} /></Field><div className="form-grid thirds"><Field label={`Life ${areaTerm.toLowerCase()}`}><select value={editAreaId} onChange={(e) => setEditAreaId(e.target.value)}>{state.areas.filter((item) => (!item.archived && !item.hidden) || item.id === editAreaId).map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></Field><Field label="Progress model"><select value={editModel} onChange={(e) => setEditModel(e.target.value as GoalModel)}><option value="numeric">Numeric metrics</option><option value="weighted">Weighted {terms.milestones.toLowerCase()}</option><option value="consistency">Consistency period</option><option value="open">Open reflection</option></select></Field><Field label="Importance"><select value={editPriority} onChange={(e) => setEditPriority(e.target.value as Priority)}><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option><option value="critical">Critical</option></select></Field></div><Field label="Target date" hint="Optional"><input type="date" value={editTargetDate} onChange={(e) => setEditTargetDate(e.target.value)} /></Field>{editModel !== goal.model && <p className="setting-note">Changing the model keeps compatible structures and permanent history. Review the new model after saving so it reflects the outcome honestly.</p>}{goalEditProgressIssue && <div className="setting-note" role="alert"><p>{goalEditProgressIssue} Add or reweight a measurement before saving this progress model.</p>{!goal.metrics.length && <Button variant="secondary" onClick={() => { setGoalEditOpen(false); openMetric(); }}><Plus size={15} /> Add measurement</Button>}</div>}<FieldGroup label={`Connected ${terms.stats.toLowerCase()}`}><div className="quality-list">{state.stats.filter((item) => !item.archived || editStatIds.includes(item.id)).map((stat) => { const selected = editStatIds.includes(stat.id); return <button type="button" key={stat.id} className={selected ? "selected" : ""} aria-pressed={selected} onClick={() => setEditStatIds((current) => selected ? current.filter((id) => id !== stat.id) : [...current, stat.id])}><i style={{ background: stat.color }} /><span>{stat.name}</span>{selected && <Check size={15} aria-hidden="true" />}</button>; })}</div></FieldGroup><div className="button-row end"><Button variant="ghost" onClick={() => setGoalEditOpen(false)}>Cancel</Button><Button disabled={!editTitle.trim() || !editDescription.trim() || !editAreaId || Boolean(goalEditProgressIssue)} onClick={saveGoalEdit}><Save size={16} /> Save {goalTerm.toLowerCase()}</Button></div></div></Modal>
   </div>;
