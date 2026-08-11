@@ -4,7 +4,7 @@ import { Suspense, useMemo, useState } from "react";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { Columns3, Goal as GoalIcon, LayoutGrid, List, Plus, Search } from "lucide-react";
-import { useApp } from "@/components/app-provider";
+import { useWorkspaceData } from "@/components/app-provider";
 import { GoalForm } from "@/components/goal-form";
 import { GoalCard } from "@/components/goal-card";
 import { Button, EmptyState, Pill, ProgressBar } from "@/components/ui";
@@ -17,7 +17,7 @@ type View = "cards" | "list" | "board";
 const boardColumns: GoalStatus[] = ["active", "paused", "completed"];
 
 function GoalsContent() {
-  const { state } = useApp();
+  const { state } = useWorkspaceData();
   const router = useRouter();
   const searchParams = useSearchParams();
   const [formOpen, setFormOpen] = useState(false);
@@ -68,9 +68,9 @@ function GoalsContent() {
           onChange={(event) => setStatus(event.target.value as GoalStatus | "all")}
           disabled={view === "board"}
           aria-label={`Filter ${terms.goals.pluralLower} by status`}
-          title={view === "board" ? `Board view shows every ${terms.goals.singularLower} status` : `Filter ${terms.goals.pluralLower} by status`}
+          title={view === "board" ? "Board view shows active workflow statuses; archived items stay in the archived list." : `Filter ${terms.goals.pluralLower} by status`}
         >
-          <option value="all">Every status</option>
+          <option value="all">{view === "board" ? "Active workflow statuses" : "Every status"}</option>
           <option value="active">Active</option>
           <option value="paused">Paused</option>
           <option value="completed">Completed</option>

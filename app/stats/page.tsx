@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { Activity, ArrowUpRight, BarChart3, CalendarRange, Sparkles } from "lucide-react";
 import { useState } from "react";
-import { useApp } from "@/components/app-provider";
+import { useWorkspaceData } from "@/components/app-provider";
 import { DynamicIcon } from "@/components/icons";
 import { Panel } from "@/components/ui";
 import { completionAreaShares, completionAttribution, metricEntryStatIds } from "@/lib/activity-attribution";
@@ -54,7 +54,7 @@ const formatDuration = (minutes: number) => {
 const goalFor = (goals: Goal[], goalId: string) => goals.find((goal) => goal.id === goalId);
 
 export default function StatsPage() {
-  const { state } = useApp();
+  const { state } = useWorkspaceData();
   const terms = terminologyForms(state.settings.terminology);
   const [windowDays, setWindowDays] = useState<30 | 90 | 365>(30);
   const [now] = useState(() => new Date());

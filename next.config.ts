@@ -1,6 +1,14 @@
 import type { NextConfig } from "next";
 
 const isProduction = process.env.NODE_ENV === "production";
+// A local `next start` is a production build served over HTTP. Upgrade only
+// on the HTTPS deployment target (or an explicitly equivalent host), otherwise
+// WebKit correctly upgrades local asset URLs to an unavailable TLS endpoint.
+const isHttpsDeployment = isProduction
+  && (
+    process.env.VERCEL === "1"
+    || process.env.EVOLVRA_FORCE_HTTPS === "true"
+  );
 // This server-only flag is set solely by the bounded local-Supabase CI job.
 // Deployed production builds continue to require HTTPS.
 const isCloudE2e = isProduction
@@ -56,7 +64,7 @@ const contentSecurityPolicy = [
   // Private PDF evidence is rendered from a short-lived object URL. Framing
   // the app itself remains prohibited by frame-ancestors and X-Frame-Options.
   "frame-src 'self' blob:",
-  ...(isProduction && !configuredSupabase.usesInsecureLoopback ? ["upgrade-insecure-requests"] : []),
+  ...(isHttpsDeployment && !configuredSupabase.usesInsecureLoopback ? ["upgrade-insecure-requests"] : []),
 ].join("; ");
 
 const securityHeaders = [

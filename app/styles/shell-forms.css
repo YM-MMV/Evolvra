@@ -127,5 +127,34 @@ input[type="range"] { min-height: auto; padding: 0; accent-color: var(--accent);
 .quality-list button i { width: 7px; height: 7px; border-radius: 50%; box-shadow: 0 0 8px currentColor; }
 .quality-list button span { overflow: hidden; font-size: 11px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
 .quality-list button svg { color: var(--accent); }
+.metric-default-list { display: grid; gap: 8px; }
+.metric-default-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(160px, .7fr);
+  align-items: end;
+  gap: 12px;
+  padding: 11px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--bg-soft);
+}
+.metric-default-row.selected {
+  border-color: color-mix(in srgb, var(--accent) 48%, var(--line));
+  background: var(--accent-soft);
+}
+.metric-default-toggle {
+  min-height: 42px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  cursor: pointer;
+}
+.metric-default-toggle input { width: 16px; height: 16px; accent-color: var(--accent); }
+.metric-default-toggle span,
+.metric-default-toggle strong,
+.metric-default-toggle small { min-width: 0; display: block; }
+.metric-default-toggle strong { overflow: hidden; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.metric-default-toggle small { margin-top: 3px; color: var(--muted); font-size: 10px; }
+.metric-default-row .field { margin: 0; }
 .color-input { display: grid; grid-template-columns: 45px 1fr; gap: 7px; }
 .icon-preview { display: flex; align-items: center; gap: 10px; align-self: flex-start; padding: 12px 15px; border-radius: 12px; }

@@ -5,7 +5,6 @@ import {
   AppActionsProvider,
   ProviderStatusProvider,
   WorkspaceDataProvider,
-  type AppActionsContextValue,
   type AppContextValue,
   type AnonymousWorkspaceHandoff,
   type LocalWorkspaceConflict,
@@ -15,6 +14,7 @@ import {
   type WorkspaceDataContextValue,
 } from "@/components/app-context";
 import { useProviderAuth } from "@/components/use-provider-auth";
+import { useStableAppActions } from "@/components/use-stable-app-actions";
 import { EMPTY_STATE } from "@/lib/defaults";
 import {
   adoptExistingAccountErasureFence,
@@ -30,21 +30,31 @@ import {
   type ProviderDomainActions,
 } from "@/lib/provider-command-bindings";
 import {
-  appendEvidenceBlobCopies,
-  EvidenceCompensationError,
-  rollbackEvidenceBlobJournal,
-  type EvidenceBlobJournalEntry,
-} from "@/lib/evidence-operation-journal";
-import {
   createGoalEvidenceActions,
+  GoalEvidenceCloudSaveAmbiguousError,
+  GoalEvidenceLocalCommitRetainedError,
+  saveGoalEvidenceCloudMetadataWithVerification,
   type GoalEvidenceOperationScope,
 } from "@/lib/provider-goal-evidence";
+import { normalizedEvidenceBlob } from "@/lib/goal-evidence";
 import {
   disableLocalBootstrapLegacyImport,
   LocalBootstrapSupersededError,
   observeLegacyWorkspace,
   runLocalWorkspaceBootstrap,
 } from "@/lib/provider-local-bootstrap";
+import {
+  planProviderAccountHandoff,
+  runProviderCloudReconciliation,
+  type ProviderPreparedRemote,
+} from "@/lib/provider-cloud-reconciliation";
+import {
+  createCompletePortableArchive,
+  type PortableArchiveOperationBoundary,
+} from "@/lib/provider-portable-archive";
+import { runProviderCloudSave } from "@/lib/provider-cloud-save";
+import { runClaimedRemoteEvidenceCleanup } from "@/lib/provider-remote-evidence-cleanup";
+import { runAuthoritativeWorkspaceReplacement } from "@/lib/provider-workspace-replacement";
 import {
   workspaceNoticeForActiveAccount,
   type SyncStatus,
@@ -53,6 +63,7 @@ import {
   externalizeEmbeddedEvidence,
   externalizeWorkspaceHistory,
   portableWorkspaceState,
+  remoteEvidencePath,
   rollbackEvidenceWrites,
   rollbackExternalizedEvidence,
   type StagedEvidenceWrite,
@@ -66,26 +77,49 @@ import {
   workspaceStatesEqual,
 } from "@/lib/provider-state";
 import {
+  inspectAndPreparePortableWorkspaceArchiveImport,
+  type PortableWorkspaceArchiveImportPlan,
+} from "@/lib/portable-workspace-archive";
+import {
+  applyAccountHandoffPersistence,
+  applyPortableArchivePersistence,
+  cancelEvidenceCleanupIntent,
   captureLegacyWorkspaceImport,
+  cleanupAbandonedEvidenceStaging,
   commitLegacyWorkspaceImport,
   deleteAccountPersistence,
-  deleteEvidenceBlob,
+  deleteAccountPersistenceAtRevision,
+  deleteEvidenceBlobs,
   disableLegacyWorkspaceImport,
   eraseAccountPersistenceWithTombstone,
   listEvidenceBlobs,
+  listEvidenceCleanupIntents,
+  markEvidenceCleanupRemoteComplete,
   readEvidenceBlob,
+  readAccountPersistenceBackupBoundary,
   readAccountPersistenceScope,
+  recoverLocalEvidenceCleanupIntents,
   readRawWorkspace,
   readWorkspaceWithScope,
+  quarantinedWorkspaceLocalRevision,
   replaceWorkspaceAfterRecoveryChoice,
+  rollbackStagedEvidenceBlob,
+  restoreEvidenceBlobs,
+  stageEvidenceBlob,
+  stageEvidenceCleanupIntent,
   storeEvidenceBlob,
   writeWorkspace,
   AccountPersistenceScopeError,
   LocalWorkspaceConflictError,
   PersistenceError,
+  type AccountPersistenceEraseResult,
+  type AccountPersistenceBackupBoundary,
   type AccountPersistenceScope,
+  type EvidenceBlobRecord,
   type PersistenceScopeGeneration,
+  type StagedEvidenceBlobWrite,
   type WorkspaceEnvelope,
+  type WorkspaceWriteOptions,
   LEGACY_WORKSPACE_STORAGE_KEY,
   workspaceKey,
 } from "@/lib/persistence";
@@ -98,19 +132,19 @@ import {
   WorkspaceImportError,
 } from "@/lib/state-schema";
 import {
+  claimPrivateEvidenceCleanup,
   getSupabase,
+  listPrivateEvidencePaths,
+  readAccountErasureBackupBoundary,
   saveWorkspaceSnapshotWithDeadline,
   supabaseConfigured,
 } from "@/lib/supabase";
+import type { AccountErasureCloudBackupBoundary } from "@/lib/account-erasure-checkpoint";
 import {
   canWriteCloud,
   canPersistWorkspaceAutomatically,
-  decideAccountHandoffSource,
   decideAccountSwitch,
-  decideAnonymousHandoff,
   decideConflictResolution,
-  decideRemoteMigrationCompletion,
-  decideSyncReconciliation,
   hasMeaningfulWorkspace,
   isWorkspaceRevisionConflict,
   nextWorkspaceScopeKey,
@@ -149,6 +183,61 @@ interface RemoteSnapshot {
   createdEvidence: StagedEvidenceWrite[];
 }
 
+interface PortableArchiveBoundary extends PortableArchiveOperationBoundary {
+  activeAccountId: string | null;
+  workspaceGeneration: WorkspaceScopeKey;
+  workspaceScopeKey: WorkspaceScopeKey;
+  localChangeVersion: number;
+}
+
+interface PreparedPortableArchiveImport {
+  token: string;
+  boundary: PortableArchiveBoundary;
+  importedAt: string;
+  plan: PortableWorkspaceArchiveImportPlan;
+}
+
+interface PreparedPortableArchiveReset {
+  token: string;
+  boundary: PortableArchiveBoundary;
+  localBoundary: AccountPersistenceBackupBoundary;
+  cloudBackupBoundary: AccountErasureCloudBackupBoundary | null;
+}
+
+function mutableRemoteSnapshot(
+  remote: ProviderPreparedRemote<AppState, StagedEvidenceWrite>,
+): RemoteSnapshot {
+  return {
+    ...remote,
+    createdEvidence: [...remote.createdEvidence],
+  };
+}
+
+function cloudBackupBoundariesEqual(
+  left: AccountErasureCloudBackupBoundary,
+  right: AccountErasureCloudBackupBoundary,
+): boolean {
+  return left.workspaceRevision === right.workspaceRevision
+    && left.evidenceRevision === right.evidenceRevision;
+}
+
+function localBackupBoundariesEqual(
+  left: AccountPersistenceBackupBoundary,
+  right: AccountPersistenceBackupBoundary,
+): boolean {
+  return left.accountId === right.accountId
+    && left.generation === right.generation
+    && left.workspaceLocalRevision === right.workspaceLocalRevision
+    && left.evidenceRevision === right.evidenceRevision;
+}
+
+function stringSetsEqual(left: readonly string[], right: readonly string[]): boolean {
+  if (left.length !== right.length) return false;
+  const orderedLeft = [...left].sort();
+  const orderedRight = [...right].sort();
+  return orderedLeft.every((value, index) => value === orderedRight[index]);
+}
+
 export { remoteEvidencePath } from "@/lib/provider-evidence";
 export { workspaceStatesEqual } from "@/lib/provider-state";
 export {
@@ -159,6 +248,46 @@ export {
 } from "@/components/app-context";
 
 const clone = cloneWorkspaceValue;
+const ABANDONED_EVIDENCE_STAGING_AGE_MS = 24 * 60 * 60 * 1000;
+
+const abandonedEvidenceStagingCutoff = () => new Date(
+  Date.now() - ABANDONED_EVIDENCE_STAGING_AGE_MS,
+).toISOString();
+
+function commitAuthoritativeWorkspaceReplacement<TResult>({
+  accountId,
+  persistenceGeneration,
+  sourceStates,
+  targetStates,
+  persistTarget,
+}: {
+  accountId: string;
+  persistenceGeneration: PersistenceScopeGeneration;
+  sourceStates: readonly AppState[];
+  targetStates: readonly AppState[];
+  persistTarget: () => Promise<TResult>;
+}) {
+  return runAuthoritativeWorkspaceReplacement({
+    accountId,
+    sourceStates,
+    targetStates,
+  }, {
+    listLocalEvidence: (targetAccountId) => listEvidenceBlobs(
+      targetAccountId,
+      undefined,
+      persistenceGeneration,
+    ),
+    stageCleanup: (input) => stageEvidenceCleanupIntent(
+      input,
+      persistenceGeneration,
+    ),
+    cancelCleanup: (intent) => cancelEvidenceCleanupIntent(
+      intent,
+      persistenceGeneration,
+    ),
+    persistTarget,
+  });
+}
 
 export function AppProvider({ children }: { children: React.ReactNode }) {
   const [state, setState] = useState<AppState>(EMPTY_STATE);
@@ -208,6 +337,31 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const localWriteQueues = useRef(new Map<string, Promise<void>>());
   const recoveryNotice = useRef<string | null>(null);
   const latestState = useRef(state);
+  const preparedPortableArchiveImport = useRef<PreparedPortableArchiveImport | null>(null);
+  const preparedPortableArchiveReset = useRef<PreparedPortableArchiveReset | null>(null);
+
+  useEffect(() => {
+    const prepared = preparedPortableArchiveImport.current;
+    if (
+      prepared
+      && (
+        prepared.boundary.workspaceScopeKey !== workspaceScopeKeyRef.current
+        || prepared.boundary.localChangeVersion !== localChangeVersion.current
+      )
+    ) {
+      preparedPortableArchiveImport.current = null;
+    }
+    const reset = preparedPortableArchiveReset.current;
+    if (
+      reset
+      && (
+        reset.boundary.workspaceScopeKey !== workspaceScopeKeyRef.current
+        || reset.boundary.localChangeVersion !== localChangeVersion.current
+      )
+    ) {
+      preparedPortableArchiveReset.current = null;
+    }
+  }, [state, workspaceScopeKey]);
 
   const observeAuthBoundary = useCallback((observedAccountId: string | null) => {
     if (activeAccount.current !== observedAccountId) {
@@ -247,6 +401,39 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const reportPersistenceError = useCallback((message: string) => {
     setPersistenceError(message);
   }, []);
+
+  const capturePortableArchiveBoundary = (): PortableArchiveBoundary => {
+    const accountId = persistenceAccountId(activeAccount.current);
+    const generation = persistenceScopeGenerations.current.get(accountId);
+    if (generation === undefined) {
+      throw new Error("The account persistence scope has not been loaded.");
+    }
+    return {
+      accountId,
+      authenticatedAccountId: authenticatedUserId.current,
+      persistenceGeneration: generation,
+      activeAccountId: activeAccount.current,
+      workspaceGeneration: workspaceGeneration.current,
+      workspaceScopeKey: workspaceScopeKeyRef.current,
+      localChangeVersion: localChangeVersion.current,
+    };
+  };
+
+  const portableArchiveBoundaryIsCurrent = (
+    boundary: PortableArchiveBoundary,
+    allowClosedWriterBarrier = false,
+  ) => (
+    boundary.activeAccountId === activeAccount.current
+    && boundary.authenticatedAccountId === authenticatedUserId.current
+    && boundary.accountId === persistenceAccountId(activeAccount.current)
+    && boundary.persistenceGeneration
+      === persistenceScopeGenerations.current.get(boundary.accountId)
+    && boundary.workspaceGeneration === workspaceGeneration.current
+    && boundary.workspaceScopeKey === workspaceScopeKeyRef.current
+    && boundary.localChangeVersion === localChangeVersion.current
+    && terminalErasureAccount.current === null
+    && (allowClosedWriterBarrier || !accountSwitching.current)
+  );
 
   const localPersistenceIsPending = useCallback(() => {
     const pending = localPersistencePending.current;
@@ -288,6 +475,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
   const persistWorkspace = useCallback((
     envelope: Omit<WorkspaceEnvelope, "localRevision">,
+    stagedEvidence: readonly StagedEvidenceBlobWrite[] = [],
+    options: WorkspaceWriteOptions = {},
   ): Promise<WorkspaceEnvelope> => {
     const accountId = envelope.accountId;
     const scopeGeneration = persistenceScopeGenerations.current.get(accountId);
@@ -302,7 +491,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       const saved = await writeWorkspace({
         ...envelope,
         localRevision: expectedLocalRevisions.current.get(accountId) ?? 0,
-      }, scopeGeneration);
+      }, scopeGeneration, stagedEvidence, options);
       expectedLocalRevisions.current.set(accountId, saved.localRevision);
       return saved;
     }).catch((error: unknown) => {
@@ -334,6 +523,53 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     });
     return operation;
   }, [quarantineLocalConflict]);
+
+  const recoverRemoteEvidenceCleanup = useCallback(async (
+    accountId: string,
+  ) => {
+    const generation = persistenceScopeGenerations.current.get(accountId);
+    if (generation === undefined) return;
+    await recoverLocalEvidenceCleanupIntents(accountId, generation);
+    const intents = await listEvidenceCleanupIntents(accountId, generation);
+    if (!intents.length) return;
+    const supabase = getSupabase();
+    const bucket = supabase?.storage.from("evidence");
+    if (!supabase || !bucket) return;
+    for (const intent of intents) {
+      if (!intent.remotePath) continue;
+      await runClaimedRemoteEvidenceCleanup({
+        claimCleanup: async () => {
+          if (
+            authenticatedUserId.current !== accountId
+            || activeAccount.current !== accountId
+            || accountSwitching.current
+          ) {
+            throw new Error("The active cloud account changed before evidence cleanup could be claimed.");
+          }
+          const claim = await claimPrivateEvidenceCleanup(
+            supabase,
+            accountId,
+            [intent.remotePath!],
+          );
+          if (
+            authenticatedUserId.current !== accountId
+            || activeAccount.current !== accountId
+            || accountSwitching.current
+          ) {
+            throw new Error("The active cloud account changed while evidence cleanup was being claimed.");
+          }
+          return claim.kind;
+        },
+        cancelCleanup: () => cancelEvidenceCleanupIntent(intent, generation),
+        removeRemote: async () => {
+          const removal = await bucket.remove([intent.remotePath!]);
+          if (removal.error) throw removal.error;
+        },
+        completeCleanup: () => markEvidenceCleanupRemoteComplete(intent, generation),
+      });
+    }
+    await recoverLocalEvidenceCleanupIntents(accountId, generation);
+  }, []);
 
   const readTrackedWorkspace = useCallback(async (accountId: string) => {
     await localWriteQueues.current.get(accountId);
@@ -445,7 +681,11 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         readRawWorkspace,
         captureLegacyWorkspaceImport,
         commitLegacyWorkspaceImport,
-        persistWorkspace: async ({ envelope, expectedScopeGeneration }) => {
+        persistWorkspace: async ({
+          envelope,
+          expectedScopeGeneration,
+          stagedEvidence,
+        }) => {
           ensureCurrent();
           if (
             persistenceScopeGenerations.current.get(envelope.accountId)
@@ -453,7 +693,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           ) {
             throw new LocalBootstrapSupersededError();
           }
-          return persistWorkspace(envelope);
+          return persistWorkspace(envelope, stagedEvidence);
         },
         externalizeEmbeddedEvidence: ({ state: nextState, accountId, expectedScopeGeneration }) =>
           externalizeEmbeddedEvidence(nextState, accountId, expectedScopeGeneration),
@@ -479,6 +719,28 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           result.scope.generation,
         );
         setPersistenceScopeGeneration(result.scope.generation);
+        try {
+          // Signed-in cleanup waits until reconciliation proves the exact
+          // cloud metadata. This preserves device-only bytes across an
+          // ambiguous metadata-save response.
+          if (result.accountId === persistenceAccountId(null)) {
+            await recoverLocalEvidenceCleanupIntents(
+              result.accountId,
+              result.scope.generation,
+            );
+          }
+          await cleanupAbandonedEvidenceStaging(
+            result.accountId,
+            result.scope.generation,
+            abandonedEvidenceStagingCutoff(),
+          );
+          ensureCurrent();
+        } catch (error) {
+          if (error instanceof LocalBootstrapSupersededError) throw error;
+          setPersistenceError(error instanceof Error
+            ? `Old incomplete file staging could not be cleaned up yet: ${error.message}`
+            : "Old incomplete file staging could not be cleaned up yet.");
+        }
       }
 
       if (result.kind === "loaded") {
@@ -697,6 +959,24 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         const destination = await readTrackedWorkspace(nextPersistenceAccountId);
         const envelope = destination.workspace;
         if (cancelled || generation !== workspaceGeneration.current) return;
+        try {
+          if (nextAccount === null) {
+            await recoverLocalEvidenceCleanupIntents(
+              nextPersistenceAccountId,
+              destination.scope.generation,
+            );
+          }
+          await cleanupAbandonedEvidenceStaging(
+            nextPersistenceAccountId,
+            destination.scope.generation,
+            abandonedEvidenceStagingCutoff(),
+          );
+        } catch (error) {
+          setPersistenceError(error instanceof Error
+            ? `Old incomplete file staging could not be cleaned up yet: ${error.message}`
+            : "Old incomplete file staging could not be cleaned up yet.");
+        }
+        if (cancelled || generation !== workspaceGeneration.current) return;
         setQuarantinedRecovery(null);
         if (destination.scope.tombstoned) {
           const emptyState = clone(EMPTY_STATE);
@@ -787,6 +1067,21 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             : envelope.dirty || recovered.changed;
           nextRevision = envelope.revision;
           nextServerUpdatedAt = envelope.serverUpdatedAt;
+          if (recovered.changed) {
+            await persistWorkspace({
+              accountId: envelope.accountId,
+              state: recovered.state,
+              history: recovered.history,
+              dirty: nextDirty,
+              revision: envelope.revision,
+              serverUpdatedAt: envelope.serverUpdatedAt,
+              savedAt: new Date().toISOString(),
+              ...(envelope.anonymousHandoff
+                ? { anonymousHandoff: envelope.anonymousHandoff }
+                : {}),
+            }, recovered.createdEvidence);
+          }
+          stagedEvidenceCommitted = true;
         }
 
         // Keep the displayed account authoritative until the destination has
@@ -822,7 +1117,6 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         recoveryNotice.current = nextRecoveryMessage;
         setPersistenceError(nextRecoveryMessage);
         setState(nextState);
-        stagedEvidenceCommitted = Boolean(stagedDestinationEvidence);
         advanceWorkspaceScope("account-switch");
         setCanUndo(nextHistory.length > 0);
         setSyncStatus(accountIsQuarantined(nextPersistenceAccountId)
@@ -917,273 +1211,262 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       && !pendingAccountHandoff.current
       && !accountSwitching.current
       && !localConflictAccounts.current.has(persistenceAccountId(syncAccountId));
-    const saveSnapshot = async (snapshot: AppState, expectedRevision: number) => {
-      const { data, error } = await saveWorkspaceSnapshotWithDeadline(
-        supabase,
-        snapshot,
-        expectedRevision,
-      );
-      if (error) throw error;
-      const row = Array.isArray(data) ? data[0] : data;
-      const savedRevision = parseWorkspaceRevision(row?.revision);
-      if (!row || savedRevision === null || typeof row.updated_at !== "string") throw new Error("Private sync returned an invalid revision response.");
-      return {
-        state: migrateStoredState(row.state),
-        revision: savedRevision,
-        updatedAt: row.updated_at,
-        needsSave: false,
-        createdEvidence: [],
-      } satisfies RemoteSnapshot;
-    };
-    const finishSave = (
-      saved: RemoteSnapshot,
-      saveVersion: number,
-      stateToAdopt?: AppState,
-    ) => {
-      if (!isCurrentAccount()) return;
-      const localUnchanged = localChangeVersion.current === saveVersion;
-      revision.current = saved.revision;
-      serverUpdatedAt.current = saved.updatedAt;
-      remoteLoaded.current = true;
-      reconciledAccount.current = syncAccountId;
-      if (stateToAdopt && localUnchanged) {
-        adoptRemoteWorkspace(stateToAdopt);
-      }
-      if (localUnchanged) dirty.current = false;
-      setMetadataEpoch((value) => value + 1);
-      setSyncStatus(localUnchanged ? "synced" : "saving");
-    };
     const reconcile = async () => {
-      let stagedRemoteEvidence: StagedEvidenceWrite[] = [];
-      let retainRemoteEvidence = false;
-      try {
-        if (
-          !isCurrentAccount()
-          || reconciliationScopeKey !== workspaceScopeKeyRef.current
-        ) return;
-        setSyncStatus("connecting");
-        const { data, error } = await supabase
-          .from("workspace_snapshots")
-          .select("state,revision,updated_at")
-          .eq("user_id", syncAccountId)
-          .maybeSingle();
-        if (!isCurrentAccount()) return;
-        if (error) {
-          setSyncStatus("error");
-          return;
-        }
-
-        const initialDecision = decideSyncReconciliation({
-          remoteExists: Boolean(data?.state),
-          remoteRevision: data?.revision,
-          localRevision: revision.current,
-          localDirty: dirty.current,
-        });
-        if (initialDecision.action === "upload-initial") {
-          setSyncStatus("saving");
-          const saveVersion = localChangeVersion.current;
-          const saved = await saveSnapshot(latestState.current, initialDecision.expectedRevision);
-          finishSave(saved, saveVersion);
-          return;
-        }
-
-        if (initialDecision.action === "invalid-revision" || !data?.state) {
-          setSyncStatus("error");
-          setPersistenceError(`Private sync returned an invalid ${initialDecision.action === "invalid-revision" ? initialDecision.source : "remote"} workspace revision. Your device copy has not been overwritten.`);
-          return;
-        }
-
-        const parsedRemoteRevision = parseWorkspaceRevision(data.revision);
-        if (parsedRemoteRevision === null) return;
-        const syncPersistenceGeneration = persistenceScopeGenerations.current.get(
-          persistenceAccountId(syncAccountId),
-        );
-        if (syncPersistenceGeneration === undefined) {
-          throw new Error("The account persistence scope changed before cloud reconciliation could begin.");
-        }
-        let recovered: Awaited<ReturnType<typeof externalizeEmbeddedEvidence>>;
-        try {
-          recovered = await externalizeEmbeddedEvidence(
-            migrateStoredState(data.state),
+      const outcome = await runProviderCloudReconciliation(
+        {
+          accountId: syncAccountId,
+          persistenceAccountId: persistenceAccountId(syncAccountId),
+          workspaceGeneration: generation,
+          workspaceScopeKey: reconciliationScopeKey,
+          persistenceGeneration: persistenceScopeGenerations.current.get(
             persistenceAccountId(syncAccountId),
-            syncPersistenceGeneration,
-          );
-        } catch (error) {
-          if (isCurrentAccount()) {
-            if (error instanceof UnsupportedStoredWorkspaceVersionError) {
-              quarantinedAccounts.current.add(persistenceAccountId(syncAccountId));
-              remoteLoaded.current = false;
-              reconciledAccount.current = null;
-              setCloudWriteAllowed(false);
-              setPersistenceError("This cloud workspace was created by a newer Evolvra version. Update the app before syncing so that newer data is not overwritten.");
-            } else if (error instanceof WorkspaceImportError) {
-              quarantinedAccounts.current.add(persistenceAccountId(syncAccountId));
-              remoteLoaded.current = false;
-              reconciledAccount.current = null;
-              setCloudWriteAllowed(false);
-              setPersistenceError("This cloud workspace failed structural validation and was quarantined. Your validated device copy was not overwritten.");
-            } else {
-              setPersistenceError("A legacy evidence file could not be moved into protected file storage. Export a backup before retrying sync.");
-            }
-            setSyncStatus("error");
-          }
-          return;
-        }
-        stagedRemoteEvidence = recovered.createdEvidence;
-        if (!isCurrentAccount()) return;
-
-        const remote: RemoteSnapshot = {
-          state: recovered.state,
-          revision: parsedRemoteRevision,
-          updatedAt: typeof data.updated_at === "string" ? data.updated_at : new Date().toISOString(),
-          needsSave: recovered.changed
-            || (data.state as { version?: unknown }).version !== CURRENT_STATE_VERSION
-            || !workspaceStatesEqual(data.state as unknown as AppState, recovered.state),
-          createdEvidence: recovered.createdEvidence,
-        };
-        const decision = decideSyncReconciliation({
-          remoteExists: true,
-          remoteRevision: remote.revision,
-          localRevision: revision.current,
-          localDirty: dirty.current,
-          localMatchesRemote: workspaceStatesEqual(latestState.current, remote.state),
-        });
-
-        if (decision.action === "invalid-revision") {
-          await rollbackEvidenceWrites(remote.createdEvidence);
-          stagedRemoteEvidence = [];
-          setSyncStatus("error");
-          setPersistenceError(`Private sync found an invalid ${decision.source} workspace revision. Your device copy has not been overwritten.`);
-          return;
-        }
-        if (decision.action === "conflict") {
-          retainRemoteEvidence = true;
-          remoteConflict.current = remote;
-          setCloudWriteAllowed(false);
-          setSyncConflict({
-            remoteUpdatedAt: remote.updatedAt,
-            localUpdatedAt: latestState.current.updatedAt,
-          });
-          setSyncStatus("conflict");
-          return;
-        }
-        if (decision.action === "upload-local") {
-          await rollbackEvidenceWrites(remote.createdEvidence);
-          stagedRemoteEvidence = [];
-          setSyncStatus("saving");
-          const saveVersion = localChangeVersion.current;
-          const saved = await saveSnapshot(latestState.current, decision.expectedRevision);
-          finishSave(saved, saveVersion);
-          return;
-        }
-        if (decision.action === "acknowledge-remote") {
-          let acknowledgedRemote = remote;
-          if (remote.needsSave) {
-            setSyncStatus("saving");
-            const saveVersion = localChangeVersion.current;
-            const saved = await saveSnapshot(remote.state, remote.revision);
-            if (!isCurrentAccount()) return;
-            acknowledgedRemote = {
-              ...saved,
-              createdEvidence: remote.createdEvidence,
-            };
+          ),
+        },
+        {
+          inspectCurrentness: (boundary) => {
             if (
-              decideRemoteMigrationCompletion(saveVersion, localChangeVersion.current)
-              === "conflict"
+              boundary.workspaceGeneration !== workspaceGeneration.current
+              || boundary.workspaceScopeKey !== workspaceScopeKeyRef.current
+              || boundary.persistenceGeneration
+                !== persistenceScopeGenerations.current.get(
+                  boundary.persistenceAccountId,
+                )
             ) {
-              retainRemoteEvidence = true;
-              remoteLoaded.current = false;
-              reconciledAccount.current = null;
-              remoteConflict.current = acknowledgedRemote;
-              setCloudWriteAllowed(false);
-              setSyncConflict({
-                remoteUpdatedAt: acknowledgedRemote.updatedAt,
-                localUpdatedAt: latestState.current.updatedAt,
-              });
-              setSyncStatus("conflict");
-              return;
+              return { current: false, reason: "scope" };
             }
-          }
-          revision.current = acknowledgedRemote.revision;
-          serverUpdatedAt.current = acknowledgedRemote.updatedAt;
-          remoteLoaded.current = true;
-          reconciledAccount.current = syncAccountId;
-          dirty.current = false;
-          retainRemoteEvidence = true;
-          setMetadataEpoch((value) => value + 1);
-          setSyncStatus("synced");
-          return;
+            if (activeAccount.current !== boundary.accountId) {
+              return { current: false, reason: "account" };
+            }
+            if (pendingAccountHandoff.current) {
+              return { current: false, reason: "handoff" };
+            }
+            if (accountSwitching.current) {
+              return { current: false, reason: "switch" };
+            }
+            if (
+              localConflictAccounts.current.has(
+                boundary.persistenceAccountId,
+              )
+            ) {
+              return { current: false, reason: "local-conflict" };
+            }
+            return { current: true };
+          },
+          readLocal: () => ({
+            state: latestState.current,
+            revision: revision.current,
+            dirty: dirty.current,
+            changeVersion: localChangeVersion.current,
+          }),
+          fetchRemote: async (accountId) => {
+            const { data, error } = await supabase
+              .from("workspace_snapshots")
+              .select("state,revision,updated_at")
+              .eq("user_id", accountId)
+              .maybeSingle();
+            return { data, error };
+          },
+          saveSnapshot: (snapshot, expectedRevision) =>
+            saveWorkspaceSnapshotWithDeadline(
+              supabase,
+              syncAccountId,
+              snapshot,
+              expectedRevision,
+            ),
+          migrateState: migrateStoredState,
+          prepareEvidence: externalizeEmbeddedEvidence,
+          rollbackEvidence: async (evidence) => {
+            await rollbackEvidenceWrites([...evidence]);
+          },
+          statesEqual: workspaceStatesEqual,
+          parseRevision: parseWorkspaceRevision,
+          isRevisionConflict: isWorkspaceRevisionConflict,
+          readStoredStateVersion: (stored) => (
+            typeof stored === "object"
+            && stored !== null
+            && "version" in stored
+              ? stored.version
+              : undefined
+          ),
+          currentStateVersion: CURRENT_STATE_VERSION,
+          now: () => new Date().toISOString(),
+          onPhase: setSyncStatus,
+        },
+      );
+      if (
+        outcome.kind === "superseded"
+        || !isCurrentAccount()
+        || reconciliationScopeKey !== workspaceScopeKeyRef.current
+      ) return;
+
+      if (outcome.kind === "remote-read-error") {
+        setSyncStatus("error");
+        return;
+      }
+      if (outcome.kind === "invalid-revision") {
+        setSyncStatus("error");
+        setPersistenceError(
+          `Private sync ${outcome.phase === "initial" ? "returned" : "found"} an invalid ${outcome.source} workspace revision. Your device copy has not been overwritten.`,
+        );
+        return;
+      }
+      if (outcome.kind === "preparation-error") {
+        if (outcome.error instanceof UnsupportedStoredWorkspaceVersionError) {
+          quarantinedAccounts.current.add(persistenceAccountId(syncAccountId));
+          remoteLoaded.current = false;
+          reconciledAccount.current = null;
+          setCloudWriteAllowed(false);
+          setPersistenceError("This cloud workspace was created by a newer Evolvra version. Update the app before syncing so that newer data is not overwritten.");
+        } else if (outcome.error instanceof WorkspaceImportError) {
+          quarantinedAccounts.current.add(persistenceAccountId(syncAccountId));
+          remoteLoaded.current = false;
+          reconciledAccount.current = null;
+          setCloudWriteAllowed(false);
+          setPersistenceError("This cloud workspace failed structural validation and was quarantined. Your validated device copy was not overwritten.");
+        } else {
+          setPersistenceError("A legacy evidence file could not be moved into protected file storage. Export a backup before retrying sync.");
         }
-        if (decision.action === "use-remote" && remote.needsSave) {
-          setSyncStatus("saving");
-          const saveVersion = localChangeVersion.current;
-          const saved = await saveSnapshot(remote.state, remote.revision);
-          if (!isCurrentAccount()) return;
-          if (
-            decideRemoteMigrationCompletion(saveVersion, localChangeVersion.current)
-            === "conflict"
-          ) {
-            const concurrentRemote: RemoteSnapshot = {
-              ...saved,
-              createdEvidence: remote.createdEvidence,
-            };
-            retainRemoteEvidence = true;
-            remoteLoaded.current = false;
-            reconciledAccount.current = null;
-            remoteConflict.current = concurrentRemote;
-            setCloudWriteAllowed(false);
-            setSyncConflict({
-              remoteUpdatedAt: concurrentRemote.updatedAt,
-              localUpdatedAt: latestState.current.updatedAt,
-            });
-            setSyncStatus("conflict");
-            return;
-          }
-          finishSave(saved, saveVersion, remote.state);
-          retainRemoteEvidence = true;
-          return;
+        setSyncStatus("error");
+        return;
+      }
+      if (outcome.kind === "saved-local") {
+        revision.current = outcome.remote.revision;
+        serverUpdatedAt.current = outcome.remote.updatedAt;
+        remoteLoaded.current = true;
+        reconciledAccount.current = syncAccountId;
+        if (outcome.localUnchanged) dirty.current = false;
+        setMetadataEpoch((value) => value + 1);
+        setSyncStatus(outcome.localUnchanged ? "synced" : "saving");
+        if (outcome.localUnchanged) {
+          await recoverRemoteEvidenceCleanup(persistenceAccountId(syncAccountId));
         }
-        if (decision.action === "use-remote") {
-          revision.current = remote.revision;
-          serverUpdatedAt.current = remote.updatedAt;
-          remoteLoaded.current = true;
-          reconciledAccount.current = syncAccountId;
-          adoptRemoteWorkspace(remote.state);
-          retainRemoteEvidence = true;
-          setMetadataEpoch((value) => value + 1);
-          setSyncStatus("synced");
-        }
-      } catch (error) {
-        if (!isCurrentAccount()) return;
+        return;
+      }
+      if (outcome.kind === "conflict") {
+        const remote = mutableRemoteSnapshot(outcome.remote);
         remoteLoaded.current = false;
         reconciledAccount.current = null;
         setCloudWriteAllowed(false);
-        if (error instanceof UnsupportedStoredWorkspaceVersionError) {
+        remoteConflict.current = remote;
+        setSyncConflict({
+          remoteUpdatedAt: remote.updatedAt,
+          localUpdatedAt: latestState.current.updatedAt,
+        });
+        setSyncStatus("conflict");
+        return;
+      }
+      if (outcome.kind === "acknowledged") {
+        try {
+          await persistWorkspace({
+            accountId: persistenceAccountId(syncAccountId),
+            state: outcome.remote.state,
+            history: trimWorkspaceHistory(history.current.map(clone)),
+            dirty: outcome.remote.needsSave,
+            revision: outcome.remote.revision,
+            serverUpdatedAt: outcome.remote.updatedAt,
+            savedAt: new Date().toISOString(),
+          }, outcome.remote.createdEvidence);
+        } catch (error) {
+          await rollbackEvidenceWrites([...outcome.remote.createdEvidence]);
+          throw error;
+        }
+        if (!isCurrentAccount()) return;
+        revision.current = outcome.remote.revision;
+        serverUpdatedAt.current = outcome.remote.updatedAt;
+        remoteLoaded.current = true;
+        reconciledAccount.current = syncAccountId;
+        dirty.current = outcome.remote.needsSave;
+        setMetadataEpoch((value) => value + 1);
+        setSyncStatus(outcome.remote.needsSave ? "saving" : "synced");
+        if (!outcome.remote.needsSave) {
+          await recoverRemoteEvidenceCleanup(persistenceAccountId(syncAccountId));
+        }
+        return;
+      }
+      if (outcome.kind === "adopt-remote") {
+        const replacementAccountId = persistenceAccountId(syncAccountId);
+        const replacementPersistenceGeneration = persistenceScopeGenerations.current.get(
+          replacementAccountId,
+        );
+        if (replacementPersistenceGeneration === undefined) {
+          throw new Error("The account persistence scope changed before the cloud workspace could be adopted.");
+        }
+        const sourceState = clone(latestState.current);
+        const sourceHistory = trimWorkspaceHistory(history.current.map(clone));
+        const sourceChangeVersion = localChangeVersion.current;
+        try {
+          await commitAuthoritativeWorkspaceReplacement({
+            accountId: replacementAccountId,
+            persistenceGeneration: replacementPersistenceGeneration,
+            sourceStates: [sourceState, ...sourceHistory],
+            targetStates: [outcome.remote.state],
+            persistTarget: async () => {
+              if (
+                !isCurrentAccount()
+                || sourceChangeVersion !== localChangeVersion.current
+                || !workspaceStatesEqual(sourceState, latestState.current)
+              ) {
+                throw new Error("The device workspace changed before the cloud copy could be committed.");
+              }
+              return persistWorkspace({
+                accountId: replacementAccountId,
+                state: outcome.remote.state,
+                history: [],
+                dirty: outcome.remote.needsSave,
+                revision: outcome.remote.revision,
+                serverUpdatedAt: outcome.remote.updatedAt,
+                savedAt: new Date().toISOString(),
+              }, outcome.remote.createdEvidence, {
+                removeUnreferencedEvidence: true,
+              });
+            },
+          });
+        } catch (error) {
+          await rollbackEvidenceWrites([...outcome.remote.createdEvidence]);
+          throw error;
+        }
+        if (
+          !isCurrentAccount()
+          || sourceChangeVersion !== localChangeVersion.current
+        ) return;
+        revision.current = outcome.remote.revision;
+        serverUpdatedAt.current = outcome.remote.updatedAt;
+        remoteLoaded.current = true;
+        reconciledAccount.current = syncAccountId;
+        dirty.current = outcome.remote.needsSave;
+        adoptRemoteWorkspace(outcome.remote.state);
+        setMetadataEpoch((value) => value + 1);
+        setSyncStatus(outcome.remote.needsSave ? "saving" : "synced");
+        if (!outcome.remote.needsSave) {
+          await recoverRemoteEvidenceCleanup(persistenceAccountId(syncAccountId));
+        }
+        return;
+      }
+
+      remoteLoaded.current = false;
+      reconciledAccount.current = null;
+      setCloudWriteAllowed(false);
+      if (outcome.kind === "error") {
+        if (outcome.error instanceof UnsupportedStoredWorkspaceVersionError) {
           quarantinedAccounts.current.add(persistenceAccountId(syncAccountId));
           setPersistenceError("Private sync returned a workspace created by a newer Evolvra version. No device or cloud data was overwritten.");
           setSyncStatus("error");
           return;
         }
-        if (error instanceof WorkspaceImportError) {
+        if (outcome.error instanceof WorkspaceImportError) {
           quarantinedAccounts.current.add(persistenceAccountId(syncAccountId));
           setPersistenceError("Private sync returned a structurally invalid workspace. It was quarantined and no device or cloud data was overwritten.");
           setSyncStatus("error");
           return;
         }
-        if (isWorkspaceRevisionConflict(error)) {
-          setAccountEpoch((value) => value + 1);
-          setSyncStatus("connecting");
-        } else {
-          setPersistenceError(error instanceof Error
-            ? `Private sync could not finish: ${error.message}`
-            : "Private sync could not finish. Your device copy remains available.");
-          setSyncStatus("error");
-        }
-      } finally {
-        if (stagedRemoteEvidence.length && !retainRemoteEvidence) {
-          await rollbackEvidenceWrites(stagedRemoteEvidence);
-        }
+        setPersistenceError(outcome.error instanceof Error
+          ? `Private sync could not finish: ${outcome.error.message}`
+          : "Private sync could not finish. Your device copy remains available.");
+        setSyncStatus("error");
+        return;
       }
+      setAccountEpoch((value) => value + 1);
+      setSyncStatus("connecting");
     };
     void workspaceOperations.run(
       reconciliationScopeKey,
@@ -1208,7 +1491,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         setAccountEpoch((value) => value + 1);
       }
     });
-  }, [accountEpoch, accountIsQuarantined, adoptRemoteWorkspace, authResolved, ready, user, workspaceOperations]);
+  }, [accountEpoch, accountIsQuarantined, adoptRemoteWorkspace, authResolved, persistWorkspace, ready, recoverRemoteEvidenceCleanup, user, workspaceOperations]);
 
   useEffect(() => {
     const supabase = getSupabase();
@@ -1266,60 +1549,94 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         const expectedRevision = revision.current;
         setSyncStatus("saving");
         try {
-          const { data, error } = await saveWorkspaceSnapshotWithDeadline(
-            supabase,
-            state,
-            expectedRevision,
+          const outcome = await runProviderCloudSave(
+            {
+              boundary: {
+                accountId: syncAccountId,
+                workspaceGeneration: generation,
+                workspaceScopeKey: cloudSaveScopeKey,
+              },
+              snapshot: state,
+              expectedRevision,
+              changeVersion: saveVersion,
+            },
+            {
+              saveSnapshot: (snapshot, targetRevision) =>
+                saveWorkspaceSnapshotWithDeadline(
+                  supabase,
+                  syncAccountId,
+                  snapshot,
+                  targetRevision,
+                ),
+              inspectCurrentness: (boundary) => {
+                if (
+                  boundary.workspaceGeneration !== workspaceGeneration.current
+                  || boundary.workspaceScopeKey !== workspaceScopeKeyRef.current
+                ) {
+                  return { current: false, reason: "scope" };
+                }
+                if (
+                  activeAccount.current !== boundary.accountId
+                  || reconciledAccount.current !== boundary.accountId
+                ) {
+                  return { current: false, reason: "account" };
+                }
+                if (
+                  accountSwitching.current
+                  || localConflictAccounts.current.has(
+                    persistenceAccountId(boundary.accountId),
+                  )
+                ) {
+                  return { current: false, reason: "write-gate" };
+                }
+                return { current: true };
+              },
+              readChangeVersion: () => localChangeVersion.current,
+              parseRevision: parseWorkspaceRevision,
+              isRevisionConflict: isWorkspaceRevisionConflict,
+            },
           );
-          const accountStillCurrent = generation === workspaceGeneration.current
-            && cloudSaveScopeKey === workspaceScopeKeyRef.current
-            && activeAccount.current === syncAccountId
-            && reconciledAccount.current === syncAccountId
-            && !accountSwitching.current
-            && !localConflictAccounts.current.has(persistenceAccountId(syncAccountId));
-          if (!accountStillCurrent) return;
-          if (error) {
-            remoteLoaded.current = false;
-            reconciledAccount.current = null;
-            setCloudWriteAllowed(false);
-            setSyncStatus(isWorkspaceRevisionConflict(error) ? "conflict" : "error");
-            setAccountEpoch((value) => value + 1);
-            return;
-          }
-          const row = Array.isArray(data) ? data[0] : data;
-          const savedRevision = parseWorkspaceRevision(row?.revision);
-          if (!row || savedRevision === null || typeof row.updated_at !== "string") {
-            remoteLoaded.current = false;
-            reconciledAccount.current = null;
-            setCloudWriteAllowed(false);
-            setPersistenceError("Private sync saved an unexpected response. Your device copy is still marked as unsaved.");
-            setSyncStatus("error");
-            return;
-          }
-          const localUnchanged = localChangeVersion.current === saveVersion;
-          revision.current = savedRevision;
-          serverUpdatedAt.current = row.updated_at;
-          if (localUnchanged) dirty.current = false;
-          setMetadataEpoch((value) => value + 1);
-          setSyncStatus(localUnchanged ? "synced" : "saving");
-        } catch {
-          const accountStillCurrent = generation === workspaceGeneration.current
-            && cloudSaveScopeKey === workspaceScopeKeyRef.current
-            && activeAccount.current === syncAccountId
-            && reconciledAccount.current === syncAccountId
-            && !accountSwitching.current
-            && !localConflictAccounts.current.has(persistenceAccountId(syncAccountId));
-          if (accountStillCurrent) {
-            remoteLoaded.current = false;
-            reconciledAccount.current = null;
-            setCloudWriteAllowed(false);
-            // A lost RPC response is ambiguous: the server may have committed
-            // the snapshot even though the browser never received a response.
-            // Re-read the remote revision once so a concurrent write becomes
-            // an explicit conflict and a transient transport failure can
-            // recover without waiting for another local mutation.
-            setSyncStatus("connecting");
-            setAccountEpoch((value) => value + 1);
+
+          switch (outcome.kind) {
+            case "superseded":
+              return;
+            case "saved":
+              revision.current = outcome.revision;
+              serverUpdatedAt.current = outcome.updatedAt;
+              if (outcome.localUnchanged) dirty.current = false;
+              setMetadataEpoch((value) => value + 1);
+              setSyncStatus(outcome.localUnchanged ? "synced" : "saving");
+              if (outcome.localUnchanged) {
+                await recoverRemoteEvidenceCleanup(persistenceAccountId(syncAccountId));
+              }
+              return;
+            case "revision-conflict":
+            case "error":
+              remoteLoaded.current = false;
+              reconciledAccount.current = null;
+              setCloudWriteAllowed(false);
+              setSyncStatus(outcome.kind === "revision-conflict" ? "conflict" : "error");
+              setAccountEpoch((value) => value + 1);
+              return;
+            case "malformed-response":
+              remoteLoaded.current = false;
+              reconciledAccount.current = null;
+              setCloudWriteAllowed(false);
+              setPersistenceError("Private sync saved an unexpected response. Your device copy is still marked as unsaved.");
+              setSyncStatus("error");
+              return;
+            case "ambiguous":
+              remoteLoaded.current = false;
+              reconciledAccount.current = null;
+              setCloudWriteAllowed(false);
+              // A lost RPC response is ambiguous: the server may have committed
+              // the snapshot even though the browser never received a response.
+              // Re-read the remote revision once so a concurrent write becomes
+              // an explicit conflict and a transient transport failure can
+              // recover without waiting for another local mutation.
+              setSyncStatus("connecting");
+              setAccountEpoch((value) => value + 1);
+              return;
           }
         } finally {
           if (cloudSaveAccount.current === syncAccountId) {
@@ -1336,7 +1653,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       });
     }, 900);
     return () => window.clearTimeout(timer);
-  }, [accountIsQuarantined, authResolved, localPersistenceEpoch, localPersistenceIsPending, metadataEpoch, ready, state, syncConflict, user, workspaceOperations]);
+  }, [accountIsQuarantined, authResolved, localPersistenceEpoch, localPersistenceIsPending, metadataEpoch, ready, recoverRemoteEvidenceCleanup, state, syncConflict, user, workspaceOperations]);
 
   useEffect(() => {
     if (!user) return;
@@ -1465,10 +1782,15 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   }, [markCloudChangesPending]);
 
   /** Durably save metadata before a caller removes or moves evidence bytes. */
-  const flushWorkspaceDurably = useCallback(async (expectedScopeKey: WorkspaceScopeKey) => {
+  const flushWorkspaceDurably = useCallback(async (
+    expectedScopeKey: WorkspaceScopeKey,
+    stagedEvidence: readonly StagedEvidenceBlobWrite[] = [],
+  ) => {
     const scopeIsCurrent = () => expectedScopeKey === workspaceScopeKeyRef.current
       && workspaceOperations.isActive(expectedScopeKey)
       && !accountSwitching.current;
+    const retainLocalOnDefiniteCloudFailure = stagedEvidence.length > 0;
+    let pendingStagedEvidence = stagedEvidence;
     for (let attempt = 0; attempt < 5; attempt += 1) {
       if (!scopeIsCurrent()) throw new Error("The active workspace changed before metadata could be saved.");
       const accountId = persistenceAccountId(activeAccount.current);
@@ -1479,7 +1801,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       const snapshotHistory = trimWorkspaceHistory(history.current.map(clone));
       const changeVersion = localChangeVersion.current;
       dirty.current = true;
-      await persistWorkspace({
+      const dirtyPersisted = await persistWorkspace({
         accountId,
         state: snapshot,
         history: snapshotHistory,
@@ -1487,54 +1809,91 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         revision: revision.current,
         serverUpdatedAt: serverUpdatedAt.current,
         savedAt: new Date().toISOString(),
-      });
+      }, pendingStagedEvidence);
+      pendingStagedEvidence = [];
       if (!scopeIsCurrent()) throw new Error("The active workspace changed while metadata was being saved.");
       if (changeVersion !== localChangeVersion.current) continue;
 
       const cloudAccountId = activeAccount.current;
-      if (!cloudAccountId) return;
-      if (!user || user.id !== cloudAccountId || !cloudWriteAllowed) {
-        throw new Error("Private cloud reconciliation must finish before file metadata can be committed.");
+      if (!cloudAccountId) return dirtyPersisted.localRevision;
+      let cloudConfirmed = false;
+      try {
+        if (!user || user.id !== cloudAccountId || !cloudWriteAllowed) {
+          throw new Error("Private cloud reconciliation must finish before file metadata can be committed.");
+        }
+        const supabase = getSupabase();
+        if (!supabase) throw new Error("Cloud storage is unavailable.");
+        setSyncStatus("saving");
+        const expectedCloudRevision = revision.current;
+        const saved = await saveGoalEvidenceCloudMetadataWithVerification({
+          state: snapshot,
+          expectedRevision: expectedCloudRevision,
+          save: () => saveWorkspaceSnapshotWithDeadline(
+            supabase,
+            cloudAccountId,
+            snapshot,
+            expectedCloudRevision,
+          ),
+          readAuthoritative: async () => {
+            const response = await supabase
+              .from("workspace_snapshots")
+              .select("state,revision,updated_at")
+              .eq("user_id", cloudAccountId)
+              .maybeSingle();
+            return response;
+          },
+          migrateState: migrateStoredState,
+          statesEqual: workspaceStatesEqual,
+          parseRevision: parseWorkspaceRevision,
+        });
+        cloudConfirmed = true;
+        if (
+          !scopeIsCurrent()
+          || activeAccount.current !== cloudAccountId
+          || authenticatedUserId.current !== cloudAccountId
+        ) {
+          throw new Error("The active account changed while file metadata was being saved.");
+        }
+        revision.current = saved.revision;
+        serverUpdatedAt.current = saved.updatedAt;
+        if (changeVersion !== localChangeVersion.current) {
+          dirty.current = true;
+          continue;
+        }
+        dirty.current = false;
+        const cleanPersisted = await persistWorkspace({
+          accountId,
+          state: snapshot,
+          history: snapshotHistory,
+          dirty: false,
+          revision: saved.revision,
+          serverUpdatedAt: saved.updatedAt,
+          savedAt: new Date().toISOString(),
+        });
+        remoteLoaded.current = true;
+        reconciledAccount.current = cloudAccountId;
+        setMetadataEpoch((value) => value + 1);
+        setSyncStatus("synced");
+        return cleanPersisted.localRevision;
+      } catch (error) {
+        const ambiguous = error instanceof GoalEvidenceCloudSaveAmbiguousError;
+        if (ambiguous) {
+          remoteLoaded.current = false;
+          reconciledAccount.current = null;
+          setCloudWriteAllowed(false);
+          setSyncStatus("connecting");
+          setAccountEpoch((value) => value + 1);
+        }
+        if (retainLocalOnDefiniteCloudFailure || ambiguous || cloudConfirmed) {
+          dirty.current = true;
+          throw new GoalEvidenceLocalCommitRetainedError(
+            error,
+            dirtyPersisted.localRevision,
+            ambiguous,
+          );
+        }
+        throw error;
       }
-      const supabase = getSupabase();
-      if (!supabase) throw new Error("Cloud storage is unavailable.");
-      setSyncStatus("saving");
-      const { data, error } = await saveWorkspaceSnapshotWithDeadline(
-        supabase,
-        snapshot,
-        revision.current,
-      );
-      if (error) throw error;
-      const row = Array.isArray(data) ? data[0] : data;
-      const savedRevision = parseWorkspaceRevision(row?.revision);
-      if (!row || savedRevision === null || typeof row.updated_at !== "string") {
-        throw new Error("Private sync returned an invalid revision while saving file metadata.");
-      }
-      const savedState = migrateStoredState(row.state);
-      if (!workspaceStatesEqual(savedState, snapshot)) {
-        throw new Error("Private sync did not return the exact file metadata snapshot that was submitted.");
-      }
-      revision.current = savedRevision;
-      serverUpdatedAt.current = row.updated_at;
-      if (changeVersion !== localChangeVersion.current) {
-        dirty.current = true;
-        continue;
-      }
-      dirty.current = false;
-      await persistWorkspace({
-        accountId,
-        state: snapshot,
-        history: snapshotHistory,
-        dirty: false,
-        revision: savedRevision,
-        serverUpdatedAt: row.updated_at,
-        savedAt: new Date().toISOString(),
-      });
-      remoteLoaded.current = true;
-      reconciledAccount.current = cloudAccountId;
-      setMetadataEpoch((value) => value + 1);
-      setSyncStatus("synced");
-      return;
     }
     throw new Error("The workspace kept changing while file metadata was being saved. No file bytes were removed.");
   }, [accountIsQuarantined, cloudWriteAllowed, persistWorkspace, user, workspaceOperations]);
@@ -1556,6 +1915,18 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     };
   };
 
+  const goalEvidenceScopeIsCurrent = (scope: GoalEvidenceOperationScope) => (
+    scope.workspaceScopeKey === workspaceScopeKeyRef.current
+    && scope.workspaceGeneration === workspaceGeneration.current
+    && scope.persistenceAccountId === persistenceAccountId(activeAccount.current)
+    && scope.persistenceGeneration
+      === persistenceScopeGenerations.current.get(scope.persistenceAccountId)
+    && scope.authenticatedAccountId === authenticatedUserId.current
+    && workspaceOperations.isActive(scope.workspaceScopeKey)
+    && !accountSwitching.current
+    && terminalErasureAccount.current === null
+  );
+
   const goalEvidenceActions = () => createGoalEvidenceActions({
     metadata: {
       readGoalEvidence: (goalId) =>
@@ -1572,23 +1943,26 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       deleteGoalRecords: (goalId) => {
         mutateWithoutUndo((draft) => deleteGoalRecordsDraft(draft, goalId));
       },
-      restoreWorkspace: ({ state: restoredState, history: restoredHistory }) => {
+      restoreWorkspace: (
+        { state: restoredState, history: restoredHistory },
+        expectedCurrent,
+      ) => {
+        if (expectedCurrent && (
+          !workspaceStatesEqual(latestState.current, expectedCurrent.state)
+          || history.current.length !== expectedCurrent.history.length
+          || history.current.some((item, index) =>
+            !workspaceStatesEqual(item, expectedCurrent.history[index]))
+        )) return false;
         replaceWorkspaceInMemory(restoredState, [...restoredHistory]);
+        return true;
       },
-      flushDurably: (scope) => flushWorkspaceDurably(scope.workspaceScopeKey),
+      flushDurably: (scope, stagedEvidence) => flushWorkspaceDurably(
+        scope.workspaceScopeKey,
+        stagedEvidence,
+      ),
     },
     scope: {
-      isCurrent: (scope) => (
-        scope.workspaceScopeKey === workspaceScopeKeyRef.current
-        && scope.workspaceGeneration === workspaceGeneration.current
-        && scope.persistenceAccountId === persistenceAccountId(activeAccount.current)
-        && scope.persistenceGeneration
-          === persistenceScopeGenerations.current.get(scope.persistenceAccountId)
-        && scope.authenticatedAccountId === authenticatedUserId.current
-        && workspaceOperations.isActive(scope.workspaceScopeKey)
-        && !accountSwitching.current
-        && terminalErasureAccount.current === null
-      ),
+      isCurrent: goalEvidenceScopeIsCurrent,
       runExclusive: (scope, operation) => runWorkspaceFileOperation(
         scope.workspaceScopeKey,
         operation,
@@ -1597,15 +1971,13 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     localEvidence: {
       list: (accountId, goalId, generation) =>
         listEvidenceBlobs(accountId, goalId, generation),
-      remove: (snapshot, generation) => deleteEvidenceBlob(
-        snapshot.accountId,
-        snapshot.goalId,
-        snapshot.evidenceId,
+      remove: (snapshots, generation, committedWorkspaceLocalRevision) => deleteEvidenceBlobs(
+        snapshots,
         generation,
+        committedWorkspaceLocalRevision,
       ),
-      restore: async (snapshot, generation) => {
-        await storeEvidenceBlob(snapshot, generation);
-      },
+      stageCleanup: stageEvidenceCleanupIntent,
+      cancelCleanup: cancelEvidenceCleanupIntent,
     },
     remoteEvidence: {
       assertWriteAllowed: () => {
@@ -1613,29 +1985,36 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           throw new Error("Finish the pending workspace or sync choice before deleting cloud evidence.");
         }
       },
-      download: async (path) => {
-        const bucket = getSupabase()?.storage.from("evidence");
-        if (!bucket) throw new Error("Cloud storage is unavailable.");
-        const { data, error } = await bucket.download(path);
-        if (error || !data) {
-          throw error ?? new Error("A private evidence file could not be captured before deletion.");
+      claim: async (paths) => {
+        const accountId = activeAccount.current;
+        const supabase = getSupabase();
+        if (
+          !accountId
+          || !supabase
+          || authenticatedUserId.current !== accountId
+          || accountSwitching.current
+        ) {
+          throw new Error("The active cloud account changed before evidence cleanup could be claimed.");
         }
-        return data;
+        const claim = await claimPrivateEvidenceCleanup(
+          supabase,
+          accountId,
+          paths,
+        );
+        if (
+          activeAccount.current !== accountId
+          || authenticatedUserId.current !== accountId
+          || accountSwitching.current
+        ) {
+          throw new Error("The active cloud account changed while evidence cleanup was being claimed.");
+        }
+        return claim.kind;
       },
       remove: async (paths) => {
         if (!paths.length) return;
         const bucket = getSupabase()?.storage.from("evidence");
         if (!bucket) throw new Error("Cloud storage is unavailable.");
         const { error } = await bucket.remove([...paths]);
-        if (error) throw error;
-      },
-      restore: async (snapshot) => {
-        const bucket = getSupabase()?.storage.from("evidence");
-        if (!bucket) throw new Error("Cloud storage is unavailable.");
-        const { error } = await bucket.upload(snapshot.path, snapshot.blob, {
-          contentType: snapshot.blob.type,
-          upsert: true,
-        });
         if (error) throw error;
       },
     },
@@ -1673,13 +2052,133 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       runWorkspaceFileOperation,
       reportPersistenceError,
       ...domainActions,
-      async setGoalFileEvidence(goalId, evidence, expectedWorkspaceScopeKey) {
+      async setGoalFileEvidence(
+        goalId,
+        evidence,
+        expectedWorkspaceScopeKey,
+        stagedEvidence = [],
+      ) {
         const scope = captureGoalEvidenceScope(expectedWorkspaceScopeKey);
-        await goalEvidenceActions().setGoalFileEvidence({
+        return goalEvidenceActions().setGoalFileEvidence({
           goalId,
           evidence,
           scope,
+          stagedEvidence,
         });
+      },
+      async readGoalEvidenceBlob(goalId, evidenceId, expectedWorkspaceScopeKey) {
+        const scope = captureGoalEvidenceScope(expectedWorkspaceScopeKey);
+        if (!goalEvidenceScopeIsCurrent(scope)) {
+          throw new Error("The active workspace changed before evidence could be read.");
+        }
+        return readEvidenceBlob(
+          scope.persistenceAccountId,
+          goalId,
+          evidenceId,
+          scope.persistenceGeneration,
+        );
+      },
+      async stageGoalEvidenceBlob(goalId, evidenceId, blob, expectedWorkspaceScopeKey) {
+        const scope = captureGoalEvidenceScope(expectedWorkspaceScopeKey);
+        if (!goalEvidenceScopeIsCurrent(scope)) {
+          throw new Error("The active workspace changed before evidence could be staged.");
+        }
+        const staged = await stageEvidenceBlob({
+          accountId: scope.persistenceAccountId,
+          goalId,
+          evidenceId,
+          blob,
+        }, scope.persistenceGeneration);
+        return { ...staged, scopeGeneration: scope.persistenceGeneration };
+      },
+      async rollbackGoalEvidenceStage(staged, expectedWorkspaceScopeKey) {
+        // Token-only rollback is deliberately safe even after a scope switch;
+        // it cannot touch live evidence.
+        void expectedWorkspaceScopeKey;
+        await rollbackStagedEvidenceBlob(staged, staged.scopeGeneration);
+      },
+      async cacheGoalEvidenceBlob(
+        goalId,
+        evidenceId,
+        blob,
+        expectedWorkspaceScopeKey,
+      ) {
+        const scope = captureGoalEvidenceScope(expectedWorkspaceScopeKey);
+        if (!goalEvidenceScopeIsCurrent(scope)) {
+          throw new Error("The active workspace changed before evidence could be cached.");
+        }
+        const referenced = latestState.current.goals
+          .find((goal) => goal.id === goalId)?.evidence
+          .some((item) => item.type === "file" && item.id === evidenceId);
+        if (!referenced) {
+          throw new Error("The workspace no longer references this evidence file.");
+        }
+        return storeEvidenceBlob({
+          accountId: scope.persistenceAccountId,
+          goalId,
+          evidenceId,
+          blob,
+        }, scope.persistenceGeneration, expectedLocalRevisions.current.get(
+          scope.persistenceAccountId,
+        ) ?? 0);
+      },
+      async deleteGoalEvidenceBlobs(
+        snapshots,
+        committedWorkspaceLocalRevision,
+        expectedWorkspaceScopeKey,
+      ) {
+        const scope = captureGoalEvidenceScope(expectedWorkspaceScopeKey);
+        if (!goalEvidenceScopeIsCurrent(scope)) {
+          throw new Error("The active workspace changed before evidence could be deleted.");
+        }
+        return deleteEvidenceBlobs(
+          snapshots,
+          scope.persistenceGeneration,
+          committedWorkspaceLocalRevision
+            ?? (expectedLocalRevisions.current.get(scope.persistenceAccountId) ?? 0),
+        );
+      },
+      async restoreGoalEvidenceBlobs(receipt, expectedWorkspaceScopeKey) {
+        const scope = captureGoalEvidenceScope(expectedWorkspaceScopeKey);
+        if (!goalEvidenceScopeIsCurrent(scope)) {
+          throw new Error("The active workspace changed before evidence could be restored.");
+        }
+        return restoreEvidenceBlobs(receipt);
+      },
+      async stageGoalEvidenceCleanup(
+        snapshot,
+        goalId,
+        evidenceId,
+        remotePath,
+        expectedWorkspaceScopeKey,
+      ) {
+        const scope = captureGoalEvidenceScope(expectedWorkspaceScopeKey);
+        if (!goalEvidenceScopeIsCurrent(scope)) {
+          throw new Error("The active workspace changed before evidence cleanup could be journaled.");
+        }
+        if (!snapshot && !remotePath) return null;
+        if (snapshot && (
+          snapshot.accountId !== scope.persistenceAccountId
+          || snapshot.goalId !== goalId
+          || snapshot.evidenceId !== evidenceId
+          || !snapshot.writeId
+        )) {
+          throw new Error("The device evidence cleanup snapshot is stale or invalid.");
+        }
+        return stageEvidenceCleanupIntent({
+          accountId: scope.persistenceAccountId,
+          goalId,
+          evidenceId,
+          ...(snapshot?.writeId ? { expectedWriteId: snapshot.writeId } : {}),
+          ...(remotePath ? { remotePath } : {}),
+        }, scope.persistenceGeneration);
+      },
+      async cancelGoalEvidenceCleanup(intent, expectedWorkspaceScopeKey) {
+        const scope = captureGoalEvidenceScope(expectedWorkspaceScopeKey);
+        if (intent.accountId !== scope.persistenceAccountId) {
+          throw new Error("The evidence cleanup journal belongs to another account.");
+        }
+        await cancelEvidenceCleanupIntent(intent, scope.persistenceGeneration);
       },
       async deleteGoal(goalId) {
         const scope = captureGoalEvidenceScope(workspaceScopeKeyRef.current);
@@ -1746,8 +2245,12 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
                 ? await replaceWorkspaceAfterRecoveryChoice(
                     replacementEnvelope,
                     importPersistenceGeneration,
+                    migrated.createdEvidence,
                   )
-                : await persistWorkspace(replacementEnvelope);
+                : await persistWorkspace(
+                    replacementEnvelope,
+                    migrated.createdEvidence,
+                  );
               expectedLocalRevisions.current.set(importAccountId, saved.localRevision);
               metadataCommitted = true;
               if (
@@ -1786,6 +2289,413 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             accountSwitching.current = false;
             setWorkspaceSwitching(false);
             setAccountEpoch((value) => value + 1);
+          }
+        }
+      },
+      async exportPortableWorkspaceArchive(options = {}) {
+        if (accountSwitching.current) {
+          throw new Error("Wait for the active workspace to finish opening before creating a full backup.");
+        }
+        const prepareForAccountErasure = options.prepareForAccountErasure === true;
+        const boundary = capturePortableArchiveBoundary();
+        if (
+          prepareForAccountErasure
+          && (
+            !boundary.authenticatedAccountId
+            || boundary.activeAccountId !== boundary.authenticatedAccountId
+            || boundary.accountId !== boundary.authenticatedAccountId
+          )
+        ) {
+          throw new Error("Only the exact active signed-in account can create an account-erasure backup.");
+        }
+        return workspaceOperations.run(
+          boundary.workspaceScopeKey,
+          async () => {
+            await localWriteQueues.current.get(boundary.accountId);
+            if (!portableArchiveBoundaryIsCurrent(boundary)) {
+              throw new Error("The active workspace changed before full backup creation could begin.");
+            }
+            let localBackupBoundary = await readAccountPersistenceBackupBoundary(
+              boundary.accountId,
+            );
+            if (
+              localBackupBoundary.generation !== boundary.persistenceGeneration
+              || localBackupBoundary.workspaceLocalRevision
+                !== (expectedLocalRevisions.current.get(boundary.accountId) ?? 0)
+            ) {
+              throw new Error("The device workspace or evidence changed before full backup creation could begin.");
+            }
+            const snapshot = clone(latestState.current);
+            const createdAt = new Date().toISOString();
+            const supabase = getSupabase();
+            let cloudBackupBoundary: AccountErasureCloudBackupBoundary | null = null;
+            let strictEvidence: EvidenceBlobRecord[] | null = null;
+            let remotePathsBefore: string[] = [];
+            if (prepareForAccountErasure) {
+              if (
+                !supabase
+                || !cloudWriteAllowed
+                || !remoteLoaded.current
+                || reconciledAccount.current !== boundary.accountId
+                || dirty.current
+                || syncStatus !== "synced"
+                || remoteConflict.current
+                || pendingAccountHandoff.current
+                || accountIsQuarantined(boundary.accountId)
+              ) {
+                throw new Error("Private sync must be fully up to date before creating an account-erasure backup.");
+              }
+              await recoverRemoteEvidenceCleanup(boundary.accountId);
+              if (!portableArchiveBoundaryIsCurrent(boundary)) {
+                throw new Error("The active workspace changed while incomplete evidence cleanup was recovered.");
+              }
+              localBackupBoundary = await readAccountPersistenceBackupBoundary(
+                boundary.accountId,
+              );
+              if (
+                localBackupBoundary.generation !== boundary.persistenceGeneration
+                || localBackupBoundary.workspaceLocalRevision
+                  !== (expectedLocalRevisions.current.get(boundary.accountId) ?? 0)
+              ) {
+                throw new Error("The device workspace changed while incomplete evidence cleanup was recovered.");
+              }
+              cloudBackupBoundary = await readAccountErasureBackupBoundary(
+                supabase,
+                boundary.accountId,
+              );
+              if (cloudBackupBoundary.workspaceRevision !== revision.current) {
+                throw new Error("The cloud workspace changed on another device. Reconcile it before creating an account-erasure backup.");
+              }
+
+              remotePathsBefore = await listPrivateEvidencePaths(
+                supabase,
+                boundary.accountId,
+              );
+              const localEvidence = await listEvidenceBlobs(
+                boundary.accountId,
+                undefined,
+                boundary.persistenceGeneration,
+              );
+              const evidenceByKey = new Map(localEvidence.map((record) => [
+                `${record.goalId}\u0000${record.evidenceId}`,
+                record,
+              ]));
+              const expectedRemotePaths: string[] = [];
+              for (const goal of snapshot.goals) {
+                for (const evidence of goal.evidence) {
+                  if (evidence.type !== "file" || !evidence.remotePath) continue;
+                  const path = remoteEvidencePath(
+                    evidence,
+                    boundary.accountId,
+                    goal.id,
+                  );
+                  if (!path) {
+                    throw new Error("A private evidence path is invalid. No account-erasure backup was created.");
+                  }
+                  expectedRemotePaths.push(path);
+                  const bucket = supabase.storage.from("evidence");
+                  const { data, error } = await bucket.download(path);
+                  if (error || !data) {
+                    throw error ?? new Error("A private evidence file could not be downloaded for the account-erasure backup.");
+                  }
+                  const verified = normalizedEvidenceBlob(data, evidence);
+                  if (!verified) {
+                    throw new Error(`The private cloud copy of "${evidence.name}" does not match its recorded type and size. No account-erasure backup was created.`);
+                  }
+                  evidenceByKey.set(`${goal.id}\u0000${evidence.id}`, {
+                    accountId: boundary.accountId,
+                    goalId: goal.id,
+                    evidenceId: evidence.id,
+                    blob: verified,
+                    savedAt: createdAt,
+                  });
+                }
+              }
+              if (!stringSetsEqual(remotePathsBefore, expectedRemotePaths)) {
+                throw new Error("Private cloud evidence contains missing or unreferenced files. Resolve that inventory before erasing the account.");
+              }
+              strictEvidence = [...evidenceByKey.values()];
+            }
+            const artifact = await createCompletePortableArchive({
+              state: snapshot,
+              boundary,
+              createdAt,
+              isCurrent: () => portableArchiveBoundaryIsCurrent(boundary),
+              listLocalEvidence: (accountId, generation) =>
+                strictEvidence
+                  ? Promise.resolve(strictEvidence)
+                  : listEvidenceBlobs(accountId, undefined, generation),
+              requireExactAuthenticatedAccount: async (accountId) => {
+                const supabase = getSupabase();
+                if (!supabase) {
+                  throw new Error("Private cloud access is unavailable. No full backup was downloaded.");
+                }
+                const { data, error } = await supabase.auth.getUser();
+                if (error) throw error;
+                if (data.user?.id !== accountId) {
+                  throw new Error("The authenticated account changed before private evidence could be included.");
+                }
+              },
+              downloadRemoteEvidence: async (path) => {
+                const bucket = getSupabase()?.storage.from("evidence");
+                if (!bucket) {
+                  throw new Error("Private cloud Storage is unavailable. No full backup was downloaded.");
+                }
+                const { data, error } = await bucket.download(path);
+                if (error || !data) {
+                  throw error ?? new Error("A private evidence file could not be downloaded.");
+                }
+                return data;
+              },
+            });
+            if (!portableArchiveBoundaryIsCurrent(boundary)) {
+              throw new Error("The active workspace changed before the full backup download was ready.");
+            }
+            const finalLocalBackupBoundary = await readAccountPersistenceBackupBoundary(
+              boundary.accountId,
+            );
+            if (!localBackupBoundariesEqual(
+              localBackupBoundary,
+              finalLocalBackupBoundary,
+            )) {
+              throw new Error("The device workspace or evidence changed while its backup was created. Download a fresh full backup before resetting anything.");
+            }
+            if (prepareForAccountErasure) {
+              if (!cloudBackupBoundary || !supabase) {
+                throw new Error("The cloud backup boundary was not captured.");
+              }
+              if (artifact.report.orphanedEvidence.length) {
+                throw new Error("Device evidence contains unreferenced files. Resolve that inventory before erasing the account.");
+              }
+              const [finalCloudBoundary, remotePathsAfter] = await Promise.all([
+                readAccountErasureBackupBoundary(supabase, boundary.accountId),
+                listPrivateEvidencePaths(supabase, boundary.accountId),
+              ]);
+              if (
+                !cloudBackupBoundariesEqual(cloudBackupBoundary, finalCloudBoundary)
+                || finalCloudBoundary.workspaceRevision !== revision.current
+                || !stringSetsEqual(remotePathsBefore, remotePathsAfter)
+                || !portableArchiveBoundaryIsCurrent(boundary)
+              ) {
+                throw new Error("The private cloud workspace or evidence changed while its backup was created. Download a fresh full backup before erasing anything.");
+              }
+            }
+            const resetReceiptToken = globalThis.crypto.randomUUID();
+            preparedPortableArchiveReset.current = {
+              token: resetReceiptToken,
+              boundary,
+              localBoundary: finalLocalBackupBoundary,
+              cloudBackupBoundary,
+            };
+            return {
+              blob: artifact.blob,
+              fileName: `evolvra-full-backup-${createdAt.slice(0, 10)}.evolvra`,
+              evidenceFiles: artifact.report.includedEvidence.length,
+              evidenceBytes: artifact.report.evidenceBytes,
+              resetReceiptToken,
+            };
+          },
+          () => portableArchiveBoundaryIsCurrent(boundary),
+        );
+      },
+      async inspectPortableWorkspaceArchive(archive) {
+        if (
+          remoteConflict.current
+          || syncConflict
+          || pendingAccountHandoff.current
+          || accountHandoff
+        ) {
+          throw new Error("Resolve the active source-of-truth choice before restoring a portable backup. Neither copy was changed.");
+        }
+        if (accountSwitching.current) {
+          throw new Error("Wait for the active workspace to finish opening before inspecting a full backup.");
+        }
+        const boundary = capturePortableArchiveBoundary();
+        const importedAt = new Date().toISOString();
+        return workspaceOperations.run(
+          boundary.workspaceScopeKey,
+          async () => {
+            const current = clone(latestState.current);
+            const plan = await inspectAndPreparePortableWorkspaceArchiveImport(
+              current,
+              archive,
+              importedAt,
+            );
+            if (!portableArchiveBoundaryIsCurrent(boundary)) {
+              throw new Error("The active workspace changed while the full backup was being inspected. Select it again.");
+            }
+            if (remoteConflict.current || pendingAccountHandoff.current) {
+              throw new Error("A source-of-truth choice appeared while the backup was being inspected. Resolve it, then select the file again.");
+            }
+            const token = globalThis.crypto.randomUUID();
+            preparedPortableArchiveImport.current = {
+              token,
+              boundary,
+              importedAt,
+              plan,
+            };
+            return {
+              token,
+              archiveCreatedAt: plan.archiveCreatedAt,
+              archiveWorkspaceUpdatedAt: plan.archiveWorkspaceUpdatedAt,
+              importedEvidenceFiles: plan.importedEvidenceFiles,
+              importedEvidenceBytes: plan.importedEvidenceBytes,
+            };
+          },
+          () => portableArchiveBoundaryIsCurrent(boundary),
+        );
+      },
+      discardPortableWorkspaceArchiveImport(token) {
+        if (preparedPortableArchiveImport.current?.token === token) {
+          preparedPortableArchiveImport.current = null;
+        }
+      },
+      async applyPortableWorkspaceArchive(token, choice) {
+        const prepared = preparedPortableArchiveImport.current;
+        preparedPortableArchiveImport.current = null;
+        if (!prepared || prepared.token !== token) {
+          throw new Error("This full-backup preview is no longer active. Select the file again.");
+        }
+        const { boundary, importedAt, plan } = prepared;
+        if (
+          remoteConflict.current
+          || syncConflict
+          || pendingAccountHandoff.current
+          || accountHandoff
+        ) {
+          throw new Error("Resolve the active source-of-truth choice before restoring a portable backup. Neither copy was changed.");
+        }
+        if (accountIsQuarantined(boundary.accountId)) {
+          throw new Error("Resolve the device recovery blocker before restoring a portable backup. Neither copy was changed.");
+        }
+        if (!portableArchiveBoundaryIsCurrent(boundary)) {
+          throw new Error("The workspace changed after the backup preview. Select the file again before restoring it.");
+        }
+        const decision = choice === "merge" ? plan.merge : plan.replace;
+        const previousCloudWriteAllowed = cloudWriteAllowed;
+        const nextState = clone(decision.state);
+        const nextHistory: AppState[] = [];
+        accountSwitching.current = true;
+        setWorkspaceSwitching(true);
+        setCloudWriteAllowed(false);
+        try {
+          const result = await workspaceOperations.run(
+            boundary.workspaceScopeKey,
+            async () => {
+              await localWriteQueues.current.get(boundary.accountId);
+              if (
+                !portableArchiveBoundaryIsCurrent(boundary, true)
+                || remoteConflict.current
+                || pendingAccountHandoff.current
+              ) {
+                throw new Error("The active workspace changed before the portable backup could be restored.");
+              }
+              const sourceState = clone(latestState.current);
+              const sourceHistory = trimWorkspaceHistory(history.current.map(clone));
+              const envelope: WorkspaceEnvelope = {
+                accountId: boundary.accountId,
+                state: nextState,
+                history: nextHistory,
+                dirty: true,
+                localRevision: expectedLocalRevisions.current.get(
+                  boundary.accountId,
+                ) ?? 0,
+                revision: revision.current,
+                serverUpdatedAt: serverUpdatedAt.current,
+                savedAt: importedAt,
+              };
+              const persistArchive = () => applyPortableArchivePersistence({
+                kind: choice,
+                envelope,
+                evidence: decision.evidenceWrites.map((item) => ({
+                  accountId: boundary.accountId,
+                  goalId: item.targetGoalId,
+                  evidenceId: item.targetEvidenceId,
+                  blob: item.blob,
+                  savedAt: importedAt,
+                })),
+              }, boundary.persistenceGeneration);
+              if (
+                choice !== "replace"
+                || boundary.authenticatedAccountId !== boundary.accountId
+              ) return persistArchive();
+
+              const replacement = await commitAuthoritativeWorkspaceReplacement({
+                accountId: boundary.accountId,
+                persistenceGeneration: boundary.persistenceGeneration,
+                sourceStates: [sourceState, ...sourceHistory],
+                targetStates: [nextState],
+                persistTarget: async () => {
+                  if (
+                    !portableArchiveBoundaryIsCurrent(boundary, true)
+                    || !workspaceStatesEqual(sourceState, latestState.current)
+                  ) {
+                    throw new Error("The active workspace changed before replacement cleanup could be committed.");
+                  }
+                  return persistArchive();
+                },
+              });
+              return replacement.result;
+            },
+            () => portableArchiveBoundaryIsCurrent(boundary, true),
+          );
+          if (!portableArchiveBoundaryIsCurrent(boundary, true)) {
+            throw new Error("The backup was restored to the previous workspace, but the active workspace changed before it could be opened.");
+          }
+
+          expectedLocalRevisions.current.set(
+            boundary.accountId,
+            result.envelope.localRevision,
+          );
+          history.current = nextHistory;
+          setPersistenceError(null);
+          dirty.current = true;
+          localChangeVersion.current += 1;
+          latestState.current = nextState;
+          setCanUndo(false);
+          setState(nextState);
+          advanceWorkspaceScope("import");
+          accountSwitching.current = false;
+          setWorkspaceSwitching(false);
+          setCloudWriteAllowed(previousCloudWriteAllowed);
+          setSyncStatus(boundary.authenticatedAccountId ? "saving" : "local");
+          setMetadataEpoch((value) => value + 1);
+          return {
+            choice,
+            importedEvidenceFiles: decision.evidenceWrites.length,
+            importedEvidenceBytes: decision.evidenceWrites.reduce(
+              (total, item) => total + item.blob.size,
+              0,
+            ),
+            removedSupersededEvidence: result.removedSupersededEvidence,
+            cleanupWarning: null,
+          };
+        } catch (error) {
+          if (error instanceof LocalWorkspaceConflictError) {
+            quarantineLocalConflict(error);
+          }
+          if (error instanceof AccountPersistenceScopeError) {
+            quarantinedAccounts.current.add(error.accountId);
+            if (
+              error.code === "erasure-fenced"
+              && error.accountId === persistenceAccountId(activeAccount.current)
+            ) {
+              terminalErasureAccount.current = error.accountId;
+              setTerminalErasureAccountId(error.accountId);
+              accountSwitching.current = true;
+              setWorkspaceSwitching(true);
+              setCloudWriteAllowed(false);
+              remoteLoaded.current = false;
+              reconciledAccount.current = null;
+            }
+            setPersistenceError(error.message);
+          }
+          throw error;
+        } finally {
+          if (portableArchiveBoundaryIsCurrent(boundary, true)) {
+            accountSwitching.current = false;
+            setWorkspaceSwitching(false);
+            setCloudWriteAllowed(previousCloudWriteAllowed);
           }
         }
       },
@@ -1868,7 +2778,11 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           throw error;
         }
       },
-      async beginActiveAccountErasure(expectedAccountId, armFence) {
+      async beginActiveAccountErasure(
+        expectedAccountId,
+        backupReceiptToken,
+        armFence,
+      ) {
         const target = workspaceKey(expectedAccountId);
         if (target === persistenceAccountId(null)) {
           throw new Error("Anonymous workspace reset does not use the connected-account erasure fence.");
@@ -1890,8 +2804,58 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         if (expectedPersistenceGeneration === undefined) {
           throw new Error("The account persistence scope has not been loaded.");
         }
+        const backupReceipt = preparedPortableArchiveReset.current;
+        if (
+          !backupReceipt
+          || backupReceipt.token !== backupReceiptToken
+          || backupReceipt.boundary.accountId !== target
+          || backupReceipt.boundary.activeAccountId !== target
+          || backupReceipt.boundary.authenticatedAccountId !== target
+          || backupReceipt.cloudBackupBoundary === null
+          || !portableArchiveBoundaryIsCurrent(backupReceipt.boundary)
+          || (expectedLocalRevisions.current.get(target) ?? 0)
+            !== backupReceipt.localBoundary.workspaceLocalRevision
+          || expectedPersistenceGeneration !== backupReceipt.localBoundary.generation
+        ) {
+          preparedPortableArchiveReset.current = null;
+          throw new Error("That backup confirmation is no longer valid for this exact account revision. Download a fresh full backup before erasing anything.");
+        }
+
+        // Consume the receipt before the first asynchronous cloud check. This
+        // prevents two callers from both presenting the same token while that
+        // check is in flight; every failed or interrupted attempt must start
+        // again from a newly downloaded exact-revision backup.
+        preparedPortableArchiveReset.current = null;
+
+        const supabase = getSupabase();
+        if (!supabase || !backupReceipt.cloudBackupBoundary) {
+          throw new Error("Private cloud access is unavailable for the account-erasure backup check.");
+        }
+        const [liveCloudBoundary, liveLocalBoundary] = await Promise.all([
+          readAccountErasureBackupBoundary(supabase, target),
+          readAccountPersistenceBackupBoundary(target),
+        ]);
+        if (
+          !cloudBackupBoundariesEqual(
+            backupReceipt.cloudBackupBoundary,
+            liveCloudBoundary,
+          )
+          || !localBackupBoundariesEqual(
+            backupReceipt.localBoundary,
+            liveLocalBoundary,
+          )
+          || !portableArchiveBoundaryIsCurrent(backupReceipt.boundary)
+        ) {
+          throw new Error("The private cloud workspace or evidence changed after the backup. Download a fresh full backup before erasing anything.");
+        }
 
         const outgoingScopeKey = workspaceScopeKeyRef.current;
+        const backupBoundary = backupReceipt.boundary;
+        const backupLocalBoundary = backupReceipt.localBoundary;
+        const cloudBackupBoundary = backupReceipt.cloudBackupBoundary;
+        if (!cloudBackupBoundary) {
+          throw new Error("A connected account needs a cloud-stable full backup before erasure.");
+        }
         // Close every writer before the first await. Retirement rejects all old
         // scope admissions synchronously and then drains their finalizers.
         terminalErasureAccount.current = target;
@@ -1912,10 +2876,22 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             || activeAccount.current !== target
             || authenticatedUserId.current !== target
             || workspaceScopeKeyRef.current !== outgoingScopeKey
+            || backupBoundary.workspaceGeneration !== workspaceGeneration.current
+            || backupBoundary.workspaceScopeKey !== workspaceScopeKeyRef.current
+            || backupBoundary.localChangeVersion !== localChangeVersion.current
+            || backupBoundary.persistenceGeneration
+              !== persistenceScopeGenerations.current.get(target)
+            || (expectedLocalRevisions.current.get(target) ?? 0)
+              !== backupLocalBoundary.workspaceLocalRevision
           ) {
-            throw new Error("The exact signed-in account changed before its erasure fence was armed.");
+            throw new Error("The exact signed-in account or workspace revision changed after its backup. Download a fresh full backup before erasing anything.");
           }
-          const scope = await armFence(expectedPersistenceGeneration);
+          const scope = await armFence(
+            expectedPersistenceGeneration,
+            backupLocalBoundary.workspaceLocalRevision,
+            backupLocalBoundary.evidenceRevision,
+            cloudBackupBoundary,
+          );
           if (
             scope.accountId !== target
             || !scope.tombstoned
@@ -1932,17 +2908,85 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           return scope;
         } catch (error) {
           // A successful atomic fence may have been followed by a response
-          // failure. Refresh its durable state, but never reopen this account.
+          // failure. Refresh its durable state. Reopen only when that read
+          // proves the atomic transaction left the scope unfenced.
+          let durableScope: AccountPersistenceScope | null = null;
           try {
-            const scope = await readAccountPersistenceScope(target);
-            persistenceScopeGenerations.current.set(target, scope.generation);
-            setPersistenceScopeGeneration(scope.generation);
+            durableScope = await readAccountPersistenceScope(target);
+            persistenceScopeGenerations.current.set(target, durableScope.generation);
+            setPersistenceScopeGeneration(durableScope.generation);
           } catch {
             // The original failure remains the useful diagnostic.
+          }
+          if (durableScope && !durableScope.tombstoned) {
+            terminalErasureAccount.current = null;
+            setTerminalErasureAccountId(null);
+            const identityStillCurrent = activeAccount.current === target
+              && authenticatedUserId.current === target
+              && workspaceScopeKeyRef.current === outgoingScopeKey;
+            if (identityStillCurrent) {
+              accountSwitching.current = false;
+              setWorkspaceSwitching(false);
+              advanceWorkspaceScope("reset");
+              if (error instanceof LocalWorkspaceConflictError) {
+                quarantineLocalConflict(error);
+              } else {
+                setAccountEpoch((value) => value + 1);
+              }
+            }
           }
           setPersistenceError(error instanceof Error
             ? error.message
             : "The account erasure fence could not be armed safely.");
+          setSyncStatus("error");
+          throw error;
+        }
+      },
+      async cancelActiveAccountErasure(
+        expectedAccountId,
+        tombstonedGeneration,
+        cancelFence,
+      ) {
+        const target = workspaceKey(expectedAccountId);
+        if (
+          target === persistenceAccountId(null)
+          || terminalErasureAccount.current !== target
+          || activeAccount.current !== target
+          || authenticatedUserId.current !== target
+          || persistenceScopeGenerations.current.get(target)
+            !== tombstonedGeneration
+        ) {
+          throw new Error("Only the exact active terminal account can cancel an unstarted cloud deletion.");
+        }
+        try {
+          const restored = await cancelFence();
+          if (
+            restored.accountId !== target
+            || restored.tombstoned
+            || restored.generation <= tombstonedGeneration
+          ) {
+            throw new Error("The local account-erasure cancellation did not return a fresh writable scope.");
+          }
+          persistenceScopeGenerations.current.set(target, restored.generation);
+          setPersistenceScopeGeneration(restored.generation);
+          terminalErasureAccount.current = null;
+          setTerminalErasureAccountId(null);
+          accountSwitching.current = false;
+          setWorkspaceSwitching(false);
+          remoteLoaded.current = false;
+          reconciledAccount.current = null;
+          setCloudWriteAllowed(false);
+          advanceWorkspaceScope("reset");
+          setPersistenceError("The cloud account changed after that backup, so erasure was cancelled before any cloud data was deleted. Reconcile and download a fresh backup.");
+          setSyncStatus("connecting");
+          setAccountEpoch((value) => value + 1);
+          return restored;
+        } catch (error) {
+          // Without a proved cancellation result the permanent barrier stays
+          // closed; a later recovery may inspect server lifecycle safely.
+          setPersistenceError(error instanceof Error
+            ? error.message
+            : "The unstarted cloud deletion could not be cancelled safely.");
           setSyncStatus("error");
           throw error;
         }
@@ -2037,6 +3081,20 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             nextRevision = envelope.revision;
             nextServerUpdatedAt = envelope.serverUpdatedAt;
             nextRecoveryMessage = envelope.recovery?.message ?? null;
+            if (recovered.changed) {
+              await persistWorkspace({
+                accountId: anonymousAccountId,
+                state: recovered.state,
+                history: recovered.history,
+                dirty: nextDirty,
+                revision: envelope.revision,
+                serverUpdatedAt: envelope.serverUpdatedAt,
+                savedAt: new Date().toISOString(),
+                ...(envelope.anonymousHandoff
+                  ? { anonymousHandoff: envelope.anonymousHandoff }
+                  : {}),
+              }, recovered.createdEvidence);
+            }
             stagedAnonymousEvidenceCommitted = true;
           }
         } catch (error) {
@@ -2103,7 +3161,39 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         }
         return { sessionWarning };
       },
-      async resetWorkspace() {
+      async resetWorkspace(resetReceiptToken) {
+        const resetReceipt = resetReceiptToken
+          ? preparedPortableArchiveReset.current
+          : null;
+        if (
+          resetReceiptToken
+          && (
+            !resetReceipt
+            || resetReceipt.token !== resetReceiptToken
+          )
+        ) {
+          throw new Error("That backup confirmation is no longer valid. Download a fresh full backup before resetting anything.");
+        }
+        if (resetReceipt) {
+          if (
+            resetReceipt.boundary.authenticatedAccountId !== null
+            || resetReceipt.boundary.activeAccountId !== null
+          ) {
+            preparedPortableArchiveReset.current = null;
+            throw new Error("A connected workspace must use the separate account-erasure flow after its backup is confirmed.");
+          }
+          if (
+            !portableArchiveBoundaryIsCurrent(resetReceipt.boundary)
+            || (expectedLocalRevisions.current.get(resetReceipt.boundary.accountId) ?? 0)
+              !== resetReceipt.localBoundary.workspaceLocalRevision
+            || resetReceipt.boundary.persistenceGeneration
+              !== resetReceipt.localBoundary.generation
+          ) {
+            preparedPortableArchiveReset.current = null;
+            throw new Error("This workspace changed after the backup was created. Download a fresh full backup before resetting anything.");
+          }
+          preparedPortableArchiveReset.current = null;
+        }
         const outgoingScopeKey = workspaceScopeKeyRef.current;
         const resetActiveAccount = activeAccount.current;
         const resetAuthenticatedAccount = authenticatedUserId.current;
@@ -2131,6 +3221,12 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             || activeAccount.current !== resetActiveAccount
             || authenticatedUserId.current !== resetAuthenticatedAccount
             || workspaceScopeKeyRef.current !== outgoingScopeKey
+            || (resetReceipt !== null
+              && (
+                localChangeVersion.current !== resetReceipt.boundary.localChangeVersion
+                || (expectedLocalRevisions.current.get(resetAccountId) ?? 0)
+                  !== resetReceipt.localBoundary.workspaceLocalRevision
+              ))
           ) {
             throw new Error("The active account changed before workspace erasure could begin.");
           }
@@ -2142,19 +3238,39 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           await workspaceOperations.retire(outgoingScopeKey);
           await localWriteQueues.current.get(resetAccountId);
           ensureResetCurrent();
-          if (resetAccountId === persistenceAccountId(null)) {
-            await disableLocalBootstrapLegacyImport({
-              accountId: resetAccountId,
-              ensureCurrent: ensureResetCurrent,
-            }, { disableLegacyWorkspaceImport });
-            localStorage.removeItem(LEGACY_WORKSPACE_STORAGE_KEY);
-            localStorage.removeItem(LEGACY_LAST_REMINDER_KEY);
+          let erased: AccountPersistenceEraseResult;
+          if (resetReceipt) {
+            erased = await deleteAccountPersistenceAtRevision(
+              resetAccountId,
+              resetPersistenceGeneration,
+              resetReceipt.localBoundary.workspaceLocalRevision,
+              resetReceipt.localBoundary.evidenceRevision,
+            );
+            // The IndexedDB transaction permanently disabled legacy import and
+            // removed reminder metadata. Browser-local mirrors are best-effort
+            // cleanup only and cannot resurrect data if removal is interrupted.
+            try {
+              localStorage.removeItem(LEGACY_WORKSPACE_STORAGE_KEY);
+              localStorage.removeItem(LEGACY_LAST_REMINDER_KEY);
+              localStorage.removeItem(reminderStorageKey(resetAccountId));
+            } catch {
+              // IndexedDB remains the authority after the atomic reset.
+            }
+          } else {
+            if (resetAccountId === persistenceAccountId(null)) {
+              await disableLocalBootstrapLegacyImport({
+                accountId: resetAccountId,
+                ensureCurrent: ensureResetCurrent,
+              }, { disableLegacyWorkspaceImport });
+              localStorage.removeItem(LEGACY_WORKSPACE_STORAGE_KEY);
+              localStorage.removeItem(LEGACY_LAST_REMINDER_KEY);
+            }
+            localStorage.removeItem(reminderStorageKey(resetAccountId));
+            erased = await deleteAccountPersistence(
+              resetAccountId,
+              resetPersistenceGeneration,
+            );
           }
-          localStorage.removeItem(reminderStorageKey(resetAccountId));
-          const erased = await deleteAccountPersistence(
-            resetAccountId,
-            resetPersistenceGeneration,
-          );
           persistenceScopeGenerations.current.set(resetAccountId, erased.scope.generation);
           setPersistenceScopeGeneration(erased.scope.generation);
         } catch (error) {
@@ -2169,6 +3285,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           }
           accountSwitching.current = identityChanged;
           setWorkspaceSwitching(identityChanged);
+          if (error instanceof LocalWorkspaceConflictError) {
+            quarantineLocalConflict(error);
+          }
           if (authenticatedUserId.current) setAccountEpoch((value) => value + 1);
           throw error;
         }
@@ -2311,7 +3430,6 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         }
         const generation = workspaceGeneration.current;
         const handoffScopeKey = workspaceScopeKeyRef.current;
-        const decision = decideAnonymousHandoff(choice);
         accountSwitching.current = true;
         setWorkspaceSwitching(true);
         let stagedTargetEvidence:
@@ -2319,9 +3437,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           | Awaited<ReturnType<typeof externalizeEmbeddedEvidence>>
           | null = null;
         let stagedTargetEvidenceCommitted = false;
-        const handoffEvidenceJournal: EvidenceBlobJournalEntry[] = [];
-        let handoffEvidenceCommitted = false;
-        let handoffTargetGeneration: PersistenceScopeGeneration | null = null;
+        let preparedHandoffEvidence: EvidenceBlobRecord[] = [];
         return workspaceOperations.run(handoffScopeKey, async () => {
           try {
             const supabase = getSupabase();
@@ -2397,6 +3513,11 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
               ) {
                 targetWasQuarantined = true;
                 quarantinedAccounts.current.add(targetAccountId);
+                const rawTarget = await readRawWorkspace(targetAccountId);
+                expectedLocalRevisions.current.set(
+                  targetAccountId,
+                  quarantinedWorkspaceLocalRevision(rawTarget),
+                );
               } else {
                 throw error;
               }
@@ -2428,7 +3549,6 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
               return;
             }
             const targetGeneration = targetScope.generation;
-            handoffTargetGeneration = targetGeneration;
 
             await requireExactAuthenticatedAccount();
             const { data: fetchedRow, error: fetchError } = await supabase
@@ -2446,22 +3566,26 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
                 }
               : null;
             const remoteExists = remoteRow !== null;
-            const sourceDecision = decideAccountHandoffSource({
+            const handoffPlan = planProviderAccountHandoff({
+              choice,
               localExists: Boolean(targetEnvelope),
               localDirty: targetEnvelope?.dirty ?? false,
               localRevision: targetEnvelope?.revision,
               remoteExists,
               remoteRevision: remoteRow?.revision,
+              targetWasQuarantined,
             });
-            if (sourceDecision.action === "invalid-revision") {
-              throw new Error(`The account's ${sourceDecision.source} workspace has an invalid revision. Neither copy was changed.`);
+            if (handoffPlan.kind === "invalid-revision") {
+              throw new Error(`The account's ${handoffPlan.source} workspace has an invalid revision. Neither copy was changed.`);
             }
-            if (sourceDecision.action === "conflict") {
-              throw new Error(`This device has unsaved account changes based on revision ${sourceDecision.localRevision}, while cloud is at revision ${sourceDecision.remoteRevision}. Sign out to preserve the anonymous workspace, then resolve the account sync conflict before combining them.`);
+            if (handoffPlan.kind === "source-conflict") {
+              throw new Error(`This device has unsaved account changes based on revision ${handoffPlan.localRevision}, while cloud is at revision ${handoffPlan.remoteRevision}. Sign out to preserve the anonymous workspace, then resolve the account sync conflict before combining them.`);
             }
-            if (targetWasQuarantined && !remoteExists && decision.action === "open-account") {
+            if (handoffPlan.kind === "quarantined-account-missing-cloud") {
               throw new Error("The account's device copy is quarantined and no cloud snapshot exists. Sign out, then recover or explicitly replace that device copy before opening it.");
             }
+            const decision = handoffPlan.handoff;
+            const sourceDecision = handoffPlan.source;
 
             let migratedRemoteState: AppState | null = null;
             let remoteUpdatedAt: string | undefined;
@@ -2583,37 +3707,19 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
                 },
               });
               requireCurrentHandoff("The signed-in account changed before evidence files could be copied.");
-              await appendEvidenceBlobCopies(
-                prepared,
-                targetAccountId,
-                handoffEvidenceJournal,
-                {
-                  readTarget: async (accountId, goalId, evidenceId) => {
-                    const existing = await readEvidenceBlob(
-                      accountId,
-                      goalId,
-                      evidenceId,
-                      targetGeneration,
-                    );
-                    if (existing && decision.action === "merge-anonymous") {
-                      throw new Error("A target evidence key already exists outside the account workspace. Nothing was overwritten.");
-                    }
-                    return existing;
-                  },
-                  writeTarget: async (item) => {
-                    requireCurrentHandoff("The signed-in account changed while evidence files were being copied.");
-                    await storeEvidenceBlob(item, targetGeneration);
-                  },
-                },
-              );
+              preparedHandoffEvidence = prepared.map((item) => ({
+                ...item,
+                accountId: targetAccountId,
+              }));
             }
 
             await requireExactAuthenticatedAccount();
-            const replacementEnvelope: Omit<WorkspaceEnvelope, "localRevision"> = {
+            const replacementEnvelope: WorkspaceEnvelope = {
               accountId: targetAccountId,
               state: nextState,
               history: trimWorkspaceHistory(nextHistory),
               dirty: nextDirty,
+              localRevision: expectedLocalRevisions.current.get(targetAccountId) ?? 0,
               revision: accountBaseRevision,
               serverUpdatedAt: accountBaseServerUpdatedAt,
               savedAt,
@@ -2622,17 +3728,65 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
                 localRevision: frozenAnonymousLocalRevision,
               },
             };
-            const saved = targetWasQuarantined
-              ? await replaceWorkspaceAfterRecoveryChoice(
-                  replacementEnvelope,
-                  targetGeneration,
-                )
-              : await persistWorkspace(replacementEnvelope);
+            requireCurrentHandoff("The signed-in account changed before the account handoff could be committed.");
+            let saved: WorkspaceEnvelope;
+            try {
+              const handoffPersistenceInput = {
+                envelope: replacementEnvelope,
+                evidence: preparedHandoffEvidence,
+                stagedEvidence: stagedTargetEvidence?.createdEvidence ?? [],
+                collisionPolicy: decision.action === "merge-anonymous"
+                  ? "reject-existing" as const
+                  : "replace-inspected-workspace" as const,
+                replaceQuarantinedWorkspace: targetWasQuarantined,
+              };
+              const persistHandoff = () => applyAccountHandoffPersistence(
+                handoffPersistenceInput,
+                targetGeneration,
+              );
+              const committed = decision.action === "merge-anonymous"
+                ? await persistHandoff()
+                : (await commitAuthoritativeWorkspaceReplacement({
+                    accountId: targetAccountId,
+                    persistenceGeneration: targetGeneration,
+                    sourceStates: [
+                      ...(targetEnvelope
+                        ? [
+                            clone(targetEnvelope.state),
+                            ...targetEnvelope.history.map(clone),
+                          ]
+                        : []),
+                      ...(migratedRemoteState ? [clone(migratedRemoteState)] : []),
+                    ],
+                    targetStates: [
+                      clone(replacementEnvelope.state),
+                      ...replacementEnvelope.history.map(clone),
+                    ],
+                    persistTarget: async () => {
+                      await requireExactAuthenticatedAccount();
+                      if (
+                        localChangeVersion.current !== frozenAnonymousVersion
+                        || !workspaceStatesEqual(
+                          frozenAnonymousState,
+                          latestState.current,
+                        )
+                      ) {
+                        throw new Error("The anonymous workspace changed before the account handoff could be committed.");
+                      }
+                      return persistHandoff();
+                    },
+                  })).result;
+              saved = committed.envelope;
+            } catch (error) {
+              if (error instanceof LocalWorkspaceConflictError) {
+                quarantineLocalConflict(error);
+              }
+              throw error;
+            }
             expectedLocalRevisions.current.set(targetAccountId, saved.localRevision);
             // Metadata now references every copied byte. From this point onward
             // rolling files back would create broken evidence references.
             stagedTargetEvidenceCommitted = Boolean(stagedTargetEvidence);
-            handoffEvidenceCommitted = fileCopies.length > 0;
             quarantinedAccounts.current.delete(targetAccountId);
 
             requireCurrentHandoff("The account changed after its workspace was saved. The saved target remains internally consistent and the anonymous original was preserved.");
@@ -2658,38 +3812,13 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             setSyncStatus("connecting");
             setAccountEpoch((value) => value + 1);
           } catch (error) {
-            let reportedError: unknown = error;
-            if (
-              handoffEvidenceJournal.length
-              && !handoffEvidenceCommitted
-              && handoffTargetGeneration !== null
-            ) {
-              const rollbackGeneration = handoffTargetGeneration;
-              try {
-                await rollbackEvidenceBlobJournal(handoffEvidenceJournal, {
-                  restore: async (item) => {
-                    await storeEvidenceBlob(item, rollbackGeneration);
-                  },
-                  remove: async (accountId, goalId, evidenceId) => {
-                    await deleteEvidenceBlob(
-                      accountId,
-                      goalId,
-                      evidenceId,
-                      rollbackGeneration,
-                    );
-                  },
-                });
-              } catch (rollbackError) {
-                reportedError = new EvidenceCompensationError(error, [rollbackError]);
-              }
-            }
             if (pendingAccountHandoff.current?.accountId === pending.accountId) {
-              setPersistenceError(reportedError instanceof Error
-                ? `Workspace choice could not finish: ${reportedError.message}`
+              setPersistenceError(error instanceof Error
+                ? `Workspace choice could not finish: ${error.message}`
                 : "Workspace choice could not finish. Nothing was removed from the device copy.");
               setSyncStatus("conflict");
             }
-            throw reportedError;
+            throw error;
           } finally {
             if (stagedTargetEvidence && !stagedTargetEvidenceCommitted) {
               await rollbackExternalizedEvidence(stagedTargetEvidence);
@@ -2779,6 +3908,59 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
                 return;
               }
               if (!conflictStillCurrent()) return;
+            } else {
+              const persistenceId = persistenceAccountId(resolutionAccountId);
+              const persistenceGeneration = persistenceScopeGenerations.current.get(
+                persistenceId,
+              );
+              if (persistenceGeneration === undefined) {
+                throw new Error("The account persistence scope has not been loaded.");
+              }
+              const sourceState = clone(latestState.current);
+              const sourceHistory = trimWorkspaceHistory(history.current.map(clone));
+              const sourceChangeVersion = localChangeVersion.current;
+              try {
+                await commitAuthoritativeWorkspaceReplacement({
+                  accountId: persistenceId,
+                  persistenceGeneration,
+                  sourceStates: [sourceState, ...sourceHistory],
+                  targetStates: [remote.state],
+                  persistTarget: async () => {
+                    if (
+                      !conflictStillCurrent()
+                      || sourceChangeVersion !== localChangeVersion.current
+                      || !workspaceStatesEqual(sourceState, latestState.current)
+                    ) {
+                      throw new Error("The device workspace changed before the cloud choice could be committed.");
+                    }
+                    return persistWorkspace({
+                      accountId: persistenceId,
+                      state: remote.state,
+                      history: [],
+                      dirty: intent.shouldSave,
+                      revision: remote.revision,
+                      serverUpdatedAt: remote.updatedAt,
+                      savedAt: new Date().toISOString(),
+                    }, remote.createdEvidence, {
+                      removeUnreferencedEvidence: true,
+                    });
+                  },
+                });
+              } catch (error) {
+                try {
+                  await rollbackEvidenceWrites(remote.createdEvidence);
+                } catch (rollbackError) {
+                  throw new AggregateError(
+                    [error, rollbackError],
+                    "The cloud choice failed and its prepared evidence could not be fully rolled back.",
+                  );
+                }
+                throw error;
+              }
+              if (
+                !conflictStillCurrent()
+                || sourceChangeVersion !== localChangeVersion.current
+              ) return;
             }
             remoteConflict.current = null;
             setSyncConflict(null);
@@ -2791,6 +3973,19 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             localChangeVersion.current += 1;
             if (intent.action === "use-cloud" || intent.action === "use-cloud-and-save") {
               adoptRemoteWorkspace(remote.state);
+              if (!intent.shouldSave) {
+                try {
+                  await recoverRemoteEvidenceCleanup(
+                    persistenceAccountId(resolutionAccountId),
+                  );
+                } catch (error) {
+                  setPersistenceError(error instanceof Error
+                    ? `The cloud workspace was selected, but discarded evidence cleanup remains pending: ${error.message}`
+                    : "The cloud workspace was selected, but discarded evidence cleanup remains pending.");
+                  setSyncStatus("error");
+                  return;
+                }
+              }
             } else {
               const nextState = { ...latestState.current, updatedAt: new Date().toISOString() };
               latestState.current = nextState;
@@ -2874,7 +4069,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     value.user,
     value.workspaceSwitching,
   ]);
-  const actionsValue: AppActionsContextValue = value;
+  const actionsValue = useStableAppActions(value);
 
   return (
     <WorkspaceDataProvider value={workspaceValue}>

@@ -2,13 +2,14 @@
 
 import { useState } from "react";
 import { ArrowRight, Check, Layers3, ShieldCheck, Sparkles, Target } from "lucide-react";
-import { useApp } from "@/components/app-provider";
+import { useAppActions, useWorkspaceData } from "@/components/app-provider";
 import { Button, Field } from "@/components/ui";
 import { WORKSPACE_TEXT_LIMITS } from "@/lib/state-schema";
 import { terminologyForms } from "@/lib/terminology";
 
 export function Onboarding({ systemAlert }: { systemAlert?: string | null }) {
-  const { state, completeOnboarding } = useApp();
+  const { state } = useWorkspaceData();
+  const { completeOnboarding } = useAppActions();
   const terms = terminologyForms(state.settings.terminology);
   const [step, setStep] = useState(0);
   const [name, setName] = useState("");

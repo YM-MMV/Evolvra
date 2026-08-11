@@ -1,214 +1,326 @@
 # Project audit and next-step plan
 
-Audit date: 28 July 2026
+Audit refreshed: 11 August 2026
 
 ## Executive assessment
 
-Evolvra is substantially feature-complete for the agreed beta scope. The original safety and workflow gaps have been addressed: account-scoped local storage, revision-safe sync, strict state migration, evidence stored outside the workspace document, verified erasure, complete goal/action workflows, source-traceable analytics, recovery, offline support, accessibility foundations, CI, and operations documentation are present.
+Evolvra now covers the agreed non-gamified beta product plan from end to end.
+The original P0 data-safety risks and the major workflow gaps are implemented,
+and a final read-only audit found no remaining P0 product or data-safety defect.
+AI remains deliberately deferred and is not an unfinished release item.
 
-XP, levels, scoring, rewards, achievements, and AI integration are intentionally absent. They are not unfinished beta work.
+The current working tree is a new maintenance candidate built on the completed
+state-v3 production cutover at `292d4bc`. It adds product-truth fixes, complete
+portable backups, capacity recovery, narrower provider contexts, more testable
+cloud coordinators, recovery-dialog accessibility, browser/device/visual gates,
+Storage backup tooling, and scheduled production assurance. This candidate is
+not a release until its exact commit passes the local and hosted gates, is
+merged to `main`, deployed, and smoke-tested.
 
-The release is not complete yet. The current worktree is newer than the last pushed release-branch commit, `main` and production still run the pre-v3 application, and no hosted CI result exists for the final in-flight changes. Production still serves the old `evolvra-shell-v1` worker and lacks the candidate security headers; the linked database was last verified with only the immutable `202607150001` baseline applied, so its retired XP-era schema is not removed until the forward chain is deployed. The next priority is therefore a controlled release, not another broad feature cycle.
+Production editing remains paused until the owner-assisted authenticated smoke
+is recorded. After the Docker/local gate, linked dry-run, and explicit
+deployment-owner approval were recorded on 11 August, production migration
+`202608020011_account_erasure_backup_boundary.sql` was applied. The linked
+ledger is aligned through `.011`, and a follow-up dry-run reports the remote
+database up to date. The compatible application is not deployed yet.
 
-## Evidence at this audit
+## Current release facts
 
-- Current branch: `agent/remove-xp-levels`.
-- Pushed branch head: `dec0d30`; current worktree contains additional reviewed but uncommitted changes.
-- `origin/main` and the production application remain at the pre-v3 line rooted at `ca81723`.
-- A clean `npm ci` succeeds and the production dependency audit reports zero vulnerabilities.
-- The complete local `npm run check` passes on the candidate tree.
-- The current unit suite contains 35 files and 493 tests.
-- The production build and bundle gate pass: 22 JavaScript chunks total 1,420,515 bytes.
-- The local Chromium gate passes 29 workflows, including accessibility, keyboard, mobile, offline, recovery, evidence, and terminology. Four cloud workflows are intentionally skipped locally without the Supabase stack and remain required in hosted CI.
-- Routine near-limit workspace mutations use copy-on-write structural sharing. The 5,179,473-byte fixture completed in about 23.83 ms cold and 7.65 ms warm under 100 ms and 25 ms ceilings, without serialising the whole workspace or timeline.
-- The previously pushed `dec0d30` commit passed both hosted GitHub jobs, but that result is not evidence for the current worktree.
-- Exact-commit hosted CI, protected Preview review, linked database dry-run, and the production smoke test remain outstanding.
+- Working branch: `agent/finish-product-plan`.
+- Current production and `main`: `292d4bc81bcacb8097a082006be3dc60f1aab8a2`.
+- Stable production URL: <https://evolvra-seven.vercel.app>.
+- Linked Supabase project: `gmityvwkrhrraubhmyez`, PostgreSQL
+  `17.6.1.141`, production migrations aligned through `202608020011`.
+- Fresh verified pre-release backup:
+  `evolvra-production-backup-20260809T133841Z`, created from
+  `2026-08-09T13:38:41Z` through `13:42:08Z`. Its checksum ledger
+  `cf72fd9a57f27eb639833bc7ab4520e419588ab715c2b2480e1a5e5ceda89e5d`
+  was reverified on 11 August. It contains database/Auth/Storage metadata, the
+  migration ledger, retained dry-run output, release baseline SHA, and a
+  separately hashed evidence inventory. There were no Auth users, workspace
+  rows, or Storage objects; the empty inventory is current backup evidence but
+  not a non-empty restore drill. PostgreSQL dumps never contain Storage bytes.
+- Deployment and rollback owner: `YM-MMV`.
+- The owner has paused production editing and authorised the fresh backup,
+  local and linked `.011` verification, production `.011` application, merge,
+  deployment, and smoke testing. Completion evidence is still required for
+  Git publication, hosted CI, deployment, and smoke testing.
+- Required rollback strategy: roll forward with a state-v3/IndexedDB-v4-
+  compatible hotfix; never deploy a pre-v3 application or an IndexedDB-v3-or-
+  earlier persistence client after the v4 fence has opened.
+- Candidate service-worker cache version: `2026-08-02.3`.
 
-## Completed beta scope
+## Completed scope
 
-### Data safety, privacy, and recovery
+### Account isolation, sync, validation, and erasure
 
-- Anonymous and per-account workspaces are isolated in generation-fenced IndexedDB records.
-- Account changes close writers synchronously before a new authenticated identity is published. The outgoing workspace is settled before the destination opens, undo history never crosses accounts, and cloud writes remain closed until reconciliation finishes.
-- Anonymous-to-account handoff offers explicit account, device, or lossless-merge choices. Merge remaps identifiers and evidence references while preserving the anonymous original.
-- Cloud snapshots use server revisions and compare-and-swap writes rather than client-clock last-write-wins.
-- Imports, local records, cloud snapshots, and legacy upgrades share versioned validation with byte, node, depth, string, collection, and future-version limits.
-- Corrupt records recover from valid history where possible or remain quarantined, exportable, and write-protected.
-- Evidence bytes live in IndexedDB and private Supabase Storage. Workspace state holds metadata only; preview, download, rename, upload, delete, compensation, and stale-scope protection are implemented.
-- Account erasure has durable ownership, tombstones, exact-account checks, partial-failure reporting, retries, Storage verification, and stale-tab fencing.
+- Anonymous and per-account device workspaces are isolated by account and
+  generation.
+- Account changes close writer barriers before publishing the new identity.
+  Undo history, device evidence, and cloud writes cannot cross accounts.
+- Anonymous-to-account handoff offers explicit account, device, or lossless
+  merge choices.
+- Cloud snapshots use server revisions and compare-and-swap conflict handling,
+  with reconnect retries and honest local/saving/offline/conflict/error states.
+- Local, cloud, legacy, and imported state share strict current-version
+  validation, structural limits, migration, quarantine, and recovery.
+- Evidence bytes live outside workspace JSON in IndexedDB and private Supabase
+  Storage, with exact-account immutable paths, durable metadata compensation,
+  permanent server-side cleanup claims, and stale-scope fencing. Claims are
+  created only after authoritative metadata drops a path and prevent both
+  snapshot and Storage resurrection before byte deletion.
+- Account erasure uses durable checkpoints, verified cloud and device phases,
+  tombstones, exact-account retry rules, and explicit partial-failure recovery.
+  A new connected erasure also requires a complete portable-backup receipt
+  bound to its exact local revision plus cloud workspace/evidence revisions.
+  A later cross-device save or evidence mutation is rejected as stale while
+  the account lifecycle and data remain active.
 
-### Core product workflows
+### Goals, actions, progress, and history
 
-- Numeric, weighted-milestone, consistency, and open-reflection progress models are supported without fabricated percentages.
-- Goals, metrics, milestones, actions, mappings, statuses, archives, restores, and permanent deletion are editable.
-- Actions support one-off and recurring work, multiple linked goals, notes, actual duration, evidence annotations, metric changes, due-state rules, and immutable completion history.
-- Open goals preserve real measured progress when marked complete; open-reflection goals use dated check-ins.
-- Goal templates, board/list views, due/upcoming/anytime action views, custom terminology, dashboard arrangement, deep links, and archive/restore workflows are present.
+- Numeric, weighted milestone, consistency, and open-reflection models are
+  editable without fabricated progress.
+- Goals, measurements, milestones, actions, mappings, statuses, archives, and
+  restore/delete workflows support CRUD and ordering.
+- Actions support one-off and recurring work, multiple connected goals,
+  reusable changes for multiple metrics, notes, actual duration, evidence, and
+  immutable occurrence history.
+- Recurrence uses real occurrences and due periods; repeated clicks cannot
+  duplicate a completion.
+- Weighted plans reject totals above 100%. Deliberate partial plans below 100%
+  are normalized across their defined milestones and labelled accordingly.
+- Completing a measured goal preserves the real outcome. The first completion
+  also stores an immutable outcome snapshot so later edits do not rewrite it.
+- Open-reflection goals use dated check-ins rather than percentages.
+- Consistency measurements roll at their actual period boundary before
+  completion snapshots and show explicitly named seven-day, 30-day, lifetime,
+  recorded-time, and previous-period context.
+- Timeline and histories are paginated rather than silently truncated.
 
-### Analytics and reviews
+### Analytics, reviews, and dashboard truth
 
-- Immutable source records retain goal, area, and personal-quality attribution as it existed when an action or measurement occurred.
-- Timeline, recent activity, 30/90/365-day quality activity, area activity/time, goal links, and review context trace back to source records.
-- Weekly and monthly reviews prepare movement, lifecycle, comparison, and source-link context.
-- Histories are paginated rather than silently truncated.
-- Consistency views show seven-day activity, 30-day activity, total sessions, recorded time, and current-versus-previous 30-day momentum.
+- Immutable activity records retain goal, area, personal-quality, metric-label,
+  metric-unit, and causal attribution as it existed at the time.
+- Metric history never relabels old values with the current unit and never
+  draws a continuous trend across mixed units.
+- Weekly review movement is split at unit boundaries, so an earlier value is
+  never presented under a later unit.
+- Weekly and monthly review context includes movement, lifecycle, time by area,
+  comparison, source identifiers, and links to underlying records.
+- Saved reviews retain bounded context as it appeared when they were saved.
+- Personal-quality analytics describe connected activity, not a score or claim
+  about personal worth.
+- All eight dashboard regions can be shown, hidden, and reordered.
+- Dashboard due, upcoming, recently active, and momentum language maps to the
+  underlying records it actually describes.
 
-### Platform and release foundations
+### Portability, capacity, and recovery
 
-- The service worker uses bounded, versioned caches; safe request/response admission; exact known-goal route preparation; multi-tab manifest union; activation carry-forward; pinned build dependencies; acknowledgement; and retry after reconnect/controller change.
-- Authentication, callbacks, APIs, evidence, unsafe responses, token-bearing requests, and arbitrary goal-route discovery are excluded from caching.
-- Install/update prompts, production icons, local reminders, responsive layouts, safe areas, reduced motion, keyboard/focus handling, live regions, and automated axe checks are present.
-- Security headers, beta `noindex`, opt-in bounded telemetry, pinned toolchains, dependency automation, bundle limits, state-v3 fixtures, two-user RLS tests, cloud browser tests, recovery docs, and deployment docs are present.
+- Records-only JSON and timeline CSV exports remain available and are
+  accurately labelled as excluding evidence bytes.
+- A versioned `.evolvra` archive contains canonical workspace JSON, a
+  checksummed manifest, and every referenced evidence payload.
+- Export uses device bytes first and an exact-authenticated-account cloud
+  fallback. A missing or mismatched file prevents a “complete backup” result.
+- Import validates archive framing, canonical JSON, schema, file metadata,
+  lengths, hashes, duplicate keys, extra bytes, and completeness before showing
+  an explicit merge or destructive replace choice.
+- Import commits the resulting workspace envelope, imported evidence bytes,
+  and replace cleanup of superseded account-scoped device evidence in one
+  IndexedDB transaction under the active account, generation, and exact local
+  revision. An abort publishes none of them.
+- Both merge and replace clear recent undo history and are explicitly
+  non-undoable. Restore inspection/application stays blocked during unresolved
+  cloud/sync conflicts and pending or rendered account-handoff choices; export
+  remains available while the source of truth is resolved.
+- Replace sweeps device evidence inside the same IndexedDB transaction and
+  advances the workspace CAS even when metadata is otherwise identical. It
+  records remote cleanup intents before commit, waits for normal revision-safe
+  sync to make replacement metadata authoritative, then obtains permanent
+  database claims before removing paths that lost their final reference.
+- Capacity forecasting warns before the 5 MiB workspace ceiling and estimates
+  remaining activity headroom without presenting the estimate as a guarantee.
+- Archive-and-reset refuses incomplete backups and requires a one-use receipt
+  bound to the exact persisted revision represented by the downloaded archive.
+  A later save in any tab makes that receipt stale and forces a fresh backup
+  before anonymous data can be reset. Connected erasure extends the receipt to
+  cloud snapshot/evidence coordinates and cancels its unstarted local fence
+  after an authoritative stale-backup rejection.
 
-## Phase 0 — Freeze and release the current beta
+### Architecture and automated assurance
 
-These steps are sequential and block `main`.
+- Product consumers use separate workspace-data, provider-status, and stable
+  action contexts; the compatibility all-in-one consumer has been removed.
+- Cloud reconciliation, cloud save, portable archive coordination, domain
+  commands, provider state, evidence operations, lifecycle presentation,
+  account-erasure checkpoints, historical snapshots, capacity analysis, and
+  state migrations have focused seams and tests.
+- Safety-critical modules have explicit coverage thresholds. Property tests
+  exercise migrations, imports, merges, recurrence, and compensation behavior.
+- IndexedDB v4 rollout coverage proves that a current client closes a live v3
+  connection, preserves v3 live evidence while assigning `writeId`, creates
+  the separate staging store, and prevents an old v3 bundle from reopening the
+  newer persistence database.
+- CI covers pinned install, dependency audit, retired-mechanic and no-AI guards,
+  typecheck, lint, unit/coverage, service worker, icons, build/bundle, Chromium,
+  Firefox, WebKit, accessibility, database migration, RLS, and cloud workflows.
+- Bootstrap, quarantine, and terminal recovery blockers share a labelled modal
+  alert boundary and explicit priority. Only the highest attached blocker owns
+  focus containment, inert background, Escape safety, and scroll lock; ordinary
+  modals share reference-counted overlay ownership and cannot release it.
+- Device tests cover 320 px through desktop layouts, zoom/reflow,
+  forced-colour behavior, reduced motion, and safe areas.
+- The maskable icon has an automated Android safe-zone check.
+- Production synthetics verify routes, security headers, manifest/icon MIME,
+  service-worker version, and telemetry rejection.
+- Weekly disposable Supabase drills re-run migration, RLS, sync, conflict,
+  evidence, handoff, backup-first erasure, and cross-device stale-backup paths.
+- Storage backup tooling inventories private objects, downloads bytes,
+  records hashes, detects drift, and supports restore verification without
+  treating a database dump as file protection.
 
-1. Finish the provider integration review and deliberately include or exclude every in-flight file.
-2. Inspect the complete diff and staged set. Confirm that no environment file, credential, browser artifact, build output, or unrelated user change is included.
-3. Run a clean install, production dependency audit, and the complete `npm run check` gate on the frozen tree.
-4. Commit and push the exact release candidate to `agent/remove-xp-levels`.
-5. Require both hosted GitHub jobs on that exact SHA:
-   - application validation, build, bundle, Chromium workflows, and accessibility;
-   - fresh and legacy database migration, SQL lint, two-user RLS, revisions, cloud evidence, handoff, and erasure.
-6. Review a staged Production build from the exact commit with automatic production-domain assignment disabled. Verify Production environment variables, Supabase redirect allow-list, CSP/security headers, no private telemetry, manifest/icons, and service-worker version.
-7. Record the database backup identifier and time, migration dry-run output, deployment owner, rollback owner, and an edit-pause window.
-8. With explicit production approval, pause old-client editing, apply migrations through `202607270010`, and immediately promote the compatible staged client without rebuilding.
-9. Smoke-test sign-in, account isolation, account/device/merge handoff, sync and reconnect, conflict recovery, evidence, import/export, quarantine recovery, erasure, PWA update, offline known-route navigation, and security headers.
-10. Complete the deployment record, require both CI checks in branch protection, merge the reviewed commit, and push `main`.
+## Release phase — required now
 
-Definition of done:
+Current pre-commit evidence on 11 August: the fresh backup and empty Storage
+inventory are verified; the complete `npm run check` worktree gate passed with
+682 unit tests, 436 focused coverage tests, and 69 non-cloud browser tests
+across Chromium, Firefox, and WebKit (the seven local-Supabase cases were
+intentionally skipped there). All 28 reviewed visual snapshots matched. The
+disposable Docker-backed `.011` gate then passed fresh and populated-legacy
+migration paths, SQL lint, two RLS regressions, the cloud build, and all seven
+cloud browser integrations. The linked dry-run showed only `.011`; the owner
+approved it, it was applied, the ledger aligned through `.011`, and the clean
+follow-up dry-run reported the remote database up to date.
 
-- The release SHA is identical in the local gate, hosted CI, staged artifact, production deployment, and `main`.
-- Production uses state v3 and migration `202607270010`.
-- Both hosted jobs and the production smoke test pass.
-- The deployment record and forward-hotfix rollback owner are complete.
+These steps are sequential. Do not reopen production editing between them.
 
-Important rollback rule: after the database cutover or a state-v3 workspace open, never deploy pre-v3 `ca81723`. Roll forward with a state-v3-compatible hotfix and a new additive migration when needed.
+1. Freeze the shared tree and review every modified or untracked path.
+2. Create and verify a fresh database/Auth/Storage-metadata backup for this
+   candidate. Inventory and download/hash any Storage object bytes separately;
+   a PostgreSQL dump is not evidence-file protection.
+3. Generate the 28 primary-route visual baselines in dark/light and
+   desktop/mobile modes, inspect representative images, then prove a clean
+   non-update run.
+4. Run the complete local gate on the frozen tree:
+   clean install, production dependency audit, guards, typecheck, lint, all
+   unit tests, coverage thresholds, service-worker/icon checks, production
+   build, bundle budget, and all local browser projects.
+5. With Docker running, reproduce the hosted database job on the frozen SHA:
+   fresh migration/reset, populated-legacy upgrade, SQL lint, RLS regression,
+   cloud-enabled build, and `npm run test:e2e:cloud`. Retain the
+   cross-device stale-backup result.
+6. Retain the linked Supabase `db push --linked --dry-run --yes` output. Confirm
+   production starts aligned through `202607270010` and the only pending item
+   is `202608020011_account_erasure_backup_boundary.sql`; stop on any other
+   result.
+7. Present the Docker/local and linked dry-run evidence to the
+   deployment/rollback owner and obtain explicit `.011` approval. The existing
+   approval through `.010` is insufficient. Apply `.011` only after approval,
+   then record a linked migration list aligned through `202608020011`.
+8. Commit and push the exact candidate to `agent/finish-product-plan`.
+9. Open a reviewed pull request and require both hosted jobs on that exact SHA:
+   application validation and database/RLS/cloud integration.
+   Verify repository branch protection requires those checks; this external
+   setting has not yet been recorded.
+10. Merge only that reviewed tree to `main` and confirm exact-main hosted CI.
+11. Deploy the exact `main` commit with the existing production variables.
+   Verify that the deployment metadata identifies the same commit and that the
+   `2026-08-02.3` worker is live and its explicit update cutover reloads every
+   open Evolvra tab.
+12. Run the read-only production synthetic and a fresh anonymous browser smoke
+   for onboarding, navigation, local persistence, offline known routes,
+   portable export/import preview, recovery, PWA update, and security headers.
+13. With a disposable production account and non-valuable fixture data, record:
+   magic-link sign-in; same-browser account isolation; authenticated save and
+   reconnect; an intentional two-client conflict and recovery; evidence
+   upload/download/rename/delete; portable backup round-trip; backup-first
+   account erasure; and a second-device post-backup mutation that is rejected
+   without tombstoning or deleting the active account, cloud state, or evidence.
+14. Record the release commit, PR, CI runs, deployment IDs, smoke evidence, any
+   limitation, and the owner decision to reopen production editing.
 
-## Phase 1 — Reduce architecture and coordination risk
+Release definition of done:
 
-### Provider decomposition
+- The reviewed commit tree, hosted CI tree, `main` tree, and production artifact
+  are identical.
+- Every automated gate passes on that exact tree.
+- Public and authenticated production smoke evidence is recorded.
+- Required branch protection is verified, not inferred from workflow files.
+- Production editing is reopened only by the deployment/rollback owner.
 
-Completed seams:
+## Next engineering work after a stable release
 
-- domain command bindings;
-- authentication controller and synchronous account boundary;
-- goal-evidence operations and compensation;
-- local bootstrap/recovery;
-- state transactions and workspace profiling;
-- status selectors;
-- separate workspace, provider-status, and action contexts.
+These are not represented as completed release evidence. Some are manual or
+external confidence gates; the longer-term items should be prioritized from
+real use and operational evidence.
 
-Next:
+### P1 — Manual browser and assistive-technology confidence
 
-- Migrate consumers from compatibility `useApp()` to `useWorkspaceData()`, `useProviderStatus()`, and `useAppActions()` so unrelated state changes do not rerender every page.
-- Stabilise the actions-context value instead of recreating its command object on each provider render.
-- Extract reconciliation/cloud-save, account handoff, import/reset, and terminal-erasure coordinators from the remaining roughly 2,900-line provider.
-- Add a focused component harness for every lifecycle state: local, device-saving, offline, unsaved, connecting, cloud-saving, conflict, error, handoff, erasure, and synced.
+- Complete keyboard and VoiceOver/NVDA walkthroughs on real hardware.
+- Check 200% and 400% zoom, enlarged system text, 320/390 px phones, tablet,
+  landscape, forced colours, reduced motion, iOS safe areas, Android install
+  and update, and slow/interrupted networks.
+- Check life-calendar day exploration with keyboard and touch users; add
+  individually interactive cells only if the current accessible summary is not
+  sufficient.
+- Verify the maskable icon on real Android launchers despite the automated
+  safe-zone proof.
 
-### Oversized boundary modules
+The automated accessibility, cross-browser, reflow, and device-emulation suites
+are implemented, but the real-device and assistive-technology walkthroughs
+above were still unrecorded at the 2 August audit.
 
-Split these by responsibility while keeping one validation path:
+### P1 — Operational rehearsal
 
-- `lib/state-schema.ts` (about 2,024 lines): version migrations, current-schema validation, structural limits, and coherence rules.
-- `lib/persistence.ts` (about 1,945 lines): IndexedDB schema, workspace repository, evidence repository, erasure fences, and legacy journal.
-- `lib/account-erasure.ts` (about 945 lines): checkpoint state machine, local cleanup, cloud cleanup, and recovery presentation.
+- Run the first quarterly private-Storage inventory/download/restore drill once
+  real Storage objects exist, retain its signed-off manifest and checksums, and
+  record recovery time.
+- Run a complete `.evolvra` merge and replace rehearsal in a disposable browser
+  profile and verify the documented remote-orphan retention behavior.
+- Capture future Supabase dry-run output and hosted Auth redirect configuration
+  as durable release artifacts instead of recording only that they were
+  reviewed.
+- Keep weekly synthetics and disposable cloud drills monitored as incidents,
+  even when no code changes.
 
-### Scale and storage
+### P2 — Architecture and scale based on evidence
 
-- Benchmark full cloud snapshot saves over slow and interrupted networks; the client still submits the complete workspace after its debounce.
-- Add visible capacity forecasting well before the 5 MiB safety limit.
-- Partition immutable completions, metric entries, reviews, and long history from frequently edited workspace metadata when real usage data justifies the migration.
-- Provide an explicit archive/export-and-reset workflow before users reach the hard limit.
-- Add property/fuzz tests for migrations, imports, merges, recurrence, and compensation journals.
-- Add coverage thresholds for safety-critical modules, based on meaningful branch coverage rather than a repository-wide vanity percentage.
+- Continue extracting account handoff, records-only import/reset, and terminal
+  erasure coordination from `AppProvider` when a change next touches those
+  paths.
+- Split IndexedDB workspace, evidence, erasure-fence, and legacy-journal
+  repositories from the large persistence boundary while preserving one
+  transactional API.
+- Benchmark complete cloud snapshot saves on genuinely slow and interrupted
+  networks. Partition immutable histories from frequently edited metadata only
+  when real workspace size or latency demonstrates the need.
+- Consider streaming archive hashing if real evidence sets approach the
+  supported upper bound and browser memory profiling shows pressure.
+- Tighten CSP from compatible `unsafe-inline` allowances to nonces or hashes
+  when the deployed Next.js runtime supports it without breaking hydration.
+- Keep production telemetry disabled until its operational ownership, review,
+  alerting, and retention controls are deliberately accepted; the disabled
+  state is not evidence that production observability has been completed.
 
-Definition of done:
+### P3 — Optional product discovery
 
-- Account/sync/erasure lifecycles can be tested without rendering the product UI.
-- Read-only pages do not rerender for unrelated command/status changes.
-- Near-limit local edits and slow-network saves have recorded budgets.
-- Users receive actionable warnings before a workspace can no longer be saved.
+- Global search or command palette.
+- Planner/calendar view.
+- More user-created templates.
+- Background push reminders when the application is closed.
+- A separate public marketing surface and custom domain.
+- Carefully scoped external integrations.
 
-## Phase 2 — Complete portability and browser confidence
+AI remains deferred. Reconsidering it requires a separate privacy, consent,
+threat-model, retention, failure-mode, and non-authoritative-suggestion plan;
+it must not be introduced as an incidental enhancement.
 
-### Full backup portability
+## Owner assistance required
 
-The JSON backup is intentionally records-only: it includes evidence metadata but not file bytes. Add either:
-
-- a versioned bundled archive containing a manifest, workspace JSON, and verified evidence files; or
-- a bulk evidence download plus restore manifest and clear reconciliation workflow.
-
-The import must validate every path, MIME type, size, hash, account mapping, and compensation step before activating metadata.
-
-### Browser and device matrix
-
-- Add Firefox and WebKit smoke projects for IndexedDB, downloads, file previews, auth callbacks, service-worker update/offline routing, and evidence.
-- Complete manual checks at 320 px and 390 px, tablet, landscape, 200% and 400% zoom, enlarged text, forced colours, reduced motion, VoiceOver/NVDA, keyboard-only operation, Android installation/update, iOS safe areas, and slow/offline networks.
-- Add primary-route visual-regression snapshots in dark/light and desktop/mobile modes.
-- Review the life-calendar day detail for keyboard and touch exploration; it currently exposes an accessible summary but keeps individual cells visual.
-- Validate the maskable icon against Android safe-zone crops and create a separately padded asset if device testing shows clipping.
-
-Definition of done:
-
-- No serious or critical automated accessibility findings.
-- Core keyboard and screen-reader workflows pass manually.
-- Chromium, Firefox, and WebKit pass the agreed smoke suite.
-- Release screenshots detect layout regressions rather than capturing only test failures.
-
-## Phase 3 — Product-truthfulness decisions
-
-These require product-owner choices; none should be silently inferred.
-
-1. Consistency language: keep seven/30-day session counts, rename them explicitly, or calculate target-relative completion rates from metric targets and periods.
-2. Review history: decide whether a saved review must retain the generated context and source IDs exactly as they appeared at creation.
-3. Completion outcomes: decide whether later measurement edits are allowed; if so, persist an immutable goal-outcome snapshot at completion.
-4. Weighted plans: decide whether milestones must total exactly 100%. They currently reject totals above 100% but allow a deliberate partial plan below 100%.
-5. Reusable action defaults: decide whether an action definition needs default changes for multiple metrics. Completion already supports all linked metrics.
-6. Personal-quality trends: current analytics truthfully show activity connected to a quality, not a subjective quality score. Add explicit non-scoring quality reflections only if users need a direct trend.
-
-Definition of done:
-
-- Every displayed summary has an unambiguous definition and links to its source records.
-- Historical views remain stable to the degree promised by the product.
-- Activity is never presented as proof of personal worth or development.
-
-## Phase 4 — Operational hardening
-
-- Add production synthetic checks for headers, auth-callback cache exclusion, manifest/icon MIME, service-worker version, offline fallback, and telemetry rejection.
-- Run scheduled restore, conflict, and account-erasure drills against a disposable Supabase project; record recovery time and orphan evidence cleanup.
-- Give evidence Storage its own backup/protection plan because a Postgres backup does not contain Storage objects.
-- Investigate CSP nonces/hashes to reduce production `unsafe-inline` allowances when Next.js compatibility permits.
-- Add infrastructure-wide telemetry throttling and an explicit retention/deletion policy before enabling telemetry.
-- Document that `workspace_snapshots` is authoritative and the normalised domain tables are not dual-written application state. Restrict or retire unused surfaces before future contributors assume otherwise.
-- Verify branch protection requires both hosted jobs and prevents direct unreviewed `main` pushes.
-- Continue tracking the development-only `minimatch`/`brace-expansion` advisory until the ESLint chain supports a compatible patched version; do not force an incompatible override.
-
-Definition of done:
-
-- Recovery and erasure are rehearsed, not merely documented.
-- Production health checks catch broken deployment configuration quickly.
-- Database, Storage, telemetry, and rollback ownership are explicit.
-
-## Phase 5 — Optional discovery after a stable beta
-
-Potential discovery items, ordered behind reliability:
-
-- global search or command palette;
-- planner/calendar view;
-- user-created goal templates;
-- background push reminders when Evolvra is closed;
-- a separate public marketing surface and custom domain;
-- carefully scoped integrations.
-
-AI remains deferred. If reconsidered later, it requires a separate privacy, consent, threat-model, data-retention, failure-mode, and non-authoritative-suggestion plan; it must not be slipped into the current release.
-
-## Owner input required for production
-
-Production cutover cannot proceed without:
-
-- the current database backup identifier and time;
-- the deployment and rollback owner;
-- confirmation that editing from old clients can pause during migration and promotion;
-- explicit approval to run the linked-production Supabase dry-run and migration application.
+No additional product decision is blocking the code freeze. Owner or repository
+administrator assistance is still required to verify branch-protection
+settings, complete the authenticated production smoke in step 13, accept any required
+manual real-device/assistive-technology evidence, and explicitly reopen
+production editing after the release evidence is recorded. The Storage restore
+drill also requires real retained objects; it remains unrecorded rather than
+being treated as satisfied by the July database backup.

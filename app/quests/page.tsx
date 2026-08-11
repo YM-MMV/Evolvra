@@ -3,7 +3,7 @@
 import { useMemo, useState } from "react";
 import Link from "next/link";
 import { CalendarDays, Check, CheckCircle2, Circle, Filter, Plus, Repeat2, Search } from "lucide-react";
-import { useApp } from "@/components/app-provider";
+import { useWorkspaceData } from "@/components/app-provider";
 import { QuestCompletionForm } from "@/components/quest-completion-form";
 import { EmptyState, Panel, Pill } from "@/components/ui";
 import { completionAttribution, completionGoalIds } from "@/lib/activity-attribution";
@@ -27,7 +27,7 @@ function connectedGoalsFor(primaryGoal: Goal, linkedGoalIds: string[], goalsById
 }
 
 export default function QuestsPage() {
-  const { state } = useApp();
+  const { state } = useWorkspaceData();
   const [view, setView] = useState<QuestView>("available");
   const [areaId, setAreaId] = useState("all");
   const [query, setQuery] = useState("");

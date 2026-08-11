@@ -11,17 +11,22 @@ import {
 } from "@/lib/goal-evidence";
 
 export const PERSISTENCE_DATABASE_NAME = "evolvra-persistence";
-export const PERSISTENCE_DATABASE_VERSION = 2;
+// Version 4 separates uncommitted evidence bytes from the live evidence store.
+// Opening v4 also fences older bundles that could expose migration bytes before
+// their referencing workspace CAS committed.
+export const PERSISTENCE_DATABASE_VERSION = 4;
 export const LEGACY_WORKSPACE_STORAGE_KEY = "evolvra:workspace:v1";
 
 const WORKSPACE_STORE = "workspaces";
 const EVIDENCE_STORE = "evidence";
+const EVIDENCE_STAGING_STORE = "evidence-staging";
 const ACCOUNT_SCOPE_STORE = "account-scopes";
 const ACCOUNT_ERASURE_STORE = "account-erasure-checkpoints";
 const ACCOUNT_REMINDER_STORE = "account-reminders";
 const LEGACY_IMPORT_CLAIM_STORE = "legacy-import-claims";
 const EVIDENCE_ACCOUNT_INDEX = "by-account";
 const EVIDENCE_ACCOUNT_GOAL_INDEX = "by-account-goal";
+const EVIDENCE_STAGING_ACCOUNT_INDEX = "by-account";
 
 type UnknownRecord = Record<string, unknown>;
 
@@ -59,6 +64,8 @@ export interface EvidenceBlobRecord {
   evidenceId: string;
   blob: Blob;
   savedAt: string;
+  /** Present on every v4 live record and used by compare-delete. */
+  writeId?: string;
 }
 
 export interface EvidenceBlobInput {
@@ -69,13 +76,86 @@ export interface EvidenceBlobInput {
   savedAt?: string;
 }
 
+export interface StoredEvidenceBytesRecord {
+  accountId: string;
+  goalId: string;
+  evidenceId: string;
+  bytes: ArrayBuffer;
+  mimeType: string;
+  savedAt: string;
+  /** Opaque identity freshly assigned to every live write. */
+  writeId?: string;
+}
+
+interface StoredStagedEvidenceBytesRecord extends Omit<StoredEvidenceBytesRecord, "writeId"> {
+  token: string;
+  stagedAt: string;
+}
+
+export interface StagedEvidenceBlobWrite {
+  readonly token: string;
+  readonly record: EvidenceBlobRecord;
+}
+
+export interface EvidenceCleanupIntentInput {
+  readonly accountId: string;
+  readonly goalId: string;
+  readonly evidenceId: string;
+  readonly expectedWriteId?: string;
+  readonly remotePath?: string;
+}
+
+/**
+ * Durable deletion provenance. It is stored beside staging tokens, never in
+ * the live evidence store, and is written before metadata can drop the last
+ * reference. Recovery therefore distinguishes an intentional orphan from
+ * unrelated unreferenced bytes.
+ */
+export interface EvidenceCleanupIntent extends EvidenceCleanupIntentInput {
+  readonly kind: "cleanup";
+  readonly token: string;
+  readonly createdAt: string;
+}
+
+export type EvidenceBlobRollbackResult = "rolled-back" | "already-absent";
+export interface EvidenceBlobDeletionReceipt {
+  readonly accountId: string;
+  readonly generation: PersistenceScopeGeneration;
+  readonly workspaceLocalRevision: number;
+  readonly evidenceRevisionAfterDelete: number;
+  readonly snapshots: readonly EvidenceBlobRecord[];
+}
+
+export type EvidenceBlobDeleteResult =
+  | { readonly kind: "deleted"; readonly receipt: EvidenceBlobDeletionReceipt }
+  | { readonly kind: "superseded" };
+
 export type PersistenceScopeGeneration = number;
+
+export interface WorkspaceWriteOptions {
+  /**
+   * Removes every account-scoped live evidence row that is not referenced by
+   * the committed current state or undo history. The sweep runs in the same
+   * generation-fenced transaction as the workspace CAS, so a late writer is
+   * either observed and removed or rejected by the advanced local revision.
+   */
+  readonly removeUnreferencedEvidence?: boolean;
+}
 
 export interface AccountPersistenceScope {
   accountId: string;
   generation: PersistenceScopeGeneration;
+  /** Monotonic revision for all committed live evidence mutations. */
+  evidenceRevision: number;
   tombstoned: boolean;
   updatedAt: string;
+}
+
+export interface AccountPersistenceBackupBoundary {
+  accountId: string;
+  generation: PersistenceScopeGeneration;
+  workspaceLocalRevision: number;
+  evidenceRevision: number;
 }
 
 export interface AccountWorkspaceRead {
@@ -86,6 +166,37 @@ export interface AccountWorkspaceRead {
 export interface AccountPersistenceEraseResult {
   deletedEvidence: number;
   scope: AccountPersistenceScope;
+}
+
+export type PortableArchivePersistenceKind = "merge" | "replace";
+
+export interface PortableArchivePersistenceInput {
+  envelope: WorkspaceEnvelope;
+  evidence: readonly EvidenceBlobRecord[];
+  stagedEvidence?: readonly StagedEvidenceBlobWrite[];
+  kind: PortableArchivePersistenceKind;
+}
+
+export interface PortableArchivePersistenceResult {
+  envelope: WorkspaceEnvelope;
+  removedSupersededEvidence: number;
+}
+
+export type AccountHandoffEvidenceCollisionPolicy =
+  | "reject-existing"
+  | "replace-inspected-workspace";
+
+export interface AccountHandoffPersistenceInput {
+  envelope: WorkspaceEnvelope;
+  evidence: readonly EvidenceBlobRecord[];
+  stagedEvidence?: readonly StagedEvidenceBlobWrite[];
+  collisionPolicy: AccountHandoffEvidenceCollisionPolicy;
+  /** Explicitly permits replacing the exact quarantined revision inspected by the caller. */
+  replaceQuarantinedWorkspace: boolean;
+}
+
+export interface AccountHandoffPersistenceResult {
+  envelope: WorkspaceEnvelope;
 }
 
 export interface RawAccountErasureCheckpoint {
@@ -309,7 +420,120 @@ export function isEvidenceBlobRecord(value: unknown): value is EvidenceBlobRecor
     && isBlobLike(blob)
     && isAllowedEvidenceMimeType(normalizeEvidenceMimeType(blob.type))
     && isValidEvidenceFileSize(blob.size)
-    && isIsoDate(value.savedAt);
+    && isIsoDate(value.savedAt)
+    && (value.writeId === undefined || isPersistenceId(value.writeId));
+}
+
+function isEvidenceCleanupIntent(value: unknown): value is EvidenceCleanupIntent {
+  if (!isRecord(value)) return false;
+  return value.kind === "cleanup"
+    && isPersistenceId(value.token)
+    && isPersistenceId(value.accountId)
+    && isPersistenceId(value.goalId)
+    && isPersistenceId(value.evidenceId)
+    && isIsoDate(value.createdAt)
+    && (value.expectedWriteId === undefined || isPersistenceId(value.expectedWriteId))
+    && (value.remotePath === undefined
+      || (typeof value.remotePath === "string"
+        && value.remotePath.length > 0
+        && value.remotePath.length <= 1_024))
+    && (value.expectedWriteId !== undefined || value.remotePath !== undefined);
+}
+
+function cleanupIntentContentsEqual(
+  left: EvidenceCleanupIntent,
+  right: EvidenceCleanupIntent,
+): boolean {
+  return left.kind === right.kind
+    && left.token === right.token
+    && left.accountId === right.accountId
+    && left.goalId === right.goalId
+    && left.evidenceId === right.evidenceId
+    && left.createdAt === right.createdAt
+    && left.expectedWriteId === right.expectedWriteId
+    && left.remotePath === right.remotePath;
+}
+
+/**
+ * IndexedDB Blob persistence is not interoperable in every supported WebKit
+ * runtime. Store portable bytes plus an allow-listed media type and recreate a
+ * Blob at the repository boundary. Legacy Blob records remain readable.
+ */
+export async function serializeEvidenceBlobRecord(
+  record: EvidenceBlobRecord,
+): Promise<StoredEvidenceBytesRecord> {
+  if (!isEvidenceBlobRecord(record)) {
+    throw new PersistenceError(
+      "invalid-data",
+      "serialize-evidence",
+      "Refused to serialize an invalid evidence blob record.",
+    );
+  }
+  const bytes = await record.blob.arrayBuffer();
+  if (bytes.byteLength !== record.blob.size) {
+    throw new PersistenceError(
+      "invalid-data",
+      "serialize-evidence",
+      "The evidence bytes changed while they were being prepared for device storage.",
+    );
+  }
+  return {
+    accountId: record.accountId,
+    goalId: record.goalId,
+    evidenceId: record.evidenceId,
+    bytes,
+    mimeType: normalizeEvidenceMimeType(record.blob.type),
+    savedAt: record.savedAt,
+  };
+}
+
+export function recoverEvidenceBlobRecord(
+  value: unknown,
+): EvidenceBlobRecord | null {
+  if (isEvidenceBlobRecord(value)) return value;
+  if (
+    !isRecord(value)
+    || !isPersistenceId(value.accountId)
+    || !isPersistenceId(value.goalId)
+    || !isPersistenceId(value.evidenceId)
+    || !(value.bytes instanceof ArrayBuffer)
+    || !isAllowedEvidenceMimeType(value.mimeType)
+    || !isValidEvidenceFileSize(value.bytes.byteLength)
+    || !isIsoDate(value.savedAt)
+  ) return null;
+  try {
+    const record: EvidenceBlobRecord = {
+      accountId: value.accountId,
+      goalId: value.goalId,
+      evidenceId: value.evidenceId,
+      blob: new Blob([value.bytes], { type: value.mimeType }),
+      savedAt: value.savedAt,
+      ...(isPersistenceId(value.writeId) ? { writeId: value.writeId } : {}),
+    };
+    return isEvidenceBlobRecord(record) ? record : null;
+  } catch {
+    return null;
+  }
+}
+
+function arrayBuffersEqual(left: ArrayBuffer, right: ArrayBuffer): boolean {
+  if (left.byteLength !== right.byteLength) return false;
+  const leftBytes = new Uint8Array(left);
+  const rightBytes = new Uint8Array(right);
+  for (let index = 0; index < leftBytes.length; index += 1) {
+    if (leftBytes[index] !== rightBytes[index]) return false;
+  }
+  return true;
+}
+
+function storedEvidenceBytesEqual(value: unknown, expected: StoredEvidenceBytesRecord): boolean {
+  return isRecord(value)
+    && value.accountId === expected.accountId
+    && value.goalId === expected.goalId
+    && value.evidenceId === expected.evidenceId
+    && value.mimeType === expected.mimeType
+    && value.bytes instanceof ArrayBuffer
+    && arrayBuffersEqual(value.bytes, expected.bytes);
 }
 
 function requireId(value: string, field: string): string {
@@ -372,6 +596,27 @@ function upgradeDatabase(database: IDBDatabase, transaction: IDBTransaction) {
   }
   if (!evidence.indexNames.contains(EVIDENCE_ACCOUNT_GOAL_INDEX)) {
     evidence.createIndex(EVIDENCE_ACCOUNT_GOAL_INDEX, ["accountId", "goalId"], { unique: false });
+  }
+
+  // Every v4 live value has an ownership identity. This cursor is part of the
+  // upgrade transaction, so no v4 reader can observe a legacy value between
+  // its validation and rewrite.
+  const rewrite = evidence.openCursor();
+  rewrite.onsuccess = () => {
+    const cursor = rewrite.result;
+    if (!cursor) return;
+    const value = cursor.value;
+    if (isRecord(value) && !isPersistenceId(value.writeId)) {
+      cursor.update({ ...value, writeId: globalThis.crypto.randomUUID() });
+    }
+    cursor.continue();
+  };
+
+  const staging = database.objectStoreNames.contains(EVIDENCE_STAGING_STORE)
+    ? transaction.objectStore(EVIDENCE_STAGING_STORE)
+    : database.createObjectStore(EVIDENCE_STAGING_STORE, { keyPath: "token" });
+  if (!staging.indexNames.contains(EVIDENCE_STAGING_ACCOUNT_INDEX)) {
+    staging.createIndex(EVIDENCE_STAGING_ACCOUNT_INDEX, "accountId", { unique: false });
   }
 
   if (!database.objectStoreNames.contains(ACCOUNT_SCOPE_STORE)) {
@@ -586,6 +831,7 @@ function initialAccountPersistenceScope(accountId: string): AccountPersistenceSc
   return {
     accountId,
     generation: 0,
+    evidenceRevision: 0,
     tombstoned: false,
     updatedAt: new Date(0).toISOString(),
   };
@@ -601,6 +847,9 @@ function decodeAccountPersistenceScope(
     || value.accountId !== expectedAccountId
     || !Number.isSafeInteger(value.generation)
     || Number(value.generation) < 0
+    || (value.evidenceRevision !== undefined
+      && (!Number.isSafeInteger(value.evidenceRevision)
+        || Number(value.evidenceRevision) < 0))
     || typeof value.tombstoned !== "boolean"
     || !isIsoDate(value.updatedAt)
   ) {
@@ -613,8 +862,29 @@ function decodeAccountPersistenceScope(
   return {
     accountId: expectedAccountId,
     generation: Number(value.generation),
+    evidenceRevision: value.evidenceRevision === undefined
+      ? 0
+      : Number(value.evidenceRevision),
     tombstoned: value.tombstoned,
     updatedAt: value.updatedAt,
+  };
+}
+
+function nextEvidenceRevision(
+  scope: AccountPersistenceScope,
+  operation: string,
+): AccountPersistenceScope {
+  if (scope.evidenceRevision === Number.MAX_SAFE_INTEGER) {
+    throw new PersistenceError(
+      "invalid-data",
+      operation,
+      "The browser-local evidence revision is exhausted. Export a backup before resetting local storage.",
+    );
+  }
+  return {
+    ...scope,
+    evidenceRevision: scope.evidenceRevision + 1,
+    updatedAt: new Date().toISOString(),
   };
 }
 
@@ -652,6 +922,73 @@ export async function readAccountPersistenceScope(
     accountScopeFromStore(store, key));
 }
 
+/** Captures every browser-local backup fence coordinate in one transaction. */
+export async function readAccountPersistenceBackupBoundary(
+  accountId: string,
+): Promise<AccountPersistenceBackupBoundary> {
+  const key = workspaceKey(accountId);
+  return runStoresTransaction(
+    [WORKSPACE_STORE, ACCOUNT_SCOPE_STORE],
+    "readonly",
+    "read-account-backup-boundary",
+    async (transaction) => {
+      const scope = await accountScopeFromStore(
+        transaction.objectStore(ACCOUNT_SCOPE_STORE),
+        key,
+      );
+      const raw: unknown = await requestResult(
+        transaction.objectStore(WORKSPACE_STORE).get(key),
+      );
+      return {
+        accountId: key,
+        generation: scope.generation,
+        workspaceLocalRevision: persistedWorkspaceLocalRevision(raw, key),
+        evidenceRevision: scope.evidenceRevision,
+      };
+    },
+  );
+}
+
+function requireAccountPersistenceBackupBoundary(
+  rawWorkspace: unknown,
+  scope: AccountPersistenceScope,
+  expected: AccountPersistenceBackupBoundary,
+  operation: string,
+): void {
+  if (
+    expected.accountId !== scope.accountId
+    || !isLocalRevision(expected.generation)
+    || !isLocalRevision(expected.workspaceLocalRevision)
+    || !isLocalRevision(expected.evidenceRevision)
+  ) {
+    throw new PersistenceError(
+      "invalid-argument",
+      operation,
+      "The browser-local backup boundary is invalid or belongs to another account.",
+    );
+  }
+  if (scope.generation !== expected.generation) {
+    throw new AccountPersistenceScopeError(
+      scope.accountId,
+      expected.generation,
+      scope.generation,
+      scope.tombstoned,
+    );
+  }
+  requireExactWorkspaceLocalRevision(
+    rawWorkspace,
+    scope.accountId,
+    expected.workspaceLocalRevision,
+  );
+  if (scope.evidenceRevision !== expected.evidenceRevision) {
+    throw new PersistenceError(
+      "local-conflict",
+      operation,
+      "Device evidence changed after the backup was captured.",
+    );
+  }
+}
+
 export async function listTombstonedAccountPersistenceScopes(): Promise<AccountPersistenceScope[]> {
   return runTransaction(
     ACCOUNT_SCOPE_STORE,
@@ -687,13 +1024,71 @@ export async function accountErasureTombstoneExists(accountId: string): Promise<
   return (await readAccountPersistenceScope(accountId)).tombstoned;
 }
 
+/**
+ * Validates the exact device revision covered by an account-erasure backup.
+ * This is called from the same read/write transaction that creates the
+ * tombstone and durable checkpoint, so a competing tab cannot slip a save
+ * between the comparison and the fence.
+ */
+export function requireAccountErasureWorkspaceRevision(
+  rawWorkspace: unknown,
+  accountId: string,
+  expectedLocalRevision: number,
+): number {
+  const key = workspaceKey(accountId);
+  if (!isLocalRevision(expectedLocalRevision)) {
+    throw new PersistenceError(
+      "invalid-argument",
+      "begin-account-erasure-fence",
+      "The expected browser-local workspace revision must be a non-negative safe integer.",
+    );
+  }
+  const actualLocalRevision = rawWorkspace === undefined
+    ? 0
+    : recoverWorkspaceEnvelope(rawWorkspace, key).localRevision;
+  if (actualLocalRevision !== expectedLocalRevision) {
+    throw new LocalWorkspaceConflictError(
+      key,
+      expectedLocalRevision,
+      actualLocalRevision,
+    );
+  }
+  return actualLocalRevision;
+}
+
 export async function beginAccountErasurePersistenceFence(
   accountId: string,
   expectedGeneration: PersistenceScopeGeneration,
   checkpoint: Record<string, unknown>,
+  options: {
+    expectedLocalRevision?: number;
+    expectedBackupBoundary?: AccountPersistenceBackupBoundary;
+  } = {},
 ): Promise<{ scope: AccountPersistenceScope; checkpoint: unknown }> {
   const key = workspaceKey(accountId);
   const expected = requireScopeGeneration(expectedGeneration);
+  const expectedLocalRevision = options.expectedLocalRevision;
+  const expectedBackupBoundary = options.expectedBackupBoundary;
+  if (
+    expectedLocalRevision !== undefined
+    && !isLocalRevision(expectedLocalRevision)
+  ) {
+    throw new PersistenceError(
+      "invalid-argument",
+      "begin-account-erasure-fence",
+      "The expected browser-local workspace revision must be a non-negative safe integer.",
+    );
+  }
+  if (
+    expectedBackupBoundary !== undefined
+    && expectedBackupBoundary.accountId !== key
+  ) {
+    throw new PersistenceError(
+      "invalid-argument",
+      "begin-account-erasure-fence",
+      "The browser-local backup boundary belongs to another account.",
+    );
+  }
   if (checkpoint.accountId !== key) {
     throw new PersistenceError(
       "invalid-data",
@@ -702,7 +1097,12 @@ export async function beginAccountErasurePersistenceFence(
     );
   }
   return runStoresTransaction(
-    [ACCOUNT_SCOPE_STORE, ACCOUNT_ERASURE_STORE, ACCOUNT_REMINDER_STORE],
+    [
+      WORKSPACE_STORE,
+      ACCOUNT_SCOPE_STORE,
+      ACCOUNT_ERASURE_STORE,
+      ACCOUNT_REMINDER_STORE,
+    ],
     "readwrite",
     "begin-account-erasure-fence",
     async (transaction) => {
@@ -724,6 +1124,26 @@ export async function beginAccountErasurePersistenceFence(
           );
         }
         return { scope: current, checkpoint: existingCheckpoint };
+      }
+      if (expectedBackupBoundary !== undefined) {
+        const rawWorkspace: unknown = await requestResult(
+          transaction.objectStore(WORKSPACE_STORE).get(key),
+        );
+        requireAccountPersistenceBackupBoundary(
+          rawWorkspace,
+          current,
+          expectedBackupBoundary,
+          "begin-account-erasure-fence",
+        );
+      } else if (expectedLocalRevision !== undefined) {
+        const rawWorkspace: unknown = await requestResult(
+          transaction.objectStore(WORKSPACE_STORE).get(key),
+        );
+        requireAccountErasureWorkspaceRevision(
+          rawWorkspace,
+          key,
+          expectedLocalRevision,
+        );
       }
       let next = current;
       if (current.tombstoned) {
@@ -754,6 +1174,7 @@ export async function beginAccountErasurePersistenceFence(
         next = {
           accountId: key,
           generation: current.generation + 1,
+          evidenceRevision: current.evidenceRevision,
           tombstoned: true,
           updatedAt: new Date().toISOString(),
         };
@@ -761,8 +1182,74 @@ export async function beginAccountErasurePersistenceFence(
       }
       const storedCheckpoint = { ...checkpoint, persistenceGeneration: next.generation };
       await requestResult(checkpointStore.add(storedCheckpoint));
-      await requestResult(transaction.objectStore(ACCOUNT_REMINDER_STORE).delete(key));
       return { scope: next, checkpoint: storedCheckpoint };
+    },
+  );
+}
+
+/**
+ * Cancels only an erasure attempt that the cloud definitively refused before
+ * entering its deleting lifecycle. Workspace, evidence, and reminder data are
+ * preserved. Rotating the generation invalidates every writer admitted before
+ * the failed tombstone without ever making that old generation writable again.
+ */
+export async function cancelUnstartedAccountErasurePersistenceFence(
+  accountId: string,
+  tombstonedGeneration: PersistenceScopeGeneration,
+  attemptId: string,
+): Promise<AccountPersistenceScope> {
+  const key = workspaceKey(accountId);
+  const expected = requireScopeGeneration(tombstonedGeneration);
+  const attempt = requireId(attemptId, "attemptId");
+  return runStoresTransaction(
+    [ACCOUNT_SCOPE_STORE, ACCOUNT_ERASURE_STORE],
+    "readwrite",
+    "cancel-unstarted-account-erasure-fence",
+    async (transaction) => {
+      const scopeStore = transaction.objectStore(ACCOUNT_SCOPE_STORE);
+      const current = await accountScopeFromStore(scopeStore, key);
+      if (!current.tombstoned || current.generation !== expected) {
+        throw new AccountPersistenceScopeError(
+          key,
+          expected,
+          current.generation,
+          current.tombstoned,
+        );
+      }
+      const checkpointStore = transaction.objectStore(ACCOUNT_ERASURE_STORE);
+      const raw: unknown = await requestResult(checkpointStore.get(key));
+      if (
+        !isRecord(raw)
+        || raw.accountId !== key
+        || raw.attemptId !== attempt
+        || (raw.cloud !== "pending" && raw.cloud !== "failed")
+        || raw.local !== "pending"
+        || raw.session !== "pending"
+        || raw.persistenceGeneration !== expected
+      ) {
+        throw new PersistenceError(
+          "invalid-data",
+          "cancel-unstarted-account-erasure-fence",
+          "Only the exact unstarted account-erasure checkpoint can be cancelled.",
+        );
+      }
+      if (current.generation === Number.MAX_SAFE_INTEGER) {
+        throw new PersistenceError(
+          "invalid-data",
+          "cancel-unstarted-account-erasure-fence",
+          "The account persistence generation is exhausted.",
+        );
+      }
+      const restored: AccountPersistenceScope = {
+        accountId: key,
+        generation: current.generation + 1,
+        evidenceRevision: current.evidenceRevision,
+        tombstoned: false,
+        updatedAt: new Date().toISOString(),
+      };
+      await requestResult(scopeStore.put(restored));
+      await requestResult(checkpointStore.delete(key));
+      return restored;
     },
   );
 }
@@ -1499,6 +1986,422 @@ export function prepareWorkspaceWrite(
   };
 }
 
+/**
+ * Portable archive import always advances the exact revision it inspected.
+ * Unlike ordinary autosave, identical content is not a no-op: the evidence
+ * mutation belongs to the same strict compare-and-swap transaction.
+ */
+export function preparePortableArchiveWorkspaceWrite(
+  current: WorkspaceEnvelope | null,
+  requested: WorkspaceEnvelope,
+): WorkspaceEnvelope {
+  const actualLocalRevision = current?.localRevision ?? 0;
+  if (actualLocalRevision !== requested.localRevision) {
+    throw new LocalWorkspaceConflictError(
+      requested.accountId,
+      requested.localRevision,
+      actualLocalRevision,
+    );
+  }
+  if (actualLocalRevision === Number.MAX_SAFE_INTEGER) {
+    throw new PersistenceError(
+      "invalid-data",
+      "import-portable-archive",
+      "The browser-local workspace revision is exhausted. Export a fresh backup before resetting local storage.",
+    );
+  }
+  return {
+    ...requested,
+    ...(current?.anonymousHandoff && !requested.anonymousHandoff
+      ? { anonymousHandoff: current.anonymousHandoff }
+      : {}),
+    localRevision: actualLocalRevision + 1,
+  };
+}
+
+/**
+ * Reads the only CAS value that can be trusted from a quarantined envelope.
+ * Malformed or missing legacy values use the pre-CAS revision zero, matching
+ * the explicit recovery replacement path.
+ */
+export function quarantinedWorkspaceLocalRevision(value: unknown): number {
+  if (!isRecord(value)) return 0;
+  return normalizedStoredLocalRevision(value.localRevision) ?? 0;
+}
+
+function prepareQuarantinedAccountHandoffWorkspaceWrite(
+  raw: unknown,
+  requested: WorkspaceEnvelope,
+): WorkspaceEnvelope {
+  const actualLocalRevision = quarantinedWorkspaceLocalRevision(raw);
+  if (actualLocalRevision !== requested.localRevision) {
+    throw new LocalWorkspaceConflictError(
+      requested.accountId,
+      requested.localRevision,
+      actualLocalRevision,
+    );
+  }
+  if (actualLocalRevision === Number.MAX_SAFE_INTEGER) {
+    throw new PersistenceError(
+      "invalid-data",
+      "commit-account-handoff",
+      "The browser-local workspace revision is exhausted. Erase the quarantined device copy before replacing it.",
+    );
+  }
+  return {
+    ...requested,
+    localRevision: actualLocalRevision + 1,
+  };
+}
+
+function validatedAccountHandoffEvidence(
+  input: AccountHandoffPersistenceInput,
+): EvidenceBlobRecord[] {
+  const records = [...input.evidence];
+  const keys = new Set<string>();
+  for (const record of records) {
+    if (!isEvidenceBlobRecord(record) || record.accountId !== input.envelope.accountId) {
+      throw new PersistenceError(
+        "invalid-data",
+        "commit-account-handoff",
+        "Account handoff evidence is invalid or belongs to another account.",
+      );
+    }
+    const key = JSON.stringify(evidenceKey(
+      record.accountId,
+      record.goalId,
+      record.evidenceId,
+    ));
+    if (keys.has(key)) {
+      throw new PersistenceError(
+        "invalid-data",
+        "commit-account-handoff",
+        "Account handoff evidence contains a duplicate target key.",
+      );
+    }
+    keys.add(key);
+  }
+  return records;
+}
+
+/**
+ * Commits an anonymous-to-account handoff as one IndexedDB transaction.
+ *
+ * The workspace CAS is evaluated before evidence collisions or writes. Since
+ * IndexedDB serialises overlapping readwrite transactions across tabs, a tab
+ * that commits the inspected target first advances its workspace revision and
+ * makes this whole transaction abort. No compensation then touches that tab's
+ * evidence. Replacement semantics therefore apply only to the exact workspace
+ * revision the user inspected.
+ */
+export async function applyAccountHandoffPersistence(
+  input: AccountHandoffPersistenceInput,
+  expectedGeneration: PersistenceScopeGeneration,
+): Promise<AccountHandoffPersistenceResult> {
+  if (
+    input.collisionPolicy !== "reject-existing"
+    && input.collisionPolicy !== "replace-inspected-workspace"
+  ) {
+    throw new PersistenceError(
+      "invalid-argument",
+      "commit-account-handoff",
+      "Account handoff requires an explicit evidence collision policy.",
+    );
+  }
+  if (!isWorkspaceEnvelope(input.envelope)) {
+    throw new PersistenceError(
+      "invalid-data",
+      "commit-account-handoff",
+      `Refused to persist an invalid account handoff workspace envelope (${invalidWorkspaceEnvelopeReason(input.envelope)}).`,
+    );
+  }
+  const records = validatedAccountHandoffEvidence(input);
+  const storedRecords = await Promise.all(records.map(serializeEvidenceBlobRecord));
+  const preparedEvidence = await preparedStagedEvidenceWrites(
+    input.stagedEvidence ?? [],
+    input.envelope.accountId,
+  );
+
+  return runStoresTransaction(
+    [WORKSPACE_STORE, EVIDENCE_STORE, EVIDENCE_STAGING_STORE, ACCOUNT_SCOPE_STORE],
+    "readwrite",
+    "commit-account-handoff",
+    async (transaction) => {
+      const scopeStore = transaction.objectStore(ACCOUNT_SCOPE_STORE);
+      const scope = await requireWritableAccountScope(
+        scopeStore,
+        input.envelope.accountId,
+        expectedGeneration,
+      );
+      const workspaceStore = transaction.objectStore(WORKSPACE_STORE);
+      const raw: unknown = await requestResult(
+        workspaceStore.get(input.envelope.accountId),
+      );
+
+      let storedEnvelope: WorkspaceEnvelope;
+      if (raw === undefined) {
+        storedEnvelope = preparePortableArchiveWorkspaceWrite(null, input.envelope);
+      } else {
+        try {
+          storedEnvelope = preparePortableArchiveWorkspaceWrite(
+            recoverWorkspaceEnvelope(raw, input.envelope.accountId),
+            input.envelope,
+          );
+        } catch (error) {
+          if (
+            !input.replaceQuarantinedWorkspace
+            || !(error instanceof PersistenceError)
+            || error.code !== "invalid-data"
+          ) {
+            throw error;
+          }
+          storedEnvelope = prepareQuarantinedAccountHandoffWorkspaceWrite(
+            raw,
+            input.envelope,
+          );
+        }
+      }
+      delete storedEnvelope.recovery;
+
+      const evidenceStore = transaction.objectStore(EVIDENCE_STORE);
+      let removedSupersededEvidence = 0;
+      if (input.collisionPolicy === "reject-existing") {
+        for (const record of records) {
+          const existing = await requestResult(evidenceStore.get(evidenceKey(
+            record.accountId,
+            record.goalId,
+            record.evidenceId,
+          )));
+          if (existing !== undefined) {
+            throw new PersistenceError(
+              "local-conflict",
+              "commit-account-handoff",
+              "Anonymous evidence would overwrite a file committed to the account workspace.",
+            );
+          }
+        }
+      } else {
+        const retainedKeys = workspaceEvidenceReferences(storedEnvelope).keys;
+        const index = evidenceStore.index(EVIDENCE_ACCOUNT_INDEX);
+        await new Promise<void>((resolve, reject) => {
+          const request = index.openCursor(IDBKeyRange.only(input.envelope.accountId));
+          request.onerror = () => reject(
+            request.error ?? new Error("Could not inspect superseded account evidence."),
+          );
+          request.onsuccess = () => {
+            const cursor = request.result;
+            if (!cursor) {
+              resolve();
+              return;
+            }
+            const encodedKey = Array.isArray(cursor.primaryKey)
+              ? JSON.stringify(cursor.primaryKey)
+              : "";
+            if (retainedKeys.has(encodedKey)) {
+              cursor.continue();
+              return;
+            }
+            const deletion = cursor.delete();
+            deletion.onerror = () => reject(
+              deletion.error ?? new Error("Could not remove superseded account evidence."),
+            );
+            deletion.onsuccess = () => {
+              removedSupersededEvidence += 1;
+              cursor.continue();
+            };
+          };
+        });
+      }
+
+      const promotedEvidence = await promotePreparedStagedEvidence(
+        transaction,
+        preparedEvidence,
+      );
+      for (const record of storedRecords) {
+        await requestResult(evidenceStore.put({
+          ...record,
+          writeId: globalThis.crypto.randomUUID(),
+        } satisfies StoredEvidenceBytesRecord));
+      }
+      await requestResult(workspaceStore.put(storedEnvelope));
+      if (promotedEvidence || storedRecords.length || removedSupersededEvidence) {
+        await requestResult(scopeStore.put(
+          nextEvidenceRevision(scope, "commit-account-handoff"),
+        ));
+      }
+      return { envelope: storedEnvelope };
+    },
+  );
+}
+
+function validatedPortableArchiveEvidence(
+  input: PortableArchivePersistenceInput,
+): EvidenceBlobRecord[] {
+  const records = [...input.evidence];
+  const keys = new Set<string>();
+  for (const record of records) {
+    if (!isEvidenceBlobRecord(record) || record.accountId !== input.envelope.accountId) {
+      throw new PersistenceError(
+        "invalid-data",
+        "import-portable-archive",
+        "Portable archive evidence is invalid or belongs to another account.",
+      );
+    }
+    const key = JSON.stringify(evidenceKey(
+      record.accountId,
+      record.goalId,
+      record.evidenceId,
+    ));
+    if (keys.has(key)) {
+      throw new PersistenceError(
+        "invalid-data",
+        "import-portable-archive",
+        "Portable archive evidence contains a duplicate target key.",
+      );
+    }
+    keys.add(key);
+  }
+  return records;
+}
+
+/**
+ * Commits workspace CAS, evidence collision checks/writes, and replace cleanup
+ * in one IndexedDB transaction. IndexedDB serialises overlapping readwrite
+ * transactions across tabs, so an abort exposes neither staged bytes nor
+ * cleanup and can never compensate over another tab's committed evidence.
+ */
+export async function applyPortableArchivePersistence(
+  input: PortableArchivePersistenceInput,
+  expectedGeneration: PersistenceScopeGeneration,
+): Promise<PortableArchivePersistenceResult> {
+  if (input.kind !== "merge" && input.kind !== "replace") {
+    throw new PersistenceError(
+      "invalid-argument",
+      "import-portable-archive",
+      "Portable archive import requires an explicit merge or replace choice.",
+    );
+  }
+  if (!isWorkspaceEnvelope(input.envelope)) {
+    throw new PersistenceError(
+      "invalid-data",
+      "import-portable-archive",
+      "Refused to persist an invalid portable archive workspace envelope.",
+    );
+  }
+  const records = validatedPortableArchiveEvidence(input);
+  const storedRecords = await Promise.all(
+    records.map(serializeEvidenceBlobRecord),
+  );
+  const preparedEvidence = await preparedStagedEvidenceWrites(
+    input.stagedEvidence ?? [],
+    input.envelope.accountId,
+  );
+  return runStoresTransaction(
+    [WORKSPACE_STORE, EVIDENCE_STORE, EVIDENCE_STAGING_STORE, ACCOUNT_SCOPE_STORE],
+    "readwrite",
+    "import-portable-archive",
+    async (transaction) => {
+      const scopeStore = transaction.objectStore(ACCOUNT_SCOPE_STORE);
+      const scope = await requireWritableAccountScope(
+        scopeStore,
+        input.envelope.accountId,
+        expectedGeneration,
+      );
+      const workspaceStore = transaction.objectStore(WORKSPACE_STORE);
+      const raw: unknown = await requestResult(
+        workspaceStore.get(input.envelope.accountId),
+      );
+      const current = raw === undefined
+        ? null
+        : recoverWorkspaceEnvelope(raw, input.envelope.accountId);
+      const storedEnvelope = preparePortableArchiveWorkspaceWrite(
+        current,
+        input.envelope,
+      );
+      const evidenceStore = transaction.objectStore(EVIDENCE_STORE);
+
+      if (input.kind === "merge") {
+        for (const record of records) {
+          const existing = await requestResult(
+            evidenceStore.get(evidenceKey(
+              record.accountId,
+              record.goalId,
+              record.evidenceId,
+            )),
+          );
+          if (existing !== undefined) {
+            throw new PersistenceError(
+              "local-conflict",
+              "import-portable-archive",
+              "Imported evidence would overwrite a file committed by another tab.",
+            );
+          }
+        }
+      }
+
+      let removedSupersededEvidence = 0;
+      if (input.kind === "replace") {
+        const retained = new Set(records.map((record) =>
+          JSON.stringify(evidenceKey(
+            record.accountId,
+            record.goalId,
+            record.evidenceId,
+          ))));
+        const index = evidenceStore.index(EVIDENCE_ACCOUNT_INDEX);
+        await new Promise<void>((resolve, reject) => {
+          const request = index.openCursor(IDBKeyRange.only(input.envelope.accountId));
+          request.onerror = () => reject(
+            request.error ?? new Error("Could not inspect superseded archive evidence."),
+          );
+          request.onsuccess = () => {
+            const cursor = request.result;
+            if (!cursor) {
+              resolve();
+              return;
+            }
+            const key = Array.isArray(cursor.primaryKey)
+              ? JSON.stringify(cursor.primaryKey)
+              : "";
+            if (retained.has(key)) {
+              cursor.continue();
+              return;
+            }
+            const deletion = cursor.delete();
+            deletion.onerror = () => reject(
+              deletion.error ?? new Error("Could not remove superseded archive evidence."),
+            );
+            deletion.onsuccess = () => {
+              removedSupersededEvidence += 1;
+              cursor.continue();
+            };
+          };
+        });
+      }
+
+      const promotedEvidence = await promotePreparedStagedEvidence(
+        transaction,
+        preparedEvidence,
+      );
+      for (const record of storedRecords) {
+        await requestResult(evidenceStore.put({
+          ...record,
+          writeId: globalThis.crypto.randomUUID(),
+        } satisfies StoredEvidenceBytesRecord));
+      }
+      await requestResult(workspaceStore.put(storedEnvelope));
+      if (promotedEvidence || storedRecords.length || removedSupersededEvidence) {
+        await requestResult(scopeStore.put(
+          nextEvidenceRevision(scope, "import-portable-archive"),
+        ));
+      }
+      return {
+        envelope: storedEnvelope,
+        removedSupersededEvidence,
+      };
+    },
+  );
+}
+
 function invalidWorkspaceEnvelopeReason(value: unknown): string {
   if (!isRecord(value)) return "the envelope is not an object";
   if (!hasWorkspaceMetadata(value) || !isLocalRevision(value.localRevision)) {
@@ -1527,6 +2430,86 @@ function invalidWorkspaceEnvelopeReason(value: unknown): string {
   return "the envelope failed canonical validation";
 }
 
+async function preparedStagedEvidenceWrites(
+  writes: readonly StagedEvidenceBlobWrite[],
+  expectedAccountId: string,
+): Promise<Array<{
+  receipt: StagedEvidenceBlobWrite;
+  stored: StoredEvidenceBytesRecord;
+}>> {
+  const tokens = new Set<string>();
+  const prepared = [];
+  for (const receipt of writes) {
+    if (
+      !isPersistenceId(receipt.token)
+      || !isEvidenceBlobRecord(receipt.record)
+      || receipt.record.accountId !== expectedAccountId
+      || tokens.has(receipt.token)
+    ) {
+      throw new PersistenceError(
+        "invalid-argument",
+        "promote-staged-evidence",
+        "A staged evidence receipt is invalid, duplicated, or belongs to another account.",
+      );
+    }
+    tokens.add(receipt.token);
+    prepared.push({
+      receipt,
+      stored: await serializeEvidenceBlobRecord(receipt.record),
+    });
+  }
+  return prepared;
+}
+
+/**
+ * Validates and consumes every staging token inside the caller's transaction.
+ * Live keys are insert-only here: an exact byte match is shared without a
+ * rewrite, while any differing value aborts the whole workspace commit.
+ */
+async function promotePreparedStagedEvidence(
+  transaction: IDBTransaction,
+  prepared: readonly Awaited<ReturnType<typeof preparedStagedEvidenceWrites>>[number][],
+): Promise<boolean> {
+  const stagingStore = transaction.objectStore(EVIDENCE_STAGING_STORE);
+  const liveStore = transaction.objectStore(EVIDENCE_STORE);
+  let liveChanged = false;
+  for (const item of prepared) {
+    const staged: unknown = await requestResult(stagingStore.get(item.receipt.token));
+    if (
+      !isRecord(staged)
+      || staged.token !== item.receipt.token
+      || !storedEvidenceBytesEqual(staged, item.stored)
+    ) {
+      throw new PersistenceError(
+        "local-conflict",
+        "promote-staged-evidence",
+        "The staged evidence bytes are missing, damaged, or were already consumed by another operation.",
+      );
+    }
+    const key = evidenceKey(
+      item.receipt.record.accountId,
+      item.receipt.record.goalId,
+      item.receipt.record.evidenceId,
+    );
+    const live: unknown = await requestResult(liveStore.get(key));
+    if (live === undefined) {
+      await requestResult(liveStore.add({
+        ...item.stored,
+        writeId: globalThis.crypto.randomUUID(),
+      } satisfies StoredEvidenceBytesRecord));
+      liveChanged = true;
+    } else if (!storedEvidenceBytesEqual(live, item.stored)) {
+      throw new PersistenceError(
+        "local-conflict",
+        "promote-staged-evidence",
+        "Migrated evidence would overwrite different bytes committed by another tab.",
+      );
+    }
+    await requestResult(stagingStore.delete(item.receipt.token));
+  }
+  return liveChanged;
+}
+
 /**
  * Atomically compares the caller's expected local revision and stores the next
  * revision. Identical content is a successful no-op even if another same-tab
@@ -1535,6 +2518,8 @@ function invalidWorkspaceEnvelopeReason(value: unknown): string {
 export async function writeWorkspace(
   envelope: WorkspaceEnvelope,
   expectedGeneration: PersistenceScopeGeneration,
+  stagedEvidence: readonly StagedEvidenceBlobWrite[] = [],
+  options: WorkspaceWriteOptions = {},
 ): Promise<WorkspaceEnvelope> {
   if (!isWorkspaceEnvelope(envelope)) {
     throw new PersistenceError(
@@ -1543,13 +2528,18 @@ export async function writeWorkspace(
       `Refused to persist an invalid workspace envelope (${invalidWorkspaceEnvelopeReason(envelope)}).`,
     );
   }
+  const preparedEvidence = await preparedStagedEvidenceWrites(
+    stagedEvidence,
+    envelope.accountId,
+  );
   return runStoresTransaction(
-    [WORKSPACE_STORE, ACCOUNT_SCOPE_STORE],
+    [WORKSPACE_STORE, EVIDENCE_STORE, EVIDENCE_STAGING_STORE, ACCOUNT_SCOPE_STORE],
     "readwrite",
     "write-workspace",
     async (transaction) => {
-      await requireWritableAccountScope(
-        transaction.objectStore(ACCOUNT_SCOPE_STORE),
+      const scopeStore = transaction.objectStore(ACCOUNT_SCOPE_STORE);
+      const scope = await requireWritableAccountScope(
+        scopeStore,
         envelope.accountId,
         expectedGeneration,
       );
@@ -1560,11 +2550,76 @@ export async function writeWorkspace(
         : recoverWorkspaceEnvelope(raw, envelope.accountId);
 
       const decision = prepareWorkspaceWrite(current, envelope);
-      if (decision.action === "no-op") return decision.envelope;
-
-      const storedEnvelope = decision.envelope;
-      delete storedEnvelope.recovery;
-      await requestResult(store.put(storedEnvelope));
+      let storedEnvelope = decision.envelope;
+      let workspaceWriteRequired = decision.action === "write";
+      if (options.removeUnreferencedEvidence && decision.action === "no-op") {
+        if (storedEnvelope.localRevision !== envelope.localRevision) {
+          throw new LocalWorkspaceConflictError(
+            envelope.accountId,
+            envelope.localRevision,
+            storedEnvelope.localRevision,
+          );
+        }
+        if (storedEnvelope.localRevision === Number.MAX_SAFE_INTEGER) {
+          throw new PersistenceError(
+            "invalid-data",
+            "write-workspace",
+            "The browser-local workspace revision is exhausted. Export a backup before resetting local storage.",
+          );
+        }
+        storedEnvelope = {
+          ...storedEnvelope,
+          localRevision: storedEnvelope.localRevision + 1,
+        };
+        workspaceWriteRequired = true;
+      }
+      if (workspaceWriteRequired) {
+        delete storedEnvelope.recovery;
+        await requestResult(store.put(storedEnvelope));
+      }
+      const evidenceChanged = await promotePreparedStagedEvidence(
+        transaction,
+        preparedEvidence,
+      );
+      let removedUnreferencedEvidence = 0;
+      if (options.removeUnreferencedEvidence) {
+        const retainedKeys = workspaceEvidenceReferences(storedEnvelope).keys;
+        const evidenceStore = transaction.objectStore(EVIDENCE_STORE);
+        const index = evidenceStore.index(EVIDENCE_ACCOUNT_INDEX);
+        await new Promise<void>((resolve, reject) => {
+          const request = index.openCursor(IDBKeyRange.only(envelope.accountId));
+          request.onerror = () => reject(
+            request.error ?? new Error("Could not inspect replacement evidence."),
+          );
+          request.onsuccess = () => {
+            const cursor = request.result;
+            if (!cursor) {
+              resolve();
+              return;
+            }
+            const encodedKey = Array.isArray(cursor.primaryKey)
+              ? JSON.stringify(cursor.primaryKey)
+              : "";
+            if (retainedKeys.has(encodedKey)) {
+              cursor.continue();
+              return;
+            }
+            const deletion = cursor.delete();
+            deletion.onerror = () => reject(
+              deletion.error ?? new Error("Could not remove replacement evidence."),
+            );
+            deletion.onsuccess = () => {
+              removedUnreferencedEvidence += 1;
+              cursor.continue();
+            };
+          };
+        });
+      }
+      if (evidenceChanged || removedUnreferencedEvidence) {
+        await requestResult(scopeStore.put(
+          nextEvidenceRevision(scope, "write-workspace"),
+        ));
+      }
       return storedEnvelope;
     },
   );
@@ -1578,6 +2633,7 @@ export async function writeWorkspace(
 export async function replaceWorkspaceAfterRecoveryChoice(
   envelope: Omit<WorkspaceEnvelope, "localRevision">,
   expectedGeneration: PersistenceScopeGeneration,
+  stagedEvidence: readonly StagedEvidenceBlobWrite[] = [],
 ): Promise<WorkspaceEnvelope> {
   const requested: WorkspaceEnvelope = { ...envelope, localRevision: 0 };
   if (!isWorkspaceEnvelope(requested)) {
@@ -1587,13 +2643,18 @@ export async function replaceWorkspaceAfterRecoveryChoice(
       "Refused to replace a quarantined workspace with an invalid envelope.",
     );
   }
+  const preparedEvidence = await preparedStagedEvidenceWrites(
+    stagedEvidence,
+    requested.accountId,
+  );
   return runStoresTransaction(
-    [WORKSPACE_STORE, ACCOUNT_SCOPE_STORE],
+    [WORKSPACE_STORE, EVIDENCE_STORE, EVIDENCE_STAGING_STORE, ACCOUNT_SCOPE_STORE],
     "readwrite",
     "replace-quarantined-workspace",
     async (transaction) => {
-      await requireWritableAccountScope(
-        transaction.objectStore(ACCOUNT_SCOPE_STORE),
+      const scopeStore = transaction.objectStore(ACCOUNT_SCOPE_STORE);
+      const scope = await requireWritableAccountScope(
+        scopeStore,
         requested.accountId,
         expectedGeneration,
       );
@@ -1616,6 +2677,15 @@ export async function replaceWorkspaceAfterRecoveryChoice(
       };
       delete storedEnvelope.recovery;
       await requestResult(store.put(storedEnvelope));
+      const evidenceChanged = await promotePreparedStagedEvidence(
+        transaction,
+        preparedEvidence,
+      );
+      if (evidenceChanged) {
+        await requestResult(scopeStore.put(
+          nextEvidenceRevision(scope, "replace-quarantined-workspace"),
+        ));
+      }
       return storedEnvelope;
     },
   );
@@ -1641,10 +2711,7 @@ export async function deleteWorkspace(
   );
 }
 
-export async function storeEvidenceBlob(
-  input: EvidenceBlobInput,
-  expectedGeneration: PersistenceScopeGeneration,
-): Promise<EvidenceBlobRecord> {
+function evidenceBlobRecord(input: EvidenceBlobInput): EvidenceBlobRecord {
   evidenceKey(input.accountId, input.goalId, input.evidenceId);
   const mimeType = normalizeEvidenceMimeType(input.blob.type);
   const blob = isAllowedEvidenceMimeType(mimeType) && input.blob.type !== mimeType
@@ -1664,20 +2731,523 @@ export async function storeEvidenceBlob(
       "Refused to persist an invalid evidence blob record.",
     );
   }
+  return record;
+}
+
+export async function storeEvidenceBlob(
+  input: EvidenceBlobInput,
+  expectedGeneration: PersistenceScopeGeneration,
+  expectedWorkspaceLocalRevision: number,
+): Promise<EvidenceBlobRecord> {
+  const record = evidenceBlobRecord(input);
+  const writeId = globalThis.crypto.randomUUID();
+  let committedWriteId = writeId;
+  const storedRecord = {
+    ...await serializeEvidenceBlobRecord(record),
+    writeId,
+  } satisfies StoredEvidenceBytesRecord;
   await runStoresTransaction(
-    [EVIDENCE_STORE, ACCOUNT_SCOPE_STORE],
+    [WORKSPACE_STORE, EVIDENCE_STORE, ACCOUNT_SCOPE_STORE],
     "readwrite",
     "store-evidence",
+    async (transaction) => {
+      const scopeStore = transaction.objectStore(ACCOUNT_SCOPE_STORE);
+      const scope = await requireWritableAccountScope(
+        scopeStore,
+        record.accountId,
+        expectedGeneration,
+      );
+      const rawWorkspace: unknown = await requestResult(
+        transaction.objectStore(WORKSPACE_STORE).get(record.accountId),
+      );
+      requireExactWorkspaceLocalRevision(
+        rawWorkspace,
+        record.accountId,
+        expectedWorkspaceLocalRevision,
+      );
+      const evidenceStore = transaction.objectStore(EVIDENCE_STORE);
+      const key = evidenceKey(record.accountId, record.goalId, record.evidenceId);
+      const current: unknown = await requestResult(evidenceStore.get(key));
+      if (current !== undefined) {
+        if (!storedEvidenceBytesEqual(current, storedRecord)) {
+          throw new PersistenceError(
+            "local-conflict",
+            "store-evidence",
+            "Evidence storage already contains different bytes for this workspace key.",
+          );
+        }
+        const recovered = recoverEvidenceBlobRecord(current);
+        if (!recovered) {
+          throw new PersistenceError(
+            "invalid-data",
+            "store-evidence",
+            "The existing evidence record is damaged.",
+          );
+        }
+        if (!isPersistenceId(recovered.writeId)) {
+          throw new PersistenceError(
+            "invalid-data",
+            "store-evidence",
+            "The existing evidence record has no live write identity.",
+          );
+        }
+        committedWriteId = recovered.writeId;
+        return;
+      }
+      await requestResult(evidenceStore.add(storedRecord));
+      await requestResult(scopeStore.put(nextEvidenceRevision(scope, "store-evidence")));
+    },
+  );
+  return { ...record, writeId: committedWriteId };
+}
+
+/**
+ * Stores migration bytes under an opaque token. Staging is a separate object
+ * store and is therefore never visible to live evidence readers or backups.
+ */
+export async function stageEvidenceBlob(
+  input: EvidenceBlobInput,
+  expectedGeneration: PersistenceScopeGeneration,
+): Promise<StagedEvidenceBlobWrite> {
+  const record = evidenceBlobRecord(input);
+  const serialized = await serializeEvidenceBlobRecord(record);
+  const token = globalThis.crypto.randomUUID();
+  const stagedStored: StoredStagedEvidenceBytesRecord = {
+    ...serialized,
+    token,
+    stagedAt: new Date().toISOString(),
+  };
+
+  return runStoresTransaction(
+    [EVIDENCE_STAGING_STORE, ACCOUNT_SCOPE_STORE],
+    "readwrite",
+    "stage-evidence",
     async (transaction) => {
       await requireWritableAccountScope(
         transaction.objectStore(ACCOUNT_SCOPE_STORE),
         record.accountId,
         expectedGeneration,
       );
-      await requestResult(transaction.objectStore(EVIDENCE_STORE).put(record));
+      await requestResult(
+        transaction.objectStore(EVIDENCE_STAGING_STORE).add(stagedStored),
+      );
+      return { token, record };
     },
   );
-  return record;
+}
+
+/**
+ * Compensation deletes only the opaque staging token. It can never restore,
+ * replace, or delete a live evidence value.
+ */
+export async function rollbackStagedEvidenceBlob(
+  write: StagedEvidenceBlobWrite,
+  expectedGeneration: PersistenceScopeGeneration,
+): Promise<EvidenceBlobRollbackResult> {
+  if (
+    !isEvidenceBlobRecord(write.record)
+    || !isPersistenceId(write.token)
+  ) {
+    throw new PersistenceError(
+      "invalid-argument",
+      "rollback-staged-evidence",
+      "The staged evidence rollback receipt is invalid.",
+    );
+  }
+
+  const expected = await serializeEvidenceBlobRecord(write.record);
+
+  return runStoresTransaction(
+    [EVIDENCE_STAGING_STORE, ACCOUNT_SCOPE_STORE],
+    "readwrite",
+    "rollback-staged-evidence",
+    async (transaction) => {
+      await requireWritableAccountScope(
+        transaction.objectStore(ACCOUNT_SCOPE_STORE),
+        write.record.accountId,
+        expectedGeneration,
+      );
+      const store = transaction.objectStore(EVIDENCE_STAGING_STORE);
+      const current: unknown = await requestResult(store.get(write.token));
+      if (current === undefined) return "already-absent";
+      if (
+        !isRecord(current)
+        || current.token !== write.token
+        || !storedEvidenceBytesEqual(current, expected)
+      ) {
+        throw new PersistenceError(
+          "invalid-data",
+          "rollback-staged-evidence",
+          "The staged evidence token contains different or damaged bytes.",
+        );
+      }
+      await requestResult(store.delete(write.token));
+      return "rolled-back";
+    },
+  );
+}
+
+export async function stageEvidenceCleanupIntent(
+  input: EvidenceCleanupIntentInput,
+  expectedGeneration: PersistenceScopeGeneration,
+): Promise<EvidenceCleanupIntent> {
+  evidenceKey(input.accountId, input.goalId, input.evidenceId);
+  if (
+    (input.expectedWriteId !== undefined && !isPersistenceId(input.expectedWriteId))
+    || (input.remotePath !== undefined
+      && (input.remotePath.length === 0
+        || input.remotePath.length > 1_024
+        || input.remotePath !== input.remotePath.trim()))
+    || (input.expectedWriteId === undefined && input.remotePath === undefined)
+  ) {
+    throw new PersistenceError(
+      "invalid-argument",
+      "stage-evidence-cleanup",
+      "Evidence cleanup requires an exact live write identity or private object path.",
+    );
+  }
+  const intent: EvidenceCleanupIntent = {
+    kind: "cleanup",
+    token: globalThis.crypto.randomUUID(),
+    accountId: input.accountId,
+    goalId: input.goalId,
+    evidenceId: input.evidenceId,
+    createdAt: new Date().toISOString(),
+    ...(input.expectedWriteId ? { expectedWriteId: input.expectedWriteId } : {}),
+    ...(input.remotePath ? { remotePath: input.remotePath } : {}),
+  };
+  return runStoresTransaction(
+    [EVIDENCE_STAGING_STORE, ACCOUNT_SCOPE_STORE],
+    "readwrite",
+    "stage-evidence-cleanup",
+    async (transaction) => {
+      await requireWritableAccountScope(
+        transaction.objectStore(ACCOUNT_SCOPE_STORE),
+        intent.accountId,
+        expectedGeneration,
+      );
+      await requestResult(
+        transaction.objectStore(EVIDENCE_STAGING_STORE).add(intent),
+      );
+      return intent;
+    },
+  );
+}
+
+export async function cancelEvidenceCleanupIntent(
+  intent: EvidenceCleanupIntent,
+  expectedGeneration: PersistenceScopeGeneration,
+): Promise<"cancelled" | "already-absent"> {
+  if (!isEvidenceCleanupIntent(intent)) {
+    throw new PersistenceError(
+      "invalid-argument",
+      "cancel-evidence-cleanup",
+      "The evidence cleanup receipt is invalid.",
+    );
+  }
+  return runStoresTransaction(
+    [EVIDENCE_STAGING_STORE, ACCOUNT_SCOPE_STORE],
+    "readwrite",
+    "cancel-evidence-cleanup",
+    async (transaction) => {
+      await requireWritableAccountScope(
+        transaction.objectStore(ACCOUNT_SCOPE_STORE),
+        intent.accountId,
+        expectedGeneration,
+      );
+      const store = transaction.objectStore(EVIDENCE_STAGING_STORE);
+      const raw: unknown = await requestResult(store.get(intent.token));
+      if (raw === undefined) return "already-absent";
+      if (!isEvidenceCleanupIntent(raw) || !cleanupIntentContentsEqual(raw, intent)) {
+        throw new PersistenceError(
+          "invalid-data",
+          "cancel-evidence-cleanup",
+          "The evidence cleanup token contains different or damaged provenance.",
+        );
+      }
+      await requestResult(store.delete(intent.token));
+      return "cancelled";
+    },
+  );
+}
+
+export async function listEvidenceCleanupIntents(
+  accountId: string,
+  expectedGeneration: PersistenceScopeGeneration,
+): Promise<EvidenceCleanupIntent[]> {
+  const key = workspaceKey(accountId);
+  return runStoresTransaction(
+    [EVIDENCE_STAGING_STORE, ACCOUNT_SCOPE_STORE],
+    "readonly",
+    "list-evidence-cleanup",
+    async (transaction) => {
+      await requireWritableAccountScope(
+        transaction.objectStore(ACCOUNT_SCOPE_STORE),
+        key,
+        expectedGeneration,
+      );
+      const values: unknown[] = await requestResult(
+        transaction.objectStore(EVIDENCE_STAGING_STORE)
+          .index(EVIDENCE_STAGING_ACCOUNT_INDEX)
+          .getAll(key),
+      );
+      const intents: EvidenceCleanupIntent[] = [];
+      for (const value of values) {
+        if (!isRecord(value) || value.kind !== "cleanup") continue;
+        if (!isEvidenceCleanupIntent(value) || value.accountId !== key) {
+          throw new PersistenceError(
+            "invalid-data",
+            "list-evidence-cleanup",
+            "An evidence cleanup journal entry is damaged.",
+          );
+        }
+        intents.push(value);
+      }
+      return intents.sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+    },
+  );
+}
+
+export async function markEvidenceCleanupRemoteComplete(
+  intent: EvidenceCleanupIntent,
+  expectedGeneration: PersistenceScopeGeneration,
+): Promise<"updated" | "completed" | "already-absent"> {
+  if (!isEvidenceCleanupIntent(intent) || !intent.remotePath) {
+    throw new PersistenceError(
+      "invalid-argument",
+      "complete-remote-evidence-cleanup",
+      "Remote cleanup requires an exact durable journal receipt.",
+    );
+  }
+  return runStoresTransaction(
+    [EVIDENCE_STAGING_STORE, ACCOUNT_SCOPE_STORE],
+    "readwrite",
+    "complete-remote-evidence-cleanup",
+    async (transaction) => {
+      await requireWritableAccountScope(
+        transaction.objectStore(ACCOUNT_SCOPE_STORE),
+        intent.accountId,
+        expectedGeneration,
+      );
+      const store = transaction.objectStore(EVIDENCE_STAGING_STORE);
+      const raw: unknown = await requestResult(store.get(intent.token));
+      if (raw === undefined) return "already-absent";
+      if (!isEvidenceCleanupIntent(raw) || !cleanupIntentContentsEqual(raw, intent)) {
+        throw new PersistenceError(
+          "local-conflict",
+          "complete-remote-evidence-cleanup",
+          "The cleanup journal changed before remote deletion completed.",
+        );
+      }
+      if (raw.expectedWriteId) {
+        await requestResult(store.put({ ...raw, remotePath: undefined }));
+        return "updated";
+      }
+      await requestResult(store.delete(raw.token));
+      return "completed";
+    },
+  );
+}
+
+export interface EvidenceCleanupRecoveryResult {
+  readonly deletedLive: number;
+  readonly cancelledReferenced: number;
+  readonly pendingRemote: number;
+}
+
+function workspaceEvidenceReferences(envelope: WorkspaceEnvelope | null): {
+  keys: Set<string>;
+  remotePaths: Set<string>;
+} {
+  const keys = new Set<string>();
+  const remotePaths = new Set<string>();
+  if (!envelope) return { keys, remotePaths };
+  for (const state of [envelope.state, ...envelope.history]) {
+    for (const goal of state.goals) {
+      for (const item of goal.evidence) {
+        if (item.type === "file") {
+          keys.add(JSON.stringify(evidenceKey(
+            envelope.accountId,
+            goal.id,
+            item.id,
+          )));
+          if (item.remotePath) remotePaths.add(item.remotePath);
+        }
+      }
+    }
+  }
+  return { keys, remotePaths };
+}
+
+/**
+ * Recovers deletion work after a crash. The authoritative persisted workspace
+ * and exact live write identities are checked in the same transaction. A
+ * reintroduced reference cancels cleanup; a newer replacement always survives.
+ */
+export async function recoverLocalEvidenceCleanupIntents(
+  accountId: string,
+  expectedGeneration: PersistenceScopeGeneration,
+): Promise<EvidenceCleanupRecoveryResult> {
+  const key = workspaceKey(accountId);
+  return runStoresTransaction(
+    [WORKSPACE_STORE, EVIDENCE_STORE, EVIDENCE_STAGING_STORE, ACCOUNT_SCOPE_STORE],
+    "readwrite",
+    "recover-local-evidence-cleanup",
+    async (transaction) => {
+      const scopeStore = transaction.objectStore(ACCOUNT_SCOPE_STORE);
+      const scope = await requireWritableAccountScope(
+        scopeStore,
+        key,
+        expectedGeneration,
+      );
+      const rawWorkspace: unknown = await requestResult(
+        transaction.objectStore(WORKSPACE_STORE).get(key),
+      );
+      const envelope = rawWorkspace === undefined
+        ? null
+        : recoverWorkspaceEnvelope(rawWorkspace, key);
+      const references = workspaceEvidenceReferences(envelope);
+      const stagingStore = transaction.objectStore(EVIDENCE_STAGING_STORE);
+      const values: unknown[] = await requestResult(
+        stagingStore.index(EVIDENCE_STAGING_ACCOUNT_INDEX).getAll(key),
+      );
+      const evidenceStore = transaction.objectStore(EVIDENCE_STORE);
+      let deletedLive = 0;
+      let cancelledReferenced = 0;
+      let pendingRemote = 0;
+      for (const value of values) {
+        if (!isRecord(value) || value.kind !== "cleanup") continue;
+        if (!isEvidenceCleanupIntent(value) || value.accountId !== key) {
+          throw new PersistenceError(
+            "invalid-data",
+            "recover-local-evidence-cleanup",
+            "An evidence cleanup journal entry is damaged.",
+          );
+        }
+        const encodedKey = JSON.stringify(evidenceKey(
+          value.accountId,
+          value.goalId,
+          value.evidenceId,
+        ));
+        if (references.keys.has(encodedKey)) {
+          if (value.remotePath && !references.remotePaths.has(value.remotePath)) {
+            await requestResult(stagingStore.put({
+              ...value,
+              expectedWriteId: undefined,
+            }));
+            pendingRemote += 1;
+          } else {
+            await requestResult(stagingStore.delete(value.token));
+            cancelledReferenced += 1;
+          }
+          continue;
+        }
+        if (value.expectedWriteId) {
+          const live: unknown = await requestResult(evidenceStore.get(JSON.parse(
+            encodedKey,
+          ) as [string, string, string]));
+          if (isRecord(live) && live.writeId === value.expectedWriteId) {
+            await requestResult(evidenceStore.delete(JSON.parse(
+              encodedKey,
+            ) as [string, string, string]));
+            deletedLive += 1;
+          }
+        }
+        if (value.remotePath) {
+          await requestResult(stagingStore.put({
+            ...value,
+            expectedWriteId: undefined,
+          }));
+          pendingRemote += 1;
+        } else {
+          await requestResult(stagingStore.delete(value.token));
+        }
+      }
+      if (deletedLive) {
+        await requestResult(scopeStore.put(
+          nextEvidenceRevision(scope, "recover-local-evidence-cleanup"),
+        ));
+      }
+      return { deletedLive, cancelledReferenced, pendingRemote };
+    },
+  );
+}
+
+/** Deletes abandoned staging rows without touching any live evidence value. */
+export async function cleanupAbandonedEvidenceStaging(
+  accountId: string,
+  expectedGeneration: PersistenceScopeGeneration,
+  stagedBefore: string,
+): Promise<number> {
+  const key = workspaceKey(accountId);
+  if (!isIsoDate(stagedBefore)) {
+    throw new PersistenceError(
+      "invalid-argument",
+      "cleanup-evidence-staging",
+      "The staging cleanup cutoff must be an ISO timestamp.",
+    );
+  }
+  return runStoresTransaction(
+    [EVIDENCE_STAGING_STORE, ACCOUNT_SCOPE_STORE],
+    "readwrite",
+    "cleanup-evidence-staging",
+    async (transaction) => {
+      await requireWritableAccountScope(
+        transaction.objectStore(ACCOUNT_SCOPE_STORE),
+        key,
+        expectedGeneration,
+      );
+      const index = transaction.objectStore(EVIDENCE_STAGING_STORE)
+        .index(EVIDENCE_STAGING_ACCOUNT_INDEX);
+      return new Promise<number>((resolve, reject) => {
+        let removed = 0;
+        const cursorRequest = index.openCursor(IDBKeyRange.only(key));
+        cursorRequest.onerror = () => reject(
+          cursorRequest.error ?? new Error("Could not enumerate staged evidence."),
+        );
+        cursorRequest.onsuccess = () => {
+          const cursor = cursorRequest.result;
+          if (!cursor) {
+            resolve(removed);
+            return;
+          }
+          const value = cursor.value;
+          if (isRecord(value) && value.kind === "cleanup") {
+            if (!isEvidenceCleanupIntent(value)) {
+              reject(new PersistenceError(
+                "invalid-data",
+                "cleanup-evidence-staging",
+                "An evidence cleanup journal entry is damaged.",
+              ));
+              return;
+            }
+            cursor.continue();
+            return;
+          }
+          if (!isRecord(value) || !isIsoDate(value.stagedAt)) {
+            reject(new PersistenceError(
+              "invalid-data",
+              "cleanup-evidence-staging",
+              "A staged evidence record is damaged.",
+            ));
+            return;
+          }
+          if (value.stagedAt >= stagedBefore) {
+            cursor.continue();
+            return;
+          }
+          const deletion = cursor.delete();
+          deletion.onerror = () => reject(
+            deletion.error ?? new Error("Could not remove abandoned staged evidence."),
+          );
+          deletion.onsuccess = () => {
+            removed += 1;
+            cursor.continue();
+          };
+        };
+      });
+    },
+  );
 }
 
 export async function readEvidenceBlob(
@@ -1701,17 +3271,18 @@ export async function readEvidenceBlob(
       transaction.objectStore(EVIDENCE_STORE).get(key),
     );
     if (value === undefined) return null;
-    if (!isEvidenceBlobRecord(value)
-      || value.accountId !== key[0]
-      || value.goalId !== key[1]
-      || value.evidenceId !== key[2]) {
+    const record = recoverEvidenceBlobRecord(value);
+    if (!record
+      || record.accountId !== key[0]
+      || record.goalId !== key[1]
+      || record.evidenceId !== key[2]) {
       throw new PersistenceError(
         "invalid-data",
         "read-evidence",
         "The stored evidence record is invalid or belongs to another account or goal.",
       );
     }
-    return value;
+    return record;
     },
   );
 }
@@ -1751,15 +3322,16 @@ export async function listEvidenceBlobs(
       : store.index(EVIDENCE_ACCOUNT_GOAL_INDEX);
     const query: IDBValidKey = goalKey === undefined ? accountKey : [accountKey, goalKey];
     const values: unknown[] = await requestResult(index.getAll(query));
-    if (!values.every(isEvidenceBlobRecord)) {
+    const records = values.map(recoverEvidenceBlobRecord);
+    if (records.some((record) => record === null)) {
       throw new PersistenceError(
         "invalid-data",
         "list-evidence",
         "One or more stored evidence records are invalid.",
       );
     }
-    const records = values as EvidenceBlobRecord[];
-    if (records.some((record) => record.accountId !== accountKey
+    const recovered = records as EvidenceBlobRecord[];
+    if (recovered.some((record) => record.accountId !== accountKey
       || (goalKey !== undefined && record.goalId !== goalKey))) {
       throw new PersistenceError(
         "invalid-data",
@@ -1767,29 +3339,208 @@ export async function listEvidenceBlobs(
         "IndexedDB returned evidence outside the requested account scope.",
       );
     }
-    return records.sort((left, right) => right.savedAt.localeCompare(left.savedAt));
+    return recovered.sort((left, right) => right.savedAt.localeCompare(left.savedAt));
+    },
+  );
+}
+
+function persistedWorkspaceLocalRevision(raw: unknown, accountId: string): number {
+  return raw === undefined ? 0 : recoverWorkspaceEnvelope(raw, accountId).localRevision;
+}
+
+function requireExactWorkspaceLocalRevision(
+  raw: unknown,
+  accountId: string,
+  expectedLocalRevision: number,
+): void {
+  if (!isLocalRevision(expectedLocalRevision)) {
+    throw new PersistenceError(
+      "invalid-argument",
+      "evidence-revision-fence",
+      "The committed workspace revision must be a non-negative safe integer.",
+    );
+  }
+  const actual = persistedWorkspaceLocalRevision(raw, accountId);
+  if (actual !== expectedLocalRevision) {
+    throw new LocalWorkspaceConflictError(accountId, expectedLocalRevision, actual);
+  }
+}
+
+export async function deleteEvidenceBlobs(
+  snapshots: readonly EvidenceBlobRecord[],
+  expectedGeneration: PersistenceScopeGeneration,
+  expectedWorkspaceLocalRevision: number,
+): Promise<EvidenceBlobDeleteResult> {
+  if (!snapshots.length) {
+    throw new PersistenceError(
+      "invalid-argument",
+      "delete-evidence",
+      "Evidence deletion requires at least one exact live write snapshot.",
+    );
+  }
+  const accountId = snapshots[0].accountId;
+  const keys = new Set<string>();
+  for (const snapshot of snapshots) {
+    const key = evidenceKey(snapshot.accountId, snapshot.goalId, snapshot.evidenceId);
+    const encoded = JSON.stringify(key);
+    if (
+      !isEvidenceBlobRecord(snapshot)
+      || !isPersistenceId(snapshot.writeId)
+      || snapshot.accountId !== accountId
+      || keys.has(encoded)
+    ) {
+      throw new PersistenceError(
+        "invalid-argument",
+        "delete-evidence",
+        "Evidence deletion requires unique exact live write snapshots from one account.",
+      );
+    }
+    keys.add(encoded);
+  }
+  return runStoresTransaction(
+    [WORKSPACE_STORE, EVIDENCE_STORE, ACCOUNT_SCOPE_STORE],
+    "readwrite",
+    "delete-evidence",
+    async (transaction) => {
+      const scopeStore = transaction.objectStore(ACCOUNT_SCOPE_STORE);
+      const scope = await requireWritableAccountScope(
+        scopeStore,
+        accountId,
+        expectedGeneration,
+      );
+      const rawWorkspace: unknown = await requestResult(
+        transaction.objectStore(WORKSPACE_STORE).get(accountId),
+      );
+      requireExactWorkspaceLocalRevision(
+        rawWorkspace,
+        accountId,
+        expectedWorkspaceLocalRevision,
+      );
+      const store = transaction.objectStore(EVIDENCE_STORE);
+      for (const snapshot of snapshots) {
+        const current: unknown = await requestResult(store.get(evidenceKey(
+          snapshot.accountId,
+          snapshot.goalId,
+          snapshot.evidenceId,
+        )));
+        if (!isRecord(current) || current.writeId !== snapshot.writeId) {
+          return { kind: "superseded" };
+        }
+      }
+      for (const snapshot of snapshots) {
+        await requestResult(store.delete(evidenceKey(
+          snapshot.accountId,
+          snapshot.goalId,
+          snapshot.evidenceId,
+        )));
+      }
+      const nextScope = nextEvidenceRevision(scope, "delete-evidence");
+      await requestResult(scopeStore.put(nextScope));
+      return {
+        kind: "deleted",
+        receipt: {
+          accountId,
+          generation: expectedGeneration,
+          workspaceLocalRevision: expectedWorkspaceLocalRevision,
+          evidenceRevisionAfterDelete: nextScope.evidenceRevision,
+          snapshots: snapshots.map((snapshot) => ({ ...snapshot })),
+        },
+      };
     },
   );
 }
 
 export async function deleteEvidenceBlob(
-  accountId: string,
-  goalId: string,
-  evidenceId: string,
+  snapshot: EvidenceBlobRecord,
   expectedGeneration: PersistenceScopeGeneration,
-): Promise<void> {
-  const key = evidenceKey(accountId, goalId, evidenceId);
-  await runStoresTransaction(
-    [EVIDENCE_STORE, ACCOUNT_SCOPE_STORE],
+  expectedWorkspaceLocalRevision: number,
+): Promise<EvidenceBlobDeleteResult> {
+  return deleteEvidenceBlobs(
+    [snapshot],
+    expectedGeneration,
+    expectedWorkspaceLocalRevision,
+  );
+}
+
+/**
+ * Compensation restores only an absent key, or shares already-identical live
+ * bytes. A newer differing write is never overwritten by stale rollback.
+ */
+export async function restoreEvidenceBlobs(
+  receipt: EvidenceBlobDeletionReceipt,
+): Promise<"restored" | "already-equal" | "superseded"> {
+  if (
+    !isPersistenceId(receipt.accountId)
+    || !isLocalRevision(receipt.workspaceLocalRevision)
+    || !isLocalRevision(receipt.evidenceRevisionAfterDelete)
+    || !receipt.snapshots.length
+    || receipt.snapshots.some((snapshot) => (
+      !isEvidenceBlobRecord(snapshot)
+      || snapshot.accountId !== receipt.accountId
+    ))
+  ) {
+    throw new PersistenceError(
+      "invalid-argument",
+      "restore-evidence",
+      "Evidence restoration requires an exact deletion receipt.",
+    );
+  }
+  const stored = await Promise.all(receipt.snapshots.map(async (snapshot) => ({
+    snapshot,
+    value: await serializeEvidenceBlobRecord(snapshot),
+  })));
+  return runStoresTransaction(
+    [WORKSPACE_STORE, EVIDENCE_STORE, ACCOUNT_SCOPE_STORE],
     "readwrite",
-    "delete-evidence",
+    "restore-evidence",
     async (transaction) => {
-      await requireWritableAccountScope(
-        transaction.objectStore(ACCOUNT_SCOPE_STORE),
-        key[0],
-        expectedGeneration,
+      const scopeStore = transaction.objectStore(ACCOUNT_SCOPE_STORE);
+      const scope = await requireWritableAccountScope(
+        scopeStore,
+        receipt.accountId,
+        receipt.generation,
       );
-      await requestResult(transaction.objectStore(EVIDENCE_STORE).delete(key));
+      if (scope.evidenceRevision !== receipt.evidenceRevisionAfterDelete) {
+        return "superseded";
+      }
+      const rawWorkspace: unknown = await requestResult(
+        transaction.objectStore(WORKSPACE_STORE).get(receipt.accountId),
+      );
+      requireExactWorkspaceLocalRevision(
+        rawWorkspace,
+        receipt.accountId,
+        receipt.workspaceLocalRevision,
+      );
+      const evidenceStore = transaction.objectStore(EVIDENCE_STORE);
+      let inserted = false;
+      for (const item of stored) {
+        const current: unknown = await requestResult(evidenceStore.get(evidenceKey(
+          item.snapshot.accountId,
+          item.snapshot.goalId,
+          item.snapshot.evidenceId,
+        )));
+        if (current !== undefined && !storedEvidenceBytesEqual(current, item.value)) {
+          return "superseded";
+        }
+      }
+      for (const item of stored) {
+        const key = evidenceKey(
+          item.snapshot.accountId,
+          item.snapshot.goalId,
+          item.snapshot.evidenceId,
+        );
+        const current: unknown = await requestResult(evidenceStore.get(key));
+        if (current !== undefined) continue;
+        await requestResult(evidenceStore.add({
+          ...item.value,
+          writeId: globalThis.crypto.randomUUID(),
+        } satisfies StoredEvidenceBytesRecord));
+        inserted = true;
+      }
+      if (inserted) {
+        await requestResult(scopeStore.put(nextEvidenceRevision(scope, "restore-evidence")));
+      }
+      return inserted ? "restored" : "already-equal";
     },
   );
 }
@@ -1825,15 +3576,22 @@ export async function deleteAllAccountEvidence(
     "readwrite",
     "delete-account-evidence",
     async (transaction) => {
-      await requireWritableAccountScope(
-        transaction.objectStore(ACCOUNT_SCOPE_STORE),
+      const scopeStore = transaction.objectStore(ACCOUNT_SCOPE_STORE);
+      const scope = await requireWritableAccountScope(
+        scopeStore,
         key,
         expectedGeneration,
       );
-      return deleteEvidenceCursor(
+      const deleted = await deleteEvidenceCursor(
         transaction.objectStore(EVIDENCE_STORE).index(EVIDENCE_ACCOUNT_INDEX),
         key,
       );
+      if (deleted) {
+        await requestResult(scopeStore.put(
+          nextEvidenceRevision(scope, "delete-account-evidence"),
+        ));
+      }
+      return deleted;
     },
   );
 }
@@ -1849,7 +3607,13 @@ export async function deleteAccountPersistence(
   const key = workspaceKey(accountId);
   const expected = requireScopeGeneration(expectedGeneration);
   return runStoresTransaction(
-    [WORKSPACE_STORE, EVIDENCE_STORE, ACCOUNT_SCOPE_STORE, ACCOUNT_REMINDER_STORE],
+    [
+      WORKSPACE_STORE,
+      EVIDENCE_STORE,
+      EVIDENCE_STAGING_STORE,
+      ACCOUNT_SCOPE_STORE,
+      ACCOUNT_REMINDER_STORE,
+    ],
     "readwrite",
     "delete-account-persistence",
     async (transaction) => {
@@ -1862,18 +3626,108 @@ export async function deleteAccountPersistence(
           "The account persistence generation is exhausted.",
         );
       }
-      const scope: AccountPersistenceScope = {
-        accountId: key,
-        generation: current.generation + 1,
-        tombstoned: false,
-        updatedAt: new Date().toISOString(),
-      };
       const evidenceStore = transaction.objectStore(EVIDENCE_STORE);
       const [, deletedEvidence] = await Promise.all([
         requestResult(transaction.objectStore(WORKSPACE_STORE).delete(key)),
         deleteEvidenceCursor(evidenceStore.index(EVIDENCE_ACCOUNT_INDEX), key),
+        deleteEvidenceCursor(
+          transaction.objectStore(EVIDENCE_STAGING_STORE)
+            .index(EVIDENCE_STAGING_ACCOUNT_INDEX),
+          key,
+        ),
         requestResult(transaction.objectStore(ACCOUNT_REMINDER_STORE).delete(key)),
       ]);
+      const scope: AccountPersistenceScope = {
+        accountId: key,
+        generation: current.generation + 1,
+        evidenceRevision: deletedEvidence
+          ? nextEvidenceRevision(current, "delete-account-persistence").evidenceRevision
+          : current.evidenceRevision,
+        tombstoned: false,
+        updatedAt: new Date().toISOString(),
+      };
+      await requestResult(scopeStore.put(scope));
+      return { deletedEvidence, scope };
+    },
+  );
+}
+
+/**
+ * Atomically refuses destructive reset when the persisted workspace revision
+ * differs from the revision covered by the person's completed backup.
+ */
+export async function deleteAccountPersistenceAtRevision(
+  accountId: string,
+  expectedGeneration: PersistenceScopeGeneration,
+  expectedLocalRevision: number,
+  expectedEvidenceRevision: number,
+): Promise<AccountPersistenceEraseResult> {
+  const key = workspaceKey(accountId);
+  const expected = requireScopeGeneration(expectedGeneration);
+  if (!isLocalRevision(expectedLocalRevision) || !isLocalRevision(expectedEvidenceRevision)) {
+    throw new PersistenceError(
+      "invalid-argument",
+      "delete-account-persistence-at-revision",
+      "The backup receipt contains an invalid browser-local revision.",
+    );
+  }
+  return runStoresTransaction(
+    [
+      WORKSPACE_STORE,
+      EVIDENCE_STORE,
+      EVIDENCE_STAGING_STORE,
+      ACCOUNT_SCOPE_STORE,
+      ACCOUNT_REMINDER_STORE,
+      LEGACY_IMPORT_CLAIM_STORE,
+    ],
+    "readwrite",
+    "delete-account-persistence-at-revision",
+    async (transaction) => {
+      const scopeStore = transaction.objectStore(ACCOUNT_SCOPE_STORE);
+      const current = await requireWritableAccountScope(scopeStore, key, expected);
+      const raw: unknown = await requestResult(
+        transaction.objectStore(WORKSPACE_STORE).get(key),
+      );
+      requireAccountPersistenceBackupBoundary(raw, current, {
+        accountId: key,
+        generation: expected,
+        workspaceLocalRevision: expectedLocalRevision,
+        evidenceRevision: expectedEvidenceRevision,
+      }, "delete-account-persistence-at-revision");
+      if (current.generation === Number.MAX_SAFE_INTEGER) {
+        throw new PersistenceError(
+          "invalid-data",
+          "delete-account-persistence-at-revision",
+          "The account persistence generation is exhausted.",
+        );
+      }
+      const evidenceStore = transaction.objectStore(EVIDENCE_STORE);
+      const legacyImportStore = transaction.objectStore(LEGACY_IMPORT_CLAIM_STORE);
+      const legacyImport: unknown = await requestResult(legacyImportStore.get(key));
+      const disabledLegacyImport = prepareLegacyWorkspaceImportDisable(
+        legacyImport,
+        key,
+      );
+      const [, deletedEvidence] = await Promise.all([
+        requestResult(transaction.objectStore(WORKSPACE_STORE).delete(key)),
+        deleteEvidenceCursor(evidenceStore.index(EVIDENCE_ACCOUNT_INDEX), key),
+        deleteEvidenceCursor(
+          transaction.objectStore(EVIDENCE_STAGING_STORE)
+            .index(EVIDENCE_STAGING_ACCOUNT_INDEX),
+          key,
+        ),
+        requestResult(transaction.objectStore(ACCOUNT_REMINDER_STORE).delete(key)),
+        requestResult(legacyImportStore.put(disabledLegacyImport)),
+      ]);
+      const scope: AccountPersistenceScope = {
+        accountId: key,
+        generation: current.generation + 1,
+        evidenceRevision: deletedEvidence
+          ? nextEvidenceRevision(current, "delete-account-persistence-at-revision").evidenceRevision
+          : current.evidenceRevision,
+        tombstoned: false,
+        updatedAt: new Date().toISOString(),
+      };
       await requestResult(scopeStore.put(scope));
       return { deletedEvidence, scope };
     },
@@ -1891,7 +3745,13 @@ export async function eraseAccountPersistenceWithTombstone(
   const key = workspaceKey(accountId);
   const expected = requireScopeGeneration(tombstonedGeneration);
   return runStoresTransaction(
-    [WORKSPACE_STORE, EVIDENCE_STORE, ACCOUNT_SCOPE_STORE, ACCOUNT_REMINDER_STORE],
+    [
+      WORKSPACE_STORE,
+      EVIDENCE_STORE,
+      EVIDENCE_STAGING_STORE,
+      ACCOUNT_SCOPE_STORE,
+      ACCOUNT_REMINDER_STORE,
+    ],
     "readwrite",
     "erase-tombstoned-account-persistence",
     async (transaction) => {
@@ -1911,6 +3771,11 @@ export async function eraseAccountPersistenceWithTombstone(
       const [, deletedEvidence] = await Promise.all([
         requestResult(transaction.objectStore(WORKSPACE_STORE).delete(key)),
         deleteEvidenceCursor(evidenceStore.index(EVIDENCE_ACCOUNT_INDEX), key),
+        deleteEvidenceCursor(
+          transaction.objectStore(EVIDENCE_STAGING_STORE)
+            .index(EVIDENCE_STAGING_ACCOUNT_INDEX),
+          key,
+        ),
         requestResult(transaction.objectStore(ACCOUNT_REMINDER_STORE).delete(key)),
       ]);
       return { deletedEvidence, scope };
@@ -1921,6 +3786,7 @@ export async function eraseAccountPersistenceWithTombstone(
 export const indexedDbPersistence = {
   isAvailable: hasIndexedDbSupport,
   readAccountPersistenceScope,
+  readAccountPersistenceBackupBoundary,
   listTombstonedAccountPersistenceScopes,
   readWorkspaceWithScope,
   readAccountReminderDate,
@@ -1936,10 +3802,23 @@ export const indexedDbPersistence = {
   replaceWorkspaceAfterRecoveryChoice,
   deleteWorkspace,
   storeEvidenceBlob,
+  stageEvidenceBlob,
+  rollbackStagedEvidenceBlob,
+  stageEvidenceCleanupIntent,
+  cancelEvidenceCleanupIntent,
+  listEvidenceCleanupIntents,
+  markEvidenceCleanupRemoteComplete,
+  recoverLocalEvidenceCleanupIntents,
+  cleanupAbandonedEvidenceStaging,
   readEvidenceBlob,
   listEvidenceBlobs,
   deleteEvidenceBlob,
+  deleteEvidenceBlobs,
+  restoreEvidenceBlobs,
   deleteAllAccountEvidence,
   deleteAccountPersistence,
+  deleteAccountPersistenceAtRevision,
+  applyAccountHandoffPersistence,
+  applyPortableArchivePersistence,
   eraseAccountPersistenceWithTombstone,
 };

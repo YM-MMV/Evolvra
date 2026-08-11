@@ -9,6 +9,8 @@ import {
 } from "@/lib/persistence";
 import {
   disableLocalBootstrapLegacyImport,
+  LocalBootstrapSupersededError,
+  observeLegacyWorkspace,
   runLocalWorkspaceBootstrap,
   type LocalBootstrapPorts,
 } from "@/lib/provider-local-bootstrap";
@@ -21,6 +23,7 @@ const NOW = "2026-07-28T12:00:00.000Z";
 const scope: AccountPersistenceScope = {
   accountId: ACCOUNT_ID,
   generation: 7,
+  evidenceRevision: 0,
   tombstoned: false,
   updatedAt: NOW,
 };
@@ -91,6 +94,21 @@ const request = (raw: string | null = null) => ({
 });
 
 describe("local workspace bootstrap", () => {
+  it("captures legacy storage synchronously and freezes both success and failure observations", () => {
+    const success = observeLegacyWorkspace(() => "legacy-json");
+    const expected = new Error("storage denied");
+    const errorFailure = observeLegacyWorkspace(() => { throw expected; });
+    const unknownFailure = observeLegacyWorkspace(() => { throw "denied"; });
+
+    expect(success).toEqual({ raw: "legacy-json" });
+    expect(Object.isFrozen(success)).toBe(true);
+    expect(errorFailure).toEqual({ raw: null, readError: expected });
+    expect(unknownFailure.readError).toMatchObject({
+      message: "Legacy browser storage could not be read.",
+    });
+    expect(Object.isFrozen(errorFailure)).toBe(true);
+  });
+
   it("returns an empty result without creating a workspace", async () => {
     const persistWorkspace = vi.fn<LocalBootstrapPorts["persistWorkspace"]>();
     const result = await runLocalWorkspaceBootstrap(
@@ -209,6 +227,123 @@ describe("local workspace bootstrap", () => {
       source: "legacy",
       persistedDuringBootstrap: true,
       legacySourceCanBeCleared: true,
+    });
+  });
+
+  it("persists a device envelope and commits a pending legacy journal with all metadata", async () => {
+    const events: string[] = [];
+    const saved = {
+      ...envelope(state("Device wins")),
+      serverUpdatedAt: "2026-07-28T11:59:00.000Z",
+      anonymousHandoff: { generation: 4, localRevision: 8 },
+    };
+    const pending: LegacyWorkspaceImportJournal = {
+      accountId: ACCOUNT_ID,
+      status: "pending",
+      raw: JSON.stringify(state("Ignored legacy")),
+      capturedAt: NOW,
+    };
+    const persistWorkspace = vi.fn<LocalBootstrapPorts["persistWorkspace"]>(
+      async ({ envelope: write }) => {
+        events.push("persist");
+        return { ...write, localRevision: saved.localRevision + 1 };
+      },
+    );
+
+    const result = await runLocalWorkspaceBootstrap(
+      request(pending.raw),
+      ports({
+        readWorkspace: async () => ({ workspace: saved, scope }),
+        captureLegacyWorkspaceImport: async () => pending,
+        persistWorkspace,
+        commitLegacyWorkspaceImport: async () => {
+          events.push("commit");
+          return committedJournal;
+        },
+      }),
+    );
+
+    expect(events).toEqual(["persist", "commit"]);
+    expect(persistWorkspace).toHaveBeenCalledWith(expect.objectContaining({
+      envelope: expect.objectContaining({
+        serverUpdatedAt: saved.serverUpdatedAt,
+        anonymousHandoff: saved.anonymousHandoff,
+      }),
+      expectedScopeGeneration: scope.generation,
+      stagedEvidence: [],
+    }));
+    expect(result).toMatchObject({
+      kind: "loaded",
+      source: "device",
+      persistedDuringBootstrap: true,
+    });
+  });
+
+  it("fails closed when the account scope is tombstoned", async () => {
+    const result = await runLocalWorkspaceBootstrap(
+      request(),
+      ports({
+        readWorkspace: async () => ({
+          workspace: null,
+          scope: { ...scope, tombstoned: true },
+        }),
+      }),
+    );
+
+    expect(result).toMatchObject({
+      kind: "failed",
+      message: expect.stringMatching(/unexpectedly fenced/i),
+    });
+  });
+
+  it("quarantines a synchronous legacy-storage read failure without inventing raw JSON", async () => {
+    const readError = new Error("storage denied");
+    const result = await runLocalWorkspaceBootstrap({
+      accountId: ACCOUNT_ID,
+      legacy: { raw: null, readError },
+      ensureCurrent: () => undefined,
+    }, ports({
+      readRawWorkspace: async () => undefined as unknown as null,
+    }));
+
+    expect(result).toMatchObject({
+      kind: "quarantined",
+      error: readError,
+    });
+    expect("rawJson" in result).toBe(false);
+  });
+
+  it("returns a dedicated superseded result when the lifecycle token expires", async () => {
+    let checkpoints = 0;
+    const result = await runLocalWorkspaceBootstrap({
+      accountId: ACCOUNT_ID,
+      legacy: { raw: null },
+      ensureCurrent: () => {
+        checkpoints += 1;
+        if (checkpoints === 2) throw new LocalBootstrapSupersededError();
+      },
+    }, ports());
+
+    expect(result).toMatchObject({
+      kind: "superseded",
+      accountId: ACCOUNT_ID,
+      error: expect.objectContaining({
+        name: "LocalBootstrapSupersededError",
+      }),
+      legacySourceCanBeCleared: false,
+    });
+  });
+
+  it("uses the safe fallback message for a non-Error bootstrap rejection", async () => {
+    const result = await runLocalWorkspaceBootstrap(
+      request(),
+      ports({ readWorkspace: async () => Promise.reject("broken") }),
+    );
+
+    expect(result).toMatchObject({
+      kind: "failed",
+      message: "Saved data could not be read. A safe empty workspace was opened.",
+      error: "broken",
     });
   });
 

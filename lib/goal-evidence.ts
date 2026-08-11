@@ -83,6 +83,18 @@ export function normalizedEvidenceBlob(
   return blob.type === mimeType ? blob : blob.slice(0, blob.size, mimeType);
 }
 
+/** Exact byte-and-type comparison for immutable Storage-object adoption. */
+export async function evidenceBlobsEqual(left: Blob, right: Blob): Promise<boolean> {
+  if (left.size !== right.size || left.type !== right.type) return false;
+  const [leftBuffer, rightBuffer] = await Promise.all([
+    left.arrayBuffer(),
+    right.arrayBuffer(),
+  ]);
+  const leftBytes = new Uint8Array(leftBuffer);
+  const rightBytes = new Uint8Array(rightBuffer);
+  return leftBytes.every((value, index) => value === rightBytes[index]);
+}
+
 export function isValidEvidenceFileSize(value: unknown): value is number {
   return typeof value === "number"
     && Number.isSafeInteger(value)

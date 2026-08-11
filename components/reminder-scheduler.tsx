@@ -1,7 +1,11 @@
 "use client";
 
 import { useEffect, useRef } from "react";
-import { useApp } from "@/components/app-provider";
+import {
+  useAppActions,
+  useProviderStatus,
+  useWorkspaceData,
+} from "@/components/app-provider";
 import {
   readAccountReminderDate,
   writeAccountReminderDate,
@@ -18,13 +22,14 @@ import { isQuestAvailable, localDateKey } from "@/lib/utils";
 export function ReminderScheduler() {
   const {
     state,
-    user,
     workspaceScopeKey,
     persistenceScopeGeneration,
-    workspaceSwitching,
+  } = useWorkspaceData();
+  const { user, workspaceSwitching } = useProviderStatus();
+  const {
     runWorkspaceFileOperation,
     reportPersistenceError,
-  } = useApp();
+  } = useAppActions();
   const accountId = persistenceAccountId(user?.id ?? null);
   const storageKey = reminderStorageKey(accountId);
   const persistenceIdentity = `${storageKey}:${persistenceScopeGeneration}`;

@@ -258,6 +258,7 @@ describe("existing account-erasure fence adoption", () => {
         return {
           accountId: "account-a",
           generation: 4,
+          evidenceRevision: 0,
           tombstoned: true,
           updatedAt: "2026-07-22T12:00:00.000Z",
         };
@@ -287,6 +288,7 @@ describe("existing account-erasure fence adoption", () => {
       drainWriters: async () => undefined,
       readScope: async () => ({
         ...scope,
+        evidenceRevision: 0,
         updatedAt: "2026-07-22T12:00:00.000Z",
       }),
     })).rejects.toThrow(/does not match/i);

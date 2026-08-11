@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
 import { Activity, CalendarDays, CheckCircle2, Filter, Flag, Gauge, NotebookPen, Search, Sparkles, Target, X } from "lucide-react";
-import { useApp } from "@/components/app-provider";
+import { useWorkspaceData } from "@/components/app-provider";
 import { Button, EmptyState, Panel, Pill } from "@/components/ui";
 import {
   parseTimelineFilters,
@@ -35,7 +35,7 @@ const filterCount = (filters: TimelineFilters) => Object.values(filters)
   .filter((value) => typeof value === "string" && value.trim()).length;
 
 export default function TimelinePage() {
-  const { state } = useApp();
+  const { state } = useWorkspaceData();
   const terms = terminologyForms(state.settings.terminology);
   const eventLabels: Record<TimelineEvent["type"], string> = {
     quest: terms.quests.singularLower,

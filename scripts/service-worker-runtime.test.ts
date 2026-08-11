@@ -10,6 +10,8 @@ type RequestLike = {
   destination: string;
 };
 
+type WorkerCacheStores = Map<string, Map<string, Response>>;
+
 type WorkerRuntime = {
   listeners: Map<string, (event: Record<string, unknown>) => void>;
   caches: CacheStorage;
@@ -18,6 +20,7 @@ type WorkerRuntime = {
     skipWaitingCalls: number;
     clientMessages: unknown[];
     clientMatchOptions: unknown[];
+    clientNavigations: Array<{ id: string; url: string }>;
   };
   test: {
     navigationStrategy: (request: RequestLike) => Promise<Response>;
@@ -67,14 +70,15 @@ function request(path: string, destination = "document", mode = destination === 
 function createRuntime(
   fetchImplementation: (input: Request | RequestLike) => Promise<Response>,
   liveClientIds = ["client-a"],
+  stores: WorkerCacheStores = new Map(),
 ): WorkerRuntime {
   const listeners = new Map<string, (event: Record<string, unknown>) => void>();
-  const stores = new Map<string, Map<string, Response>>();
   const lifecycle: WorkerRuntime["lifecycle"] = {
     claimedClients: 0,
     skipWaitingCalls: 0,
     clientMessages: [],
     clientMatchOptions: [],
+    clientNavigations: [],
   };
   const key = (input: RequestInfo | URL | RequestLike) => typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
   const cacheStorage = {
@@ -109,7 +113,12 @@ function createRuntime(
         return liveClientIds.map((id) => ({
           id,
           type: "window",
+          url: `https://evolvra.test/open/${id}`,
           postMessage: (message: unknown) => lifecycle.clientMessages.push(message),
+          navigate: async (url: string) => {
+            lifecycle.clientNavigations.push({ id, url });
+            return null;
+          },
         }));
       },
     },
@@ -151,9 +160,9 @@ describe("service worker runtime safety", () => {
       waitUntil: (promise: Promise<unknown>) => { lifetime = promise; },
     });
 
-    expect(runtime.lifecycle.skipWaitingCalls).toBe(1);
     expect(lifetime).not.toBeNull();
     await lifetime;
+    expect(runtime.lifecycle.skipWaitingCalls).toBe(1);
   });
 
   it("claims clients, removes only old Evolvra caches, and announces activation", async () => {
@@ -182,6 +191,48 @@ describe("service worker runtime safety", () => {
       type: "EVOLVRA_OFFLINE_READY",
       version: runtime.test.WORKER_VERSION,
     }]);
+    expect(runtime.lifecycle.clientNavigations).toEqual([]);
+  });
+
+  it("navigates every open tab when a user-approved update activates", async () => {
+    const stores: WorkerCacheStores = new Map();
+    const waitingRuntime = createRuntime(
+      async () => new Response("unused"),
+      ["client-a", "client-b"],
+      stores,
+    );
+    const messageListener = waitingRuntime.listeners.get("message");
+    let skipLifetime: Promise<unknown> | null = null;
+
+    messageListener?.({
+      data: { type: "SKIP_WAITING" },
+      waitUntil: (promise: Promise<unknown>) => { skipLifetime = promise; },
+    });
+    await skipLifetime;
+
+    // Activation may run in a new worker global after the browser terminates
+    // the waiting worker. Only the shared persistent CacheStorage survives.
+    const activeRuntime = createRuntime(
+      async () => new Response("unused"),
+      ["client-a", "client-b"],
+      stores,
+    );
+    const activateListener = activeRuntime.listeners.get("activate");
+    let activationLifetime: Promise<unknown> | null = null;
+    activateListener?.({
+      waitUntil: (promise: Promise<unknown>) => { activationLifetime = promise; },
+    });
+    await activationLifetime;
+
+    expect(waitingRuntime.lifecycle.clientNavigations).toEqual([]);
+    expect(activeRuntime.lifecycle.clientNavigations).toEqual([
+      { id: "client-a", url: "https://evolvra.test/open/client-a" },
+      { id: "client-b", url: "https://evolvra.test/open/client-b" },
+    ]);
+    expect(activeRuntime.lifecycle.clientMatchOptions).toEqual([
+      { type: "window", includeUncontrolled: true },
+      { type: "window", includeUncontrolled: true },
+    ]);
   });
 
   it("synchronizes a bounded exact set of declared workspace goals", async () => {

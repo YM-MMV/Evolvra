@@ -1,6 +1,10 @@
 import { createStarterGoals } from "@/lib/defaults";
 import { validateGoalEvidenceList } from "@/lib/goal-evidence";
 import { assertGoalProgressConfiguration } from "@/lib/goal-progress";
+import {
+  createGoalOutcomeSnapshot,
+  createReviewContextSnapshot,
+} from "@/lib/historical-snapshots";
 import { cloneWorkspaceValue } from "@/lib/provider-state";
 import type {
   AppState,
@@ -17,6 +21,7 @@ import type {
 } from "@/lib/types";
 import {
   isQuestAvailable,
+  monthlyAnchorDayForSchedule,
   nextRepeatDate,
   rollMetricPeriod,
   singularizeTerm,
@@ -46,6 +51,23 @@ const attributionForGoal = (goal: Pick<Goal, "areaId" | "statIds">) => ({
   areaId: goal.areaId,
   statIds: [...goal.statIds],
 });
+
+const normalizeQuestSchedule = (quest: Quest): Quest => {
+  const monthlyAnchorDay = monthlyAnchorDayForSchedule(
+    quest.repeat,
+    quest.dueDate,
+    quest,
+  );
+  if (monthlyAnchorDay !== undefined) {
+    return { ...quest, monthlyAnchorDay };
+  }
+  if ("monthlyAnchorDay" in quest) {
+    const { monthlyAnchorDay: _monthlyAnchorDay, ...withoutAnchor } = quest;
+    void _monthlyAnchorDay;
+    return withoutAnchor;
+  }
+  return quest;
+};
 
 export function addTimelineDraft(
   draft: AppState,
@@ -103,16 +125,20 @@ export function addGoalDraft(
   goal: Goal,
   runtime = defaultRuntime,
 ) {
-  assertGoalProgressConfiguration(goal);
-  validateGoalEvidenceList(goal.evidence, goal.id);
+  const normalizedGoal = {
+    ...goal,
+    quests: goal.quests.map(normalizeQuestSchedule),
+  };
+  assertGoalProgressConfiguration(normalizedGoal);
+  validateGoalEvidenceList(normalizedGoal.evidence, normalizedGoal.id);
   const goalTerm = singularizeTerm(draft.settings.terminology.goals);
-  draft.goals.unshift(goal);
+  draft.goals.unshift(normalizedGoal);
   addTimelineDraft(draft, {
     type: "goal",
-    title: `Created ${goalTerm.toLowerCase()}: ${goal.title}`,
-    detail: `Progress will use the ${goal.model} model.`,
-    goalId: goal.id,
-    areaId: goal.areaId,
+    title: `Created ${goalTerm.toLowerCase()}: ${normalizedGoal.title}`,
+    detail: `Progress will use the ${normalizedGoal.model} model.`,
+    goalId: normalizedGoal.id,
+    areaId: normalizedGoal.areaId,
   }, runtime);
 }
 
@@ -125,9 +151,19 @@ export function updateGoalDraft(
   const goalTerm = singularizeTerm(draft.settings.terminology.goals);
   const goal = draft.goals.find((item) => item.id === goalId);
   if (!goal) return;
-  assertGoalProgressConfiguration({ ...goal, ...patch });
-  if (patch.evidence) validateGoalEvidenceList(patch.evidence, goalId);
-  Object.assign(goal, patch);
+  const {
+    completedAt: _completedAt,
+    completionSnapshot: _completionSnapshot,
+    ...mutablePatch
+  } = patch;
+  void _completedAt;
+  void _completionSnapshot;
+  const normalizedPatch = mutablePatch.quests
+    ? { ...mutablePatch, quests: mutablePatch.quests.map(normalizeQuestSchedule) }
+    : mutablePatch;
+  assertGoalProgressConfiguration({ ...goal, ...normalizedPatch });
+  if (normalizedPatch.evidence) validateGoalEvidenceList(normalizedPatch.evidence, goalId);
+  Object.assign(goal, normalizedPatch);
   addTimelineDraft(draft, {
     type: "goal",
     title: `Updated ${goal.title}`,
@@ -160,7 +196,16 @@ export function setGoalStatusDraft(
   if (!goal || goal.status === status) return;
   const firstCompletion = status === "completed" && !goal.completedAt;
   goal.status = status;
-  if (firstCompletion) goal.completedAt = runtime.now();
+  if (firstCompletion) {
+    const completedAt = runtime.now();
+    if (goal.model === "consistency") {
+      const completionDate = new Date(completedAt);
+      goal.metrics = goal.metrics.map((metric) =>
+        rollMetricPeriod(metric, completionDate));
+    }
+    goal.completedAt = completedAt;
+    goal.completionSnapshot = createGoalOutcomeSnapshot(goal, completedAt);
+  }
   addTimelineDraft(draft, {
     type: "goal",
     title: `${goal.title} ${status}`,
@@ -209,11 +254,12 @@ export function addQuestDraft(
   const questTerm = singularizeTerm(draft.settings.terminology.quests);
   const goal = draft.goals.find((item) => item.id === goalId);
   if (!goal) return;
-  goal.quests.unshift(quest);
+  const normalizedQuest = normalizeQuestSchedule(quest);
+  goal.quests.unshift(normalizedQuest);
   addTimelineDraft(draft, {
     type: "note",
-    title: `New ${questTerm.toLowerCase()}: ${quest.title}`,
-    detail: quest.dueDate ? `Planned for ${quest.dueDate}.` : "Ready when it is useful.",
+    title: `New ${questTerm.toLowerCase()}: ${normalizedQuest.title}`,
+    detail: normalizedQuest.dueDate ? `Planned for ${normalizedQuest.dueDate}.` : "Ready when it is useful.",
     goalId,
     areaId: goal.areaId,
   }, runtime);
@@ -229,11 +275,36 @@ export function completeQuestDraft(
   const questTerm = singularizeTerm(draft.settings.terminology.quests);
   const goal = draft.goals.find((item) => item.id === goalId);
   const quest = goal?.quests.find((item) => item.id === questId);
-  if (!goal || goal.status !== "active" || !quest || !isQuestAvailable(quest)) return;
   const completedAt = runtime.now();
+  const completionDate = new Date(completedAt);
+  if (
+    !goal
+    || goal.status !== "active"
+    || !quest
+    || Number.isNaN(completionDate.getTime())
+    || !isQuestAvailable(quest, completionDate)
+  ) return;
   quest.completedAt = completedAt;
   quest.completed = quest.repeat === "none";
-  if (quest.repeat !== "none") quest.dueDate = nextRepeatDate(quest.repeat, quest.dueDate);
+  if (quest.repeat !== "none") {
+    if (quest.repeat === "monthly") {
+      const monthlyAnchorDay = monthlyAnchorDayForSchedule(
+        quest.repeat,
+        quest.dueDate,
+        quest,
+      ) ?? completionDate.getDate();
+      quest.monthlyAnchorDay = monthlyAnchorDay;
+      quest.dueDate = nextRepeatDate(
+        quest.repeat,
+        quest.dueDate,
+        completionDate,
+        monthlyAnchorDay,
+      );
+    } else {
+      delete quest.monthlyAnchorDay;
+      quest.dueDate = nextRepeatDate(quest.repeat, quest.dueDate, completionDate);
+    }
+  }
   const requestedDuration = input.durationMinutes === undefined
     ? quest.durationMinutes
     : input.durationMinutes;
@@ -425,10 +496,15 @@ export function addReviewDraft(
   review: Review,
   runtime = defaultRuntime,
 ) {
-  draft.reviews.unshift(review);
+  const savedReview: Review = {
+    ...review,
+    answers: { ...review.answers },
+    context: createReviewContextSnapshot(draft, review),
+  };
+  draft.reviews.unshift(savedReview);
   addTimelineDraft(draft, {
     type: "review",
-    title: `${review.cadence[0].toUpperCase()}${review.cadence.slice(1)} review completed`,
+    title: `${savedReview.cadence[0].toUpperCase()}${savedReview.cadence.slice(1)} review completed`,
     detail: "A calm reflection was added to your development record.",
   }, runtime);
 }

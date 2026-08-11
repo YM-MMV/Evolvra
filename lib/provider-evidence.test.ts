@@ -6,6 +6,7 @@ import {
   externalizeWorkspaceHistory,
   portableWorkspaceState,
   remoteEvidencePath,
+  rollbackEvidenceWrites,
   rollbackExternalizedEvidence,
 } from "@/lib/provider-evidence";
 import { cloneWorkspaceValue } from "@/lib/provider-state";
@@ -19,16 +20,17 @@ import { workspaceScopeKeyFromDecimal } from "@/lib/workspace-scope";
 const SCOPE_GENERATION = 7;
 const workspaceScope = (value: number) => workspaceScopeKeyFromDecimal(String(value));
 
-const { storeEvidenceBlob, readEvidenceBlob, deleteEvidenceBlob } = vi.hoisted(() => ({
-  storeEvidenceBlob: vi.fn(async (input: Record<string, unknown>) => input),
-  readEvidenceBlob: vi.fn(async () => null as null | Record<string, unknown>),
-  deleteEvidenceBlob: vi.fn(async () => undefined),
+const {
+  stageEvidenceBlob,
+  rollbackStagedEvidenceBlob,
+} = vi.hoisted(() => ({
+  stageEvidenceBlob: vi.fn(),
+  rollbackStagedEvidenceBlob: vi.fn(),
 }));
 
 vi.mock("@/lib/persistence", () => ({
-  storeEvidenceBlob,
-  readEvidenceBlob,
-  deleteEvidenceBlob,
+  stageEvidenceBlob,
+  rollbackStagedEvidenceBlob,
 }));
 
 const EVIDENCE_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
@@ -127,12 +129,22 @@ describe("portable workspace backups", () => {
 
 describe("embedded evidence externalization", () => {
   beforeEach(() => {
-    storeEvidenceBlob.mockReset();
-    storeEvidenceBlob.mockImplementation(async (input: Record<string, unknown>) => input);
-    readEvidenceBlob.mockReset();
-    readEvidenceBlob.mockResolvedValue(null);
-    deleteEvidenceBlob.mockReset();
-    deleteEvidenceBlob.mockResolvedValue(undefined);
+    let writeSequence = 0;
+    stageEvidenceBlob.mockReset();
+    stageEvidenceBlob.mockImplementation(async (
+      input: Record<string, unknown>,
+    ) => {
+      writeSequence += 1;
+      return {
+        token: `00000000-0000-4000-8000-${String(writeSequence).padStart(12, "0")}`,
+        record: {
+          ...input,
+          savedAt: input.savedAt ?? `2026-07-19T12:00:00.${String(writeSequence).padStart(3, "0")}Z`,
+        },
+      };
+    });
+    rollbackStagedEvidenceBlob.mockReset();
+    rollbackStagedEvidenceBlob.mockResolvedValue("rolled-back");
   });
 
   it("stores legacy bytes under the migrated id and removes the data payload", async () => {
@@ -148,7 +160,7 @@ describe("embedded evidence externalization", () => {
     const result = await externalizeEmbeddedEvidence(state, "anonymous", SCOPE_GENERATION);
 
     expect(result.changed).toBe(true);
-    expect(storeEvidenceBlob).toHaveBeenCalledWith(
+    expect(stageEvidenceBlob).toHaveBeenCalledWith(
       expect.objectContaining({
         accountId: "anonymous",
         goalId: "goal-one",
@@ -211,10 +223,10 @@ describe("embedded evidence externalization", () => {
     expect(result.history).toHaveLength(1);
     expect(JSON.stringify(result.state)).not.toContain("data:text/plain");
     expect(JSON.stringify(result.history)).not.toContain("data:text/plain");
-    expect(storeEvidenceBlob).toHaveBeenCalledTimes(2);
+    expect(stageEvidenceBlob).toHaveBeenCalledTimes(2);
   });
 
-  it("restores a pre-existing blob instead of deleting it when staging is rolled back", async () => {
+  it("rolls back only the opaque staging token and never touches a live value", async () => {
     const decoded = decodeLegacyGoalEvidence(
       "file|proof.txt|data:text/plain;base64,cHJvb2Y=",
       "goal-one",
@@ -222,22 +234,89 @@ describe("embedded evidence externalization", () => {
     );
     expect(decoded.status).toBe("valid");
     if (decoded.status !== "valid") return;
-    const existing = {
-      accountId: "anonymous",
-      goalId: "goal-one",
-      evidenceId: decoded.evidence.id,
-      blob: new Blob(["older"], { type: "text/plain" }),
-      savedAt: "2026-07-17T12:00:00.000Z",
-    };
-    readEvidenceBlob.mockResolvedValueOnce(existing);
     const state = stateWithEvidence([decoded.evidence]);
 
     const result = await externalizeEmbeddedEvidence(state, "anonymous", SCOPE_GENERATION);
-    storeEvidenceBlob.mockClear();
     await rollbackExternalizedEvidence(result);
 
-    expect(storeEvidenceBlob).toHaveBeenCalledWith(existing, SCOPE_GENERATION);
-    expect(deleteEvidenceBlob).not.toHaveBeenCalled();
+    expect(rollbackStagedEvidenceBlob).toHaveBeenCalledWith(
+      expect.objectContaining({
+        token: expect.any(String),
+        record: expect.objectContaining({ evidenceId: decoded.evidence.id }),
+      }),
+      SCOPE_GENERATION,
+    );
+  });
+
+  it("counts an already-absent staging token as successful idempotent compensation", async () => {
+    rollbackStagedEvidenceBlob.mockResolvedValueOnce("already-absent");
+
+    await expect(rollbackEvidenceWrites([{
+      token: "00000000-0000-4000-8000-000000000099",
+      record: {
+        accountId: "anonymous",
+        goalId: "goal-one",
+        evidenceId: EVIDENCE_ID,
+        blob: new Blob(["proof"], { type: "text/plain" }),
+        savedAt: "2026-07-19T12:00:00.000Z",
+      },
+      scopeGeneration: SCOPE_GENERATION,
+    }])).resolves.toEqual({ rolledBack: 0, alreadyAbsent: 1 });
+  });
+
+  it("leaves notes and already-external file references unchanged", async () => {
+    const remotePath = `anonymous/goal-one/${EVIDENCE_ID}/proof.pdf`;
+    const source = stateWithEvidence([
+      { id: "note-one", type: "note", text: "Context" },
+      fileEvidence(remotePath),
+    ]);
+
+    const result = await externalizeEmbeddedEvidence(
+      source,
+      "anonymous",
+      SCOPE_GENERATION,
+    );
+
+    expect(result).toMatchObject({ changed: false, createdEvidence: [] });
+    expect(result.state.goals[0].evidence).toEqual(source.goals[0].evidence);
+    expect(stageEvidenceBlob).not.toHaveBeenCalled();
+  });
+
+  it("rejects embedded bytes whose decoded metadata no longer matches", async () => {
+    const decoded = decodeLegacyGoalEvidence(
+      "file|proof.txt|data:text/plain;base64,cHJvb2Y=",
+      "goal-one",
+      0,
+    );
+    expect(decoded.status).toBe("valid");
+    if (decoded.status !== "valid" || decoded.evidence.type !== "file") return;
+    const mismatched = { ...decoded.evidence, size: decoded.evidence.size + 1 };
+
+    await expect(externalizeEmbeddedEvidence(
+      stateWithEvidence([mismatched]),
+      "anonymous",
+      SCOPE_GENERATION,
+    )).rejects.toThrow(/did not match/i);
+    expect(stageEvidenceBlob).not.toHaveBeenCalled();
+  });
+
+  it("retains an existing private path while externalizing embedded bytes", async () => {
+    const decoded = decodeLegacyGoalEvidence(
+      "file|proof.txt|data:text/plain;base64,cHJvb2Y=",
+      "goal-one",
+      0,
+    );
+    expect(decoded.status).toBe("valid");
+    if (decoded.status !== "valid" || decoded.evidence.type !== "file") return;
+    const remotePath = `anonymous/goal-one/${decoded.evidence.id}/proof.txt`;
+
+    const result = await externalizeEmbeddedEvidence(
+      stateWithEvidence([{ ...decoded.evidence, remotePath }]),
+      "anonymous",
+      SCOPE_GENERATION,
+    );
+
+    expect(result.state.goals[0].evidence[0]).toMatchObject({ remotePath });
   });
 
   it("rolls back earlier snapshots when a later history migration fails", async () => {
@@ -248,8 +327,17 @@ describe("embedded evidence externalization", () => {
     );
     expect(decoded.status).toBe("valid");
     if (decoded.status !== "valid") return;
-    storeEvidenceBlob
-      .mockResolvedValueOnce({})
+    stageEvidenceBlob
+      .mockResolvedValueOnce({
+        token: "00000000-0000-4000-8000-000000000001",
+        record: {
+          accountId: "anonymous",
+          goalId: "goal-one",
+          evidenceId: decoded.evidence.id,
+          blob: new Blob(["proof"], { type: "text/plain" }),
+          savedAt: "2026-07-19T12:00:00.000Z",
+        },
+      })
       .mockRejectedValueOnce(new Error("quota exhausted"));
 
     await expect(externalizeWorkspaceHistory(
@@ -258,10 +346,8 @@ describe("embedded evidence externalization", () => {
       "anonymous",
       SCOPE_GENERATION,
     )).rejects.toThrow(/quota exhausted/i);
-    expect(deleteEvidenceBlob).toHaveBeenCalledWith(
-      "anonymous",
-      "goal-one",
-      decoded.evidence.id,
+    expect(rollbackStagedEvidenceBlob).toHaveBeenCalledWith(
+      expect.objectContaining({ token: "00000000-0000-4000-8000-000000000001" }),
       SCOPE_GENERATION,
     );
   });
@@ -274,10 +360,19 @@ describe("embedded evidence externalization", () => {
     );
     expect(decoded.status).toBe("valid");
     if (decoded.status !== "valid") return;
-    storeEvidenceBlob
-      .mockResolvedValueOnce({})
+    stageEvidenceBlob
+      .mockResolvedValueOnce({
+        token: "00000000-0000-4000-8000-000000000001",
+        record: {
+          accountId: "anonymous",
+          goalId: "goal-one",
+          evidenceId: decoded.evidence.id,
+          blob: new Blob(["proof"], { type: "text/plain" }),
+          savedAt: "2026-07-19T12:00:00.000Z",
+        },
+      })
       .mockRejectedValueOnce(new Error("quota exhausted"));
-    deleteEvidenceBlob.mockRejectedValueOnce(new Error("rollback blocked"));
+    rollbackStagedEvidenceBlob.mockRejectedValueOnce(new Error("rollback blocked"));
 
     const failure = await externalizeWorkspaceHistory(
       stateWithEvidence([decoded.evidence]),
@@ -291,12 +386,9 @@ describe("embedded evidence externalization", () => {
     expect(JSON.stringify(nested.errors.map(String))).toMatch(/quota exhausted|rollback blocked/i);
   });
 
-  it.each([
-    ["erasure", "a pre-existing blob", true],
-    ["erasure", "a newly-created blob", false],
-    ["account switch", "a pre-existing blob", true],
-    ["account switch", "a newly-created blob", false],
-  ])("finishes compensation before %s after pausing before replacing %s", async (boundary, _label, hasPrevious) => {
+  it.each(["erasure", "account switch"])(
+    "finishes token-only compensation before %s",
+    async (boundary) => {
     const decoded = decodeLegacyGoalEvidence(
       "file|proof.txt|data:text/plain;base64,cHJvb2Y=",
       "goal-one",
@@ -305,42 +397,29 @@ describe("embedded evidence externalization", () => {
     expect(decoded.status).toBe("valid");
     if (decoded.status !== "valid") return;
 
-    const key = `account-a/goal-one/${decoded.evidence.id}`;
-    const blobs = new Map<string, Record<string, unknown>>();
+    const stagedTokens = new Set<string>();
     const events: string[] = [];
-    const beforePut = deferred<void>();
-    const allowPut = deferred<void>();
-    const previous = {
-      accountId: "account-a",
-      goalId: "goal-one",
-      evidenceId: decoded.evidence.id,
-      blob: new Blob(["previous"], { type: "text/plain" }),
-      savedAt: "2026-07-17T12:00:00.000Z",
-    };
-    if (hasPrevious) blobs.set(key, previous);
-
-    readEvidenceBlob.mockImplementation(async () => {
-      events.push("read");
-      return blobs.get(key) ?? null;
+    const beforeStage = deferred<void>();
+    const allowStage = deferred<void>();
+    const token = "00000000-0000-4000-8000-000000000042";
+    stageEvidenceBlob.mockImplementation(async (input: Record<string, unknown>) => {
+      events.push("stage-start");
+      beforeStage.resolve();
+      await allowStage.promise;
+      stagedTokens.add(token);
+      events.push("stage");
+      return {
+        token,
+        record: {
+          ...input,
+          savedAt: "2026-07-19T12:00:00.000Z",
+        },
+      };
     });
-    storeEvidenceBlob.mockImplementation(async (input: Record<string, unknown>) => {
-      if (!("savedAt" in input)) {
-        events.push("put-start");
-        beforePut.resolve();
-        await allowPut.promise;
-        events.push("put");
-      } else {
-        events.push("rollback-store");
-      }
-      blobs.set(key, {
-        ...input,
-        savedAt: input.savedAt ?? "2026-07-19T12:00:00.000Z",
-      });
-      return input;
-    });
-    deleteEvidenceBlob.mockImplementation(async () => {
-      events.push("rollback-delete");
-      blobs.delete(key);
+    rollbackStagedEvidenceBlob.mockImplementation(async () => {
+      events.push("rollback-stage");
+      stagedTokens.delete(token);
+      return "rolled-back";
     });
 
     const coordinator = createWorkspaceOperationCoordinator();
@@ -354,13 +433,12 @@ describe("embedded evidence externalization", () => {
       if (!accountIsCurrent) await rollbackExternalizedEvidence(migrated);
     });
 
-    await beforePut.promise;
+    await beforeStage.promise;
     accountIsCurrent = false;
     let boundaryFinished = false;
     const boundaryOperation = boundary === "erasure"
       ? coordinator.retire(workspaceScope(42)).then(() => {
           events.push("erase");
-          blobs.clear();
           boundaryFinished = true;
         })
       : coordinator.run(workspaceScope(42), async () => {
@@ -378,12 +456,12 @@ describe("embedded evidence externalization", () => {
       WorkspaceOperationStartRejectedError,
     );
 
-    allowPut.resolve();
+    allowStage.resolve();
     await reconciliation;
     await boundaryOperation;
 
-    expect(blobs.size).toBe(boundary === "erasure" || !hasPrevious ? 0 : 1);
+    expect(stagedTokens.size).toBe(0);
     expect(events.at(-1)).toBe(boundary === "erasure" ? "erase" : "switch");
-    expect(events).toContain(hasPrevious ? "rollback-store" : "rollback-delete");
+    expect(events).toContain("rollback-stage");
   });
 });

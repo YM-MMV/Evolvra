@@ -53,6 +53,29 @@ vi.mock("@/lib/persistence", async (importOriginal) => {
       persistence.raw.set(accountId, stored);
       return { scope, checkpoint: stored };
     }),
+    cancelUnstartedAccountErasurePersistenceFence: vi.fn(async (
+      accountId: string,
+      tombstonedGeneration: number,
+      attemptId: string,
+    ) => {
+      const current = persistence.scopes.get(accountId);
+      const raw = persistence.raw.get(accountId) as Record<string, unknown> | undefined;
+      if (
+        !current?.tombstoned
+        || current.generation !== tombstonedGeneration
+        || raw?.attemptId !== attemptId
+        || (raw.cloud !== "pending" && raw.cloud !== "failed")
+      ) throw new Error("not an unstarted exact fence");
+      const restored = {
+        accountId,
+        generation: current.generation + 1,
+        tombstoned: false,
+        updatedAt: new Date().toISOString(),
+      };
+      persistence.scopes.set(accountId, restored);
+      persistence.raw.delete(accountId);
+      return restored;
+    }),
     recoverOrphanedAccountErasurePersistenceFence: vi.fn(async (
       accountId: string,
       expectedGeneration: number,
@@ -121,6 +144,7 @@ import {
   actionableLocalErasureCheckpoint,
   advanceCloudAccountErasure,
   beginAccountErasureIntent,
+  cancelUnstartedAccountErasureIntent,
   discardCorruptAccountErasureCheckpoint,
   discardLegacyAccountErasureCheckpoints,
   eraseInactiveAccountLocalData,
@@ -152,6 +176,7 @@ function checkpoint(
     local: "pending",
     session: "pending",
     persistenceGeneration: 1,
+    backup: null,
     owner: null,
     updatedAt: at,
     ...patch,
@@ -200,6 +225,24 @@ describe("durable account-erasure checkpoints", () => {
 
     expect(second.checkpoint.attemptId).toBe(first.checkpoint.attemptId);
     expect(second.scope).toEqual(first.scope);
+  });
+
+  it("rotates back to a writable generation only for the exact unstarted attempt", async () => {
+    const begun = await beginAccountErasureIntent("account-a", 0, {
+      attemptId: "attempt-cancel",
+      now: atMs,
+      backup: { workspaceRevision: 4, evidenceRevision: 7 },
+    });
+
+    const restored = await cancelUnstartedAccountErasureIntent(
+      begun.checkpoint,
+    );
+    expect(restored).toMatchObject({
+      accountId: "account-a",
+      generation: 2,
+      tombstoned: false,
+    });
+    expect(persistence.raw.has("account-a")).toBe(false);
   });
 
   it("reconstructs an orphan tombstone as ambiguous without rotating its generation", async () => {

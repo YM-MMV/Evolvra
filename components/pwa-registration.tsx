@@ -48,6 +48,21 @@ const visuallyHidden: CSSProperties = {
 };
 
 const MAX_WORKSPACE_GOAL_ROUTES = 2_000;
+const OFFLINE_SHELL_ROUTES = new Set([
+  "/",
+  "/goals",
+  "/quests",
+  "/stats",
+  "/reviews",
+  "/timeline",
+  "/settings",
+]);
+
+function isOfflineDocumentRoute(pathname: string) {
+  const normalized = pathname.length > 1 ? pathname.replace(/\/$/, "") : pathname;
+  return OFFLINE_SHELL_ROUTES.has(normalized)
+    || /^\/goals\/[^/]+$/.test(normalized);
+}
 
 function offlineGoalRoutes(goalIds: readonly string[]) {
   const routes = new Set<string>();
@@ -118,6 +133,47 @@ export function PwaRegistration({
       window.removeEventListener("beforeinstallprompt", captureInstallPrompt);
       window.removeEventListener("appinstalled", clearInstallPrompt);
     };
+  }, []);
+
+  useEffect(() => {
+    if (process.env.NODE_ENV !== "production") return;
+    const useCachedDocumentNavigation = (event: MouseEvent) => {
+      if (
+        navigator.onLine
+        || event.defaultPrevented
+        || event.button !== 0
+        || event.metaKey
+        || event.ctrlKey
+        || event.shiftKey
+        || event.altKey
+        || !(event.target instanceof Element)
+      ) return;
+      const anchor = event.target.closest<HTMLAnchorElement>("a[href]");
+      if (
+        !anchor
+        || anchor.hasAttribute("download")
+        || (anchor.target && anchor.target !== "_self")
+      ) return;
+      const url = new URL(anchor.href, window.location.href);
+      if (
+        url.origin !== window.location.origin
+        || url.search
+        || url.hash
+        || !isOfflineDocumentRoute(url.pathname)
+      ) return;
+      // Next client transitions request an RSC payload that is not a safe HTML
+      // substitute. A real document navigation lets the service worker return
+      // the already-validated shell/goal document instead.
+      event.preventDefault();
+      event.stopPropagation();
+      window.location.assign(url.href);
+    };
+    document.addEventListener("click", useCachedDocumentNavigation, true);
+    return () => document.removeEventListener(
+      "click",
+      useCachedDocumentNavigation,
+      true,
+    );
   }, []);
 
   const goalRouteSignature = offlineGoalRoutes(goalIds).join("\n");

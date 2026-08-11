@@ -3,6 +3,10 @@
 import { type ButtonHTMLAttributes, type PropsWithChildren, useEffect, useId, useRef } from "react";
 import { createPortal } from "react-dom";
 import { X } from "lucide-react";
+import {
+  createOverlayLease,
+  restoreOverlayFocus,
+} from "@/components/overlay-effects";
 
 const FOCUSABLE_SELECTOR = [
   "a[href]",
@@ -23,8 +27,31 @@ function focusableElements(container: HTMLElement) {
 }
 
 function isTopmostModal(dialog: HTMLElement) {
+  if (dialog.closest("[inert]") || dialog.closest("[aria-hidden='true']")) {
+    return false;
+  }
   const dialogs = [...document.querySelectorAll<HTMLElement>("[role='dialog'][aria-modal='true']")];
-  return dialogs.at(-1) === dialog;
+  return dialogs.filter((candidate) =>
+    !candidate.closest("[inert]")
+    && !candidate.closest("[aria-hidden='true']")).at(-1) === dialog;
+}
+
+function isolateModalBackground(
+  dialog: HTMLElement,
+  overlay: ReturnType<typeof createOverlayLease>,
+) {
+  let activeBranch: HTMLElement = dialog;
+  let parent = activeBranch.parentElement;
+  while (parent) {
+    for (const sibling of parent.children) {
+      if (sibling !== activeBranch && sibling instanceof HTMLElement) {
+        overlay.isolate(sibling, { inert: true, ariaHidden: true });
+      }
+    }
+    if (parent === dialog.ownerDocument.body) break;
+    activeBranch = parent;
+    parent = parent.parentElement;
+  }
 }
 
 export function Button({ className = "", variant = "primary", ...props }: ButtonHTMLAttributes<HTMLButtonElement> & { variant?: "primary" | "secondary" | "ghost" | "danger" }) {
@@ -57,11 +84,33 @@ export function Modal({ open, onClose, title, eyebrow, children, wide = false }:
   useEffect(() => {
     if (!open) return;
     returnFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-    const app = document.querySelector<HTMLElement>(".app-layout");
-    const wasInert = app?.hasAttribute("inert") ?? false;
-    app?.setAttribute("inert", "");
-    const previousOverflow = document.body.style.overflow;
-    document.body.style.overflow = "hidden";
+    const dialog = dialogRef.current;
+    if (!dialog) return;
+    let overlay: ReturnType<typeof createOverlayLease> | null = null;
+    const syncModalIsolation = () => {
+      if (document.querySelector("[data-recovery-layer]")) {
+        overlay?.release();
+        overlay = null;
+        return;
+      }
+      if (!overlay) {
+        overlay = createOverlayLease(document);
+        overlay.lockBodyScroll();
+      }
+      isolateModalBackground(dialog, overlay);
+      overlay.reinforce();
+    };
+    syncModalIsolation();
+    const observer = new MutationObserver(() => {
+      if (!dialogRef.current) return;
+      syncModalIsolation();
+    });
+    observer.observe(document.body, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ["inert", "aria-hidden", "style"],
+    });
     const focusTimer = window.setTimeout(() => {
       const dialog = dialogRef.current;
       if (!dialog || !isTopmostModal(dialog)) return;
@@ -101,13 +150,27 @@ export function Modal({ open, onClose, title, eyebrow, children, wide = false }:
         first.focus();
       }
     };
-    document.addEventListener("keydown", handleKeyDown);
+    const handleFocusIn = (event: FocusEvent) => {
+      const currentDialog = dialogRef.current;
+      const target = event.target;
+      if (
+        !currentDialog
+        || !isTopmostModal(currentDialog)
+        || !(target instanceof Node)
+        || currentDialog.contains(target)
+      ) return;
+      event.stopImmediatePropagation();
+      currentDialog.focus({ preventScroll: true });
+    };
+    document.addEventListener("keydown", handleKeyDown, true);
+    document.addEventListener("focusin", handleFocusIn, true);
     return () => {
       window.clearTimeout(focusTimer);
-      document.removeEventListener("keydown", handleKeyDown);
-      document.body.style.overflow = previousOverflow;
-      if (!wasInert) app?.removeAttribute("inert");
-      if (returnFocusRef.current?.isConnected) returnFocusRef.current.focus({ preventScroll: true });
+      observer.disconnect();
+      document.removeEventListener("keydown", handleKeyDown, true);
+      document.removeEventListener("focusin", handleFocusIn, true);
+      overlay?.release();
+      restoreOverlayFocus(document, returnFocusRef.current);
     };
   }, [open]);
 

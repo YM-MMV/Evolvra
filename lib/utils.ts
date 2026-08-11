@@ -24,7 +24,17 @@ export const isFiniteWorkspaceNumber = (
 
 export function goalProgress(goal: Goal, today = new Date()): number | null {
   if (goal.model === "weighted") {
-    return clamp(goal.milestones.reduce((total, milestone) => total + (milestone.completed ? milestone.weight : 0), 0));
+    if (!goal.milestones.length) return 0;
+    const totalWeight = goal.milestones.reduce((total, milestone) => total + milestone.weight, 0);
+    if (totalWeight > 0) {
+      const completedWeight = goal.milestones.reduce(
+        (total, milestone) => total + (milestone.completed ? milestone.weight : 0),
+        0,
+      );
+      return clamp((completedWeight / totalWeight) * 100);
+    }
+    const completedCount = goal.milestones.filter((milestone) => milestone.completed).length;
+    return clamp((completedCount / goal.milestones.length) * 100);
   }
 
   if (goal.model === "numeric") {
@@ -111,7 +121,30 @@ export function rollMetricPeriod(metric: ProgressMetric, today = new Date()): Pr
   return { ...metric, current: 0, periodKey };
 }
 
-export function nextRepeatDate(repeat: Quest["repeat"], from?: string, today = new Date()) {
+export function monthlyAnchorDayForSchedule(
+  repeat: Quest["repeat"],
+  dueDate?: string,
+  previous?: Pick<Quest, "repeat" | "dueDate" | "monthlyAnchorDay">,
+) {
+  if (repeat !== "monthly") return undefined;
+  if (
+    previous?.repeat === "monthly"
+    && previous.dueDate === dueDate
+    && Number.isInteger(previous.monthlyAnchorDay)
+    && previous.monthlyAnchorDay! >= 1
+    && previous.monthlyAnchorDay! <= 31
+  ) {
+    return previous.monthlyAnchorDay;
+  }
+  return parseLocalDate(dueDate)?.getDate();
+}
+
+export function nextRepeatDate(
+  repeat: Quest["repeat"],
+  from?: string,
+  today = new Date(),
+  monthlyAnchorDay?: number,
+) {
   const parsed = parseLocalDate(from);
   const todayStart = new Date(today.getFullYear(), today.getMonth(), today.getDate());
   const date = parsed && parsed > todayStart ? new Date(parsed) : todayStart;
@@ -119,7 +152,11 @@ export function nextRepeatDate(repeat: Quest["repeat"], from?: string, today = n
   if (repeat === "daily") date.setDate(date.getDate() + 1);
   if (repeat === "weekly") date.setDate(date.getDate() + 7);
   if (repeat === "monthly") {
-    const day = date.getDate();
+    const day = Number.isInteger(monthlyAnchorDay)
+      && monthlyAnchorDay! >= 1
+      && monthlyAnchorDay! <= 31
+      ? monthlyAnchorDay!
+      : date.getDate();
     date.setDate(1);
     date.setMonth(date.getMonth() + 1);
     const lastDay = new Date(date.getFullYear(), date.getMonth() + 1, 0).getDate();

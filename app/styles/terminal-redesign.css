@@ -235,6 +235,32 @@ select:focus { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent);
 .system-footer i.local { background: var(--accent); }
 
 /* Dashboard command view */
+.dashboard-sections {
+  display: grid;
+  grid-template-columns: repeat(12, minmax(0, 1fr));
+  gap: 12px;
+  margin-bottom: 26px;
+}
+.dashboard-section { min-width: 0; }
+.dashboard-section > * { margin-bottom: 0; }
+.dashboard-section-hero,
+.dashboard-section-overview,
+.dashboard-empty { grid-column: 1 / -1; }
+.dashboard-section-due-now,
+.dashboard-section-momentum,
+.dashboard-section-qualities { grid-column: span 4; }
+.dashboard-section-life-map,
+.dashboard-section-goals,
+.dashboard-section-review { grid-column: span 8; }
+.dashboard-section-due-now > *,
+.dashboard-section-momentum > *,
+.dashboard-section-goals > *,
+.dashboard-section-qualities > *,
+.dashboard-section-review > * { height: 100%; }
+.dashboard-section-life-map > div,
+.dashboard-section-life-map .panel { height: 100%; }
+.dashboard-section-hero .hero-row { margin-top: 12px; }
+.dashboard-empty { min-width: 0; }
 .dashboard-kpis {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));

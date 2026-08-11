@@ -61,6 +61,7 @@ export interface LocalBootstrapRequest {
 export interface LocalBootstrapPersistRequest {
   readonly envelope: Readonly<Omit<WorkspaceEnvelope, "localRevision">>;
   readonly expectedScopeGeneration: PersistenceScopeGeneration;
+  readonly stagedEvidence: readonly ExternalizedEvidence["createdEvidence"][number][];
 }
 
 export interface ExternalizeBootstrapStateRequest {
@@ -288,6 +289,7 @@ export async function runLocalWorkspaceBootstrap(
             ports.now(),
           ),
           expectedScopeGeneration: scope.generation,
+          stagedEvidence: recovered.createdEvidence,
         });
         canonicalWorkspacePersisted = true;
         persistedDuringBootstrap = true;
@@ -339,6 +341,7 @@ export async function runLocalWorkspaceBootstrap(
         savedAt: ports.now(),
       },
       expectedScopeGeneration: scope.generation,
+      stagedEvidence: recovered.createdEvidence,
     });
     canonicalWorkspacePersisted = true;
     request.ensureCurrent();

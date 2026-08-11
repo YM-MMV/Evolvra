@@ -1,4 +1,5 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
+import type { AccountErasureCloudBackupBoundary } from "@/lib/account-erasure-checkpoint";
 
 let clientPromise: Promise<SupabaseClient> | null = null;
 let lazyClient: SupabaseClient | null = null;
@@ -33,6 +34,19 @@ export class CloudAccountErasureError extends Error {
     this.responseStatus = responseStatus;
     this.transportFailure = transportFailure;
   }
+}
+
+export function isStaleAccountErasureBackupError(
+  error: unknown,
+): error is CloudAccountErasureError {
+  if (!(error instanceof CloudAccountErasureError) || error.stage !== "begin") {
+    return false;
+  }
+  const cause = error.cause;
+  if (!cause || typeof cause !== "object") return false;
+  const candidate = cause as Record<string, unknown>;
+  return candidate.code === "PT409"
+    && /account_erasure_backup_stale/i.test(String(candidate.message ?? ""));
 }
 
 export const supabaseConfigured = Boolean(
@@ -164,6 +178,7 @@ export function getSupabase(): SupabaseClient | null {
  */
 export async function saveWorkspaceSnapshotWithDeadline(
   supabase: SupabaseClient,
+  expectedAccountId: string,
   state: unknown,
   expectedRevision: number,
   timeoutMs = WORKSPACE_SNAPSHOT_RPC_TIMEOUT_MS,
@@ -173,6 +188,7 @@ export async function saveWorkspaceSnapshotWithDeadline(
   try {
     return await supabase
       .rpc("save_workspace_snapshot", {
+        p_expected_account_id: expectedAccountId,
         p_state: state,
         p_expected_revision: expectedRevision,
       })
@@ -182,7 +198,7 @@ export async function saveWorkspaceSnapshotWithDeadline(
   }
 }
 
-async function listPrivateEvidencePaths(supabase: SupabaseClient, accountId: string) {
+export async function listPrivateEvidencePaths(supabase: SupabaseClient, accountId: string) {
   const bucket = supabase.storage.from("evidence");
   const pendingFolders = [accountId];
   const visitedFolders = new Set<string>();
@@ -212,6 +228,82 @@ async function listPrivateEvidencePaths(supabase: SupabaseClient, accountId: str
   }
 
   return paths;
+}
+
+export interface PrivateEvidenceCleanupClaim {
+  readonly kind: "claimed" | "referenced";
+  readonly workspaceRevision: number;
+}
+
+/**
+ * Atomically tombstones an immutable path batch only when the account's
+ * current cloud snapshot references none of it. The server serializes this
+ * claim against snapshot saves and Storage write/delete policy checks.
+ */
+export async function claimPrivateEvidenceCleanup(
+  supabase: SupabaseClient,
+  accountId: string,
+  remotePaths: readonly string[],
+): Promise<PrivateEvidenceCleanupClaim> {
+  const paths = [...new Set(remotePaths)];
+  if (!paths.length || paths.length !== remotePaths.length) {
+    throw new Error("Private evidence cleanup requires a non-empty unique path batch.");
+  }
+  const { data, error } = await supabase.rpc("claim_evidence_cleanup", {
+    p_expected_account_id: accountId,
+    p_remote_paths: paths,
+  });
+  if (error) throw error;
+  const row = Array.isArray(data) ? data[0] : data;
+  if (!row || typeof row !== "object") {
+    throw new Error("Private cloud did not return an evidence cleanup claim.");
+  }
+  const candidate = row as Record<string, unknown>;
+  if (typeof candidate.claimed !== "boolean") {
+    throw new Error("Private cloud returned an invalid evidence cleanup claim.");
+  }
+  return {
+    kind: candidate.claimed ? "claimed" : "referenced",
+    workspaceRevision: parsedCloudRevision(
+      candidate.workspace_revision,
+      "cleanup workspace revision",
+    ),
+  };
+}
+
+function parsedCloudRevision(value: unknown, label: string): number {
+  if (!Number.isSafeInteger(value) || Number(value) < 0) {
+    throw new Error(`Private cloud returned an invalid ${label}.`);
+  }
+  return Number(value);
+}
+
+/** Reads the monotonic cloud coordinates that make a full backup deletable. */
+export async function readAccountErasureBackupBoundary(
+  supabase: SupabaseClient,
+  accountId: string,
+): Promise<AccountErasureCloudBackupBoundary> {
+  await requireExactAuthenticatedAccount(supabase, accountId, "begin");
+  const { data, error } = await supabase.rpc(
+    "read_account_erasure_backup_boundary",
+    { p_expected_account_id: accountId },
+  );
+  if (error) throw error;
+  const row = Array.isArray(data) ? data[0] : data;
+  if (!row || typeof row !== "object") {
+    throw new Error("Private cloud did not return an account-erasure backup boundary.");
+  }
+  const candidate = row as Record<string, unknown>;
+  return {
+    workspaceRevision: parsedCloudRevision(
+      candidate.workspace_revision,
+      "workspace revision",
+    ),
+    evidenceRevision: parsedCloudRevision(
+      candidate.evidence_revision,
+      "evidence revision",
+    ),
+  };
 }
 
 /** Removes bytes through the Storage API, then verifies the account prefix is empty. */
@@ -280,6 +372,8 @@ async function requireExactAuthenticatedAccount(
 }
 
 export interface EraseConnectedAccountOptions {
+  /** Exact cloud coordinates proved by the complete portable backup. */
+  backupBoundary: AccountErasureCloudBackupBoundary | null;
   /** Persist a durable local-cleanup checkpoint before the final RPC starts. */
   onFinalDeletionStarting?: () => void | Promise<void>;
 }
@@ -291,14 +385,20 @@ export interface EraseConnectedAccountOptions {
 export async function eraseConnectedAccount(
   supabase: SupabaseClient,
   accountId: string,
-  options: EraseConnectedAccountOptions = {},
+  options: EraseConnectedAccountOptions,
 ) {
   await requireExactAuthenticatedAccount(supabase, accountId, "begin");
   let beginError: unknown;
   try {
-    ({ error: beginError } = await supabase.rpc("begin_account_deletion", {
-      p_expected_account_id: accountId,
-    }));
+    ({ error: beginError } = options.backupBoundary
+      ? await supabase.rpc("begin_account_deletion", {
+          p_expected_account_id: accountId,
+          p_expected_workspace_revision: options.backupBoundary.workspaceRevision,
+          p_expected_evidence_revision: options.backupBoundary.evidenceRevision,
+        })
+      : await supabase.rpc("begin_account_deletion", {
+          p_expected_account_id: accountId,
+        }));
   } catch (error) {
     beginError = error;
   }

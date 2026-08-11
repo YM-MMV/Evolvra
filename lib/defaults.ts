@@ -1,4 +1,5 @@
 import type { AppState, Area, Goal, LifeStat, UserSettings } from "@/lib/types";
+import { DASHBOARD_SECTION_IDS } from "@/lib/types";
 import { activePeriodKey, localDateKey } from "@/lib/utils";
 
 const now = new Date().toISOString();
@@ -56,7 +57,7 @@ export const DEFAULT_SETTINGS: UserSettings = {
   interfaceIntensity: "balanced",
   notifications: false,
   reminderTime: "18:00",
-  dashboardOrder: ["life-map", "momentum", "goals", "qualities", "review"],
+  dashboardOrder: [...DASHBOARD_SECTION_IDS],
   hiddenDashboardSections: [],
   terminology: {
     goals: "Goals",

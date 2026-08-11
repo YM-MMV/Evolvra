@@ -1,8 +1,8 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useState } from "react";
 import { ArrowDown, ArrowLeft, ArrowRight, ArrowUp, Check, Plus, Sparkles, Target, Trash2 } from "lucide-react";
-import { useApp } from "@/components/app-provider";
+import { useAppActions, useWorkspaceData } from "@/components/app-provider";
 import { Button, Field, FieldGroup, Modal } from "@/components/ui";
 import { WORKSPACE_TEXT_LIMITS } from "@/lib/state-schema";
 import { terminologyForms } from "@/lib/terminology";
@@ -53,7 +53,8 @@ const newDraftMetric = (overrides: Partial<DraftMetric> = {}): DraftMetric => ({
 });
 
 export function GoalForm({ open, onClose }: { open: boolean; onClose: () => void }) {
-  const { state, addGoal } = useApp();
+  const { state } = useWorkspaceData();
+  const { addGoal } = useAppActions();
   const [step, setStep] = useState(0);
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
@@ -70,6 +71,15 @@ export function GoalForm({ open, onClose }: { open: boolean; onClose: () => void
   const [questTitle, setQuestTitle] = useState("");
   const terms = terminologyForms(state.settings.terminology);
   const steps = ["Direction", "Measurement", terms.stats.plural, `First ${terms.quests.singularLower}`];
+  const availableAreas = state.areas.filter((area) => !area.archived && !area.hidden);
+  const effectiveAreaId = availableAreas.some((area) => area.id === areaId)
+    ? areaId
+    : availableAreas[0]?.id ?? "";
+  const availableStats = state.stats.filter((stat) => !stat.archived);
+  const retainedStatIds = statIds.filter((id) => availableStats.some((stat) => stat.id === id));
+  const effectiveStatIds = retainedStatIds.length || !availableStats.length
+    ? retainedStatIds
+    : [availableStats[0].id];
   const metricsValid = metrics.length > 0
     && metrics.every((metric) => metric.label.trim()
       && isFiniteWorkspaceNumber(metric.current, 0)
@@ -77,16 +87,17 @@ export function GoalForm({ open, onClose }: { open: boolean; onClose: () => void
       && isFiniteWorkspaceNumber(metric.weight, 0, 100))
     && metrics.some((metric) => metric.weight > 0);
 
-  const canContinue = useMemo(() => {
-    if (step === 0) return Boolean(title.trim() && description.trim() && areaId);
+  const canContinue = (() => {
+    if (step === 0) return Boolean(title.trim() && description.trim() && effectiveAreaId);
     if (step === 1 && (model === "numeric" || model === "consistency")) return metricsValid;
     if (step === 1 && model === "weighted") return milestoneText.split("\n").filter((line) => line.trim()).length > 0;
-    if (step === 2) return statIds.length > 0 || state.stats.filter((stat) => !stat.archived).length === 0;
+    if (step === 2) return effectiveStatIds.length > 0 || availableStats.length === 0;
     return true;
-  }, [areaId, description, metricsValid, milestoneText, model, statIds.length, state.stats, step, title]);
+  })();
 
   const reset = () => {
     setStep(0); setTitle(""); setDescription(""); setPriority("medium"); setTargetDate(""); setModel("numeric");
+    setAreaId(state.areas.find((area) => !area.archived && !area.hidden)?.id ?? "");
     setMetrics([newDraftMetric()]); setMilestoneText("");
     const firstAvailable = state.stats.find((stat) => !stat.archived);
     setStatIds(firstAvailable ? [firstAvailable.id] : []); setQuestTitle("");
@@ -114,7 +125,7 @@ export function GoalForm({ open, onClose }: { open: boolean; onClose: () => void
       id: uid("goal"),
       title: title.trim(),
       description: description.trim(),
-      areaId,
+      areaId: effectiveAreaId,
       model,
       priority,
       targetDate: targetDate || undefined,
@@ -131,7 +142,7 @@ export function GoalForm({ open, onClose }: { open: boolean; onClose: () => void
       })) : [],
       milestones: lines.map((line) => ({ id: uid("milestone"), title: line, weight: model === "weighted" ? 100 / lines.length : 0, completed: false })),
       quests: questTitle.trim() ? [{ id: uid("quest"), kind: "task", linkedGoalIds: [], title: questTitle.trim(), repeat: "none", completed: false, metricDeltas: [] }] : [],
-      statIds,
+      statIds: effectiveStatIds,
       checkIns: [],
       evidence: [],
       notes: "",
@@ -151,7 +162,7 @@ export function GoalForm({ open, onClose }: { open: boolean; onClose: () => void
         <FieldGroup label="Start from a template" hint="Optional — every field remains editable."><div className="model-grid">{templates.map((template) => <button type="button" className="model-card" key={template.title} onClick={() => applyTemplate(template)}><strong>{template.title}</strong><p>{template.description}</p></button>)}</div></FieldGroup>
         <Field label={`${terms.goals.singular} title`}><input data-modal-autofocus="true" maxLength={WORKSPACE_TEXT_LIMITS.goalTitle} value={title} onChange={(e) => setTitle(e.target.value)} placeholder="Reach conversational Spanish" /></Field>
         <Field label="Why this matters"><textarea rows={3} maxLength={WORKSPACE_TEXT_LIMITS.goalDescription} value={description} onChange={(e) => setDescription(e.target.value)} placeholder="I want to speak comfortably when travelling…" /></Field>
-        <div className="form-grid thirds"><Field label={`Life ${terms.areas.singularLower}`}><select value={areaId} onChange={(e) => setAreaId(e.target.value)}>{state.areas.filter((area) => !area.archived && !area.hidden).map((area) => <option key={area.id} value={area.id}>{area.name}</option>)}</select></Field><Field label="Importance"><select value={priority} onChange={(e) => setPriority(e.target.value as Priority)}><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option><option value="critical">Critical</option></select></Field><Field label="Target date" hint="Optional"><input type="date" value={targetDate} onChange={(e) => setTargetDate(e.target.value)} /></Field></div>
+        <div className="form-grid thirds"><Field label={`Life ${terms.areas.singularLower}`}><select value={effectiveAreaId} onChange={(e) => setAreaId(e.target.value)}>{availableAreas.map((area) => <option key={area.id} value={area.id}>{area.name}</option>)}</select></Field><Field label="Importance"><select value={priority} onChange={(e) => setPriority(e.target.value as Priority)}><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option><option value="critical">Critical</option></select></Field><Field label="Target date" hint="Optional"><input type="date" value={targetDate} onChange={(e) => setTargetDate(e.target.value)} /></Field></div>
       </div>}
 
       {step === 1 && <div className="form-section">
@@ -172,8 +183,8 @@ export function GoalForm({ open, onClose }: { open: boolean; onClose: () => void
 
       {step === 2 && <div className="form-section">
         <div className="form-intro"><span><Sparkles /></span><div><h3>Connect the {terms.stats.pluralLower} you are developing</h3><p>Choose every {terms.stats.singularLower} this {terms.goals.singularLower} supports. These links organise related activity and history.</p></div></div>
-        <div className="quality-list">{state.stats.filter((stat) => !stat.archived).map((stat) => { const selected = statIds.includes(stat.id); return <button type="button" key={stat.id} className={selected ? "selected" : ""} aria-pressed={selected} onClick={() => setStatIds((current) => selected ? current.filter((id) => id !== stat.id) : [...current, stat.id])}><i style={{ background: stat.color }} /><span>{stat.name}</span>{selected && <Check size={15} />}</button>; })}</div>
-        {!state.stats.some((stat) => !stat.archived) && <p className="muted-copy">You can create {terms.stats.pluralLower} later from Settings.</p>}
+        <div className="quality-list">{availableStats.map((stat) => { const selected = effectiveStatIds.includes(stat.id); return <button type="button" key={stat.id} className={selected ? "selected" : ""} aria-pressed={selected} onClick={() => setStatIds(selected ? effectiveStatIds.filter((id) => id !== stat.id) : [...effectiveStatIds, stat.id])}><i style={{ background: stat.color }} /><span>{stat.name}</span>{selected && <Check size={15} />}</button>; })}</div>
+        {!availableStats.length && <p className="muted-copy">You can create {terms.stats.pluralLower} later from Settings.</p>}
       </div>}
 
       {step === 3 && <div className="form-section">

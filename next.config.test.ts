@@ -3,15 +3,18 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 async function loadContentSecurityPolicy({
   ci = "true",
   cloudE2e = "true",
+  vercel = "1",
   supabaseUrl,
 }: {
   ci?: string;
   cloudE2e?: string;
+  vercel?: string;
   supabaseUrl: string;
 }) {
   vi.stubEnv("NODE_ENV", "production");
   vi.stubEnv("CI", ci);
   vi.stubEnv("EVOLVRA_CLOUD_E2E", cloudE2e);
+  vi.stubEnv("VERCEL", vercel);
   vi.stubEnv("NEXT_PUBLIC_SUPABASE_URL", supabaseUrl);
   vi.resetModules();
 
@@ -63,5 +66,15 @@ describe("production Supabase CSP", () => {
     expect(policy).toContain("https://project.supabase.co");
     expect(policy).toContain("wss://project.supabase.co");
     expect(policy).toContain("upgrade-insecure-requests");
+  });
+
+  it("does not rewrite assets to HTTPS under a local production server", async () => {
+    const policy = await loadContentSecurityPolicy({
+      vercel: "",
+      supabaseUrl: "https://project.supabase.co",
+    });
+
+    expect(policy).toContain("https://project.supabase.co");
+    expect(policy).not.toContain("upgrade-insecure-requests");
   });
 });

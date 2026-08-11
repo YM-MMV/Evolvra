@@ -171,13 +171,19 @@ values
 
 insert into public.workspace_snapshots (user_id, state)
 values
-  ('00000000-0000-0000-0000-0000000000a1', '{"version":3,"owner":"a"}'::jsonb),
-  ('00000000-0000-0000-0000-0000000000b2', '{"version":3,"owner":"b"}'::jsonb);
+  (
+    '00000000-0000-0000-0000-0000000000a1',
+    '{"version":3,"owner":"a","goals":[{"evidence":[{"remotePath":"00000000-0000-0000-0000-0000000000a1/seed-goal/seed-evidence/seed-a.txt"}]}]}'::jsonb
+  ),
+  (
+    '00000000-0000-0000-0000-0000000000b2',
+    '{"version":3,"owner":"b","goals":[{"evidence":[{"remotePath":"00000000-0000-0000-0000-0000000000b2/seed-goal/seed-evidence/seed-b.txt"}]}]}'::jsonb
+  );
 
 insert into storage.objects (id, bucket_id, name)
 values
-  ('70000000-0000-0000-0000-0000000000a1', 'evidence', '00000000-0000-0000-0000-0000000000a1/seed-a.txt'),
-  ('70000000-0000-0000-0000-0000000000b2', 'evidence', '00000000-0000-0000-0000-0000000000b2/seed-b.txt');
+  ('70000000-0000-0000-0000-0000000000a1', 'evidence', '00000000-0000-0000-0000-0000000000a1/seed-goal/seed-evidence/seed-a.txt'),
+  ('70000000-0000-0000-0000-0000000000b2', 'evidence', '00000000-0000-0000-0000-0000000000b2/seed-goal/seed-evidence/seed-b.txt');
 
 do $$
 declare
@@ -189,23 +195,58 @@ begin
   if has_function_privilege('anon', 'public.save_workspace_snapshot(jsonb,bigint)', 'execute') then
     raise exception 'anon must not execute save_workspace_snapshot(jsonb,bigint)';
   end if;
+  if has_function_privilege('anon', 'public.save_workspace_snapshot(uuid,jsonb,bigint)', 'execute') then
+    raise exception 'anon must not execute account-bound save_workspace_snapshot(uuid,jsonb,bigint)';
+  end if;
   if has_function_privilege('anon', 'public.begin_account_deletion(uuid)', 'execute') then
     raise exception 'anon must not execute begin_account_deletion(uuid)';
   end if;
-  if has_function_privilege('anon', 'private.evidence_writes_allowed()', 'execute') then
-    raise exception 'anon must not execute private.evidence_writes_allowed()';
+  if has_function_privilege('anon', 'public.begin_account_deletion(uuid,bigint,bigint)', 'execute') then
+    raise exception 'anon must not execute boundary-aware begin_account_deletion(uuid,bigint,bigint)';
+  end if;
+  if has_function_privilege('anon', 'public.read_account_erasure_backup_boundary(uuid)', 'execute') then
+    raise exception 'anon must not read account-erasure backup boundaries';
+  end if;
+  if has_function_privilege('anon', 'public.claim_evidence_cleanup(uuid,text[])', 'execute') then
+    raise exception 'anon must not claim private evidence cleanup';
+  end if;
+  if has_function_privilege('anon', 'private.evidence_path_writes_allowed(text,text)', 'execute')
+     or has_function_privilege('anon', 'private.evidence_deletes_allowed(text,text)', 'execute') then
+    raise exception 'anon must not execute private evidence policy helpers';
   end if;
   if not has_function_privilege('authenticated', 'public.delete_my_account(uuid)', 'execute') then
     raise exception 'authenticated must execute delete_my_account(uuid)';
   end if;
   if not has_function_privilege('authenticated', 'public.save_workspace_snapshot(jsonb,bigint)', 'execute') then
-    raise exception 'authenticated must execute save_workspace_snapshot(jsonb,bigint)';
+    raise exception 'authenticated must execute the fail-closed legacy save_workspace_snapshot(jsonb,bigint)';
+  end if;
+  if not has_function_privilege('authenticated', 'public.save_workspace_snapshot(uuid,jsonb,bigint)', 'execute') then
+    raise exception 'authenticated must execute account-bound save_workspace_snapshot(uuid,jsonb,bigint)';
   end if;
   if not has_function_privilege('authenticated', 'public.begin_account_deletion(uuid)', 'execute') then
-    raise exception 'authenticated must execute begin_account_deletion(uuid)';
+    raise exception 'authenticated must execute the resume-only begin_account_deletion(uuid)';
   end if;
-  if not has_function_privilege('authenticated', 'private.evidence_writes_allowed()', 'execute') then
-    raise exception 'authenticated must execute the internal evidence write-policy helper';
+  if not has_function_privilege('authenticated', 'public.begin_account_deletion(uuid,bigint,bigint)', 'execute') then
+    raise exception 'authenticated must execute boundary-aware begin_account_deletion(uuid,bigint,bigint)';
+  end if;
+  if not has_function_privilege('authenticated', 'public.read_account_erasure_backup_boundary(uuid)', 'execute') then
+    raise exception 'authenticated must read its account-erasure backup boundary';
+  end if;
+  if not has_function_privilege('authenticated', 'public.claim_evidence_cleanup(uuid,text[])', 'execute') then
+    raise exception 'authenticated must claim its private evidence cleanup';
+  end if;
+  if not has_function_privilege('authenticated', 'private.evidence_path_writes_allowed(text,text)', 'execute')
+     or not has_function_privilege('authenticated', 'private.evidence_deletes_allowed(text,text)', 'execute') then
+    raise exception 'authenticated must execute the path-bound evidence policy helpers';
+  end if;
+  if to_regprocedure('private.evidence_writes_allowed()') is not null
+     or to_regprocedure('private.evidence_deletes_allowed()') is not null then
+    raise exception 'retired zero-argument evidence policy helpers survived';
+  end if;
+  if has_function_privilege('authenticated', 'private.evidence_owner_id(text,text)', 'execute')
+     or has_function_privilege('authenticated', 'private.bump_account_evidence_revision()', 'execute')
+     or has_function_privilege('authenticated', 'private.workspace_state_references_evidence_path(jsonb,text)', 'execute') then
+    raise exception 'authenticated must not execute internal evidence trigger or snapshot helpers';
   end if;
   if has_function_privilege('authenticated', 'private.handle_new_account_lifecycle()', 'execute') then
     raise exception 'authenticated must not execute the lifecycle trigger function';
@@ -227,15 +268,21 @@ begin
     raise exception 'anon must have no workspace_snapshots table privileges';
   end if;
   if not has_table_privilege('authenticated', 'public.workspace_snapshots', 'select')
-     or not has_table_privilege('authenticated', 'public.workspace_snapshots', 'delete')
      or has_table_privilege('authenticated', 'public.workspace_snapshots', 'insert')
-     or has_table_privilege('authenticated', 'public.workspace_snapshots', 'update') then
-    raise exception 'authenticated workspace_snapshots privileges are not SELECT/DELETE only';
+     or has_table_privilege('authenticated', 'public.workspace_snapshots', 'update')
+     or has_table_privilege('authenticated', 'public.workspace_snapshots', 'delete')
+     or has_table_privilege('authenticated', 'public.workspace_snapshots', 'truncate')
+     or has_table_privilege('authenticated', 'public.workspace_snapshots', 'references')
+     or has_table_privilege('authenticated', 'public.workspace_snapshots', 'trigger') then
+    raise exception 'authenticated workspace_snapshots privileges are not SELECT only';
   end if;
   if not has_table_privilege('service_role', 'public.workspace_snapshots', 'select')
      or has_table_privilege('service_role', 'public.workspace_snapshots', 'insert')
      or has_table_privilege('service_role', 'public.workspace_snapshots', 'update')
-     or has_table_privilege('service_role', 'public.workspace_snapshots', 'delete') then
+     or has_table_privilege('service_role', 'public.workspace_snapshots', 'delete')
+     or has_table_privilege('service_role', 'public.workspace_snapshots', 'truncate')
+     or has_table_privilege('service_role', 'public.workspace_snapshots', 'references')
+     or has_table_privilege('service_role', 'public.workspace_snapshots', 'trigger') then
     raise exception 'service_role workspace_snapshots privileges are not SELECT only';
   end if;
 
@@ -249,9 +296,43 @@ begin
      or has_table_privilege('authenticated', 'public.account_lifecycle', 'delete') then
     raise exception 'account_lifecycle must have no direct client table privileges';
   end if;
+  if not has_table_privilege('service_role', 'public.account_lifecycle', 'select')
+     or has_table_privilege('service_role', 'public.account_lifecycle', 'insert')
+     or has_table_privilege('service_role', 'public.account_lifecycle', 'update')
+     or has_table_privilege('service_role', 'public.account_lifecycle', 'delete')
+     or has_table_privilege('service_role', 'public.account_lifecycle', 'truncate')
+     or has_table_privilege('service_role', 'public.account_lifecycle', 'references')
+     or has_table_privilege('service_role', 'public.account_lifecycle', 'trigger') then
+    raise exception 'service_role account_lifecycle privileges are not SELECT only';
+  end if;
+
+  if has_table_privilege('anon', 'private.evidence_cleanup_claims', 'select')
+     or has_table_privilege('authenticated', 'private.evidence_cleanup_claims', 'select')
+     or has_table_privilege('authenticated', 'private.evidence_cleanup_claims', 'insert')
+     or has_table_privilege('authenticated', 'private.evidence_cleanup_claims', 'update')
+     or has_table_privilege('authenticated', 'private.evidence_cleanup_claims', 'delete') then
+    raise exception 'private evidence cleanup claims must be RPC-only for clients';
+  end if;
+  if not has_table_privilege('service_role', 'private.evidence_cleanup_claims', 'select')
+     or has_table_privilege('service_role', 'private.evidence_cleanup_claims', 'insert')
+     or has_table_privilege('service_role', 'private.evidence_cleanup_claims', 'update')
+     or has_table_privilege('service_role', 'private.evidence_cleanup_claims', 'delete')
+     or has_table_privilege('service_role', 'private.evidence_cleanup_claims', 'truncate')
+     or has_table_privilege('service_role', 'private.evidence_cleanup_claims', 'references')
+     or has_table_privilege('service_role', 'private.evidence_cleanup_claims', 'trigger') then
+    raise exception 'service_role evidence cleanup claim privileges are not SELECT only';
+  end if;
 
   if (select count(*) from public.account_lifecycle where status = 'active') <> 2 then
     raise exception 'auth trigger did not create two active lifecycle rows';
+  end if;
+  if (
+    select count(*)
+    from public.account_lifecycle
+    where status = 'active'
+      and evidence_revision = 1
+  ) <> 2 then
+    raise exception 'seed evidence inserts did not advance each account revision exactly once';
   end if;
 
   foreach table_name in array array[
@@ -394,13 +475,87 @@ select pg_temp.expect_sqlstate('completion cross-owner linked goal', $sql$update
 -- Direct snapshot writes stay closed; the authenticated compare-and-swap RPC
 -- can update only A's document.
 select pg_temp.expect_denied('direct snapshot update', $sql$update public.workspace_snapshots set state = '{"forged":true}'::jsonb where user_id = '00000000-0000-0000-0000-0000000000a1'$sql$);
+select pg_temp.expect_sqlstate(
+  'legacy snapshot save fails closed during client cutover',
+  $sql$select * from public.save_workspace_snapshot('{"version":3,"owner":"a","legacy":true}'::jsonb, 0)$sql$,
+  '55000'
+);
+select pg_temp.expect_sqlstate(
+  'snapshot save cannot nominate another authenticated account',
+  $sql$select * from public.save_workspace_snapshot('00000000-0000-0000-0000-0000000000b2'::uuid, '{"version":3,"owner":"a","crossed":true}'::jsonb, 0)$sql$,
+  '42501'
+);
+select pg_temp.expect_sqlstate(
+  'cleanup claim cannot nominate another authenticated account',
+  $sql$select * from public.claim_evidence_cleanup('00000000-0000-0000-0000-0000000000b2'::uuid, array['00000000-0000-0000-0000-0000000000a1/seed-goal/seed-evidence/seed-a.txt'])$sql$,
+  '42501'
+);
+select pg_temp.expect_sqlstate(
+  'cleanup claim rejects a path owned by another account',
+  $sql$select * from public.claim_evidence_cleanup('00000000-0000-0000-0000-0000000000a1'::uuid, array['00000000-0000-0000-0000-0000000000b2/seed-goal/seed-evidence/seed-b.txt'])$sql$,
+  '22023'
+);
+select pg_temp.expect_sqlstate(
+  'cleanup claim rejects duplicate paths instead of partially claiming',
+  $sql$select * from public.claim_evidence_cleanup('00000000-0000-0000-0000-0000000000a1'::uuid, array['00000000-0000-0000-0000-0000000000a1/seed-goal/seed-evidence/seed-a.txt','00000000-0000-0000-0000-0000000000a1/seed-goal/seed-evidence/seed-a.txt'])$sql$,
+  '22023'
+);
+select pg_temp.expect_sqlstate(
+  'cleanup claim rejects an empty batch',
+  $sql$select * from public.claim_evidence_cleanup('00000000-0000-0000-0000-0000000000a1'::uuid, array[]::text[])$sql$,
+  '22023'
+);
+select pg_temp.expect_sqlstate(
+  'cleanup claim rejects an unclaimable path shape',
+  $sql$select * from public.claim_evidence_cleanup('00000000-0000-0000-0000-0000000000a1'::uuid, array['00000000-0000-0000-0000-0000000000a1/unclaimable.txt'])$sql$,
+  '22023'
+);
+do $$
+declare
+  was_claimed boolean;
+  observed_revision bigint;
+begin
+  select claimed, workspace_revision
+  into was_claimed, observed_revision
+  from public.claim_evidence_cleanup(
+    '00000000-0000-0000-0000-0000000000a1',
+    array['00000000-0000-0000-0000-0000000000a1/seed-goal/seed-evidence/seed-a.txt']
+  );
+  if was_claimed or observed_revision <> 0 then
+    raise exception 'referenced cleanup path was claimed or returned revision %', observed_revision;
+  end if;
+
+  select claimed, workspace_revision
+  into was_claimed, observed_revision
+  from public.claim_evidence_cleanup(
+    '00000000-0000-0000-0000-0000000000a1',
+    array[
+      '00000000-0000-0000-0000-0000000000a1/batch-goal/batch-evidence/candidate.txt',
+      '00000000-0000-0000-0000-0000000000a1/seed-goal/seed-evidence/seed-a.txt'
+    ]
+  );
+  if was_claimed or observed_revision <> 0 then
+    raise exception 'a batch containing a referenced path was claimed or returned revision %', observed_revision;
+  end if;
+  if not private.evidence_path_writes_allowed(
+    'evidence',
+    '00000000-0000-0000-0000-0000000000a1/batch-goal/batch-evidence/candidate.txt'
+  ) then
+    raise exception 'the referenced batch partially claimed its unreferenced path';
+  end if;
+end;
+$$;
 do $$
 declare
   saved_state jsonb;
   saved_revision bigint;
 begin
   select state, revision into saved_state, saved_revision
-  from public.save_workspace_snapshot('{"version":3,"owner":"a","saved":true}'::jsonb, 0);
+  from public.save_workspace_snapshot(
+    p_expected_account_id => '00000000-0000-0000-0000-0000000000a1'::uuid,
+    p_state => '{"version":3,"owner":"a","saved":true}'::jsonb,
+    p_expected_revision => 0
+  );
   if saved_revision <> 1 then
     raise exception 'workspace RPC returned revision %, expected 1', saved_revision;
   end if;
@@ -414,31 +569,206 @@ end;
 $$;
 select pg_temp.expect_sqlstate(
   'stale workspace revision',
-  $sql$select * from public.save_workspace_snapshot('{"version":3,"owner":"a","stale":true}'::jsonb, 0)$sql$,
+  $sql$select * from public.save_workspace_snapshot('00000000-0000-0000-0000-0000000000a1'::uuid, '{"version":3,"owner":"a","stale":true}'::jsonb, 0)$sql$,
   'PT409'
 );
 
 -- Evidence paths are private on select/insert/delete and cannot be moved into
 -- a different account's folder through UPDATE.
 insert into storage.objects (id, bucket_id, name)
-values ('70000000-0000-0000-0000-0000000000a3', 'evidence', '00000000-0000-0000-0000-0000000000a1/allowed.txt');
+values ('70000000-0000-0000-0000-0000000000a3', 'evidence', '00000000-0000-0000-0000-0000000000a1/goal-a/evidence-a/allowed.txt');
+do $$
+declare
+  boundary_workspace_revision bigint;
+  boundary_evidence_revision bigint;
+  next_evidence_revision bigint;
+begin
+  select workspace_revision, evidence_revision
+  into boundary_workspace_revision, boundary_evidence_revision
+  from public.read_account_erasure_backup_boundary(
+    '00000000-0000-0000-0000-0000000000a1'
+  );
+  if boundary_workspace_revision <> 1 or boundary_evidence_revision <> 2 then
+    raise exception 'initial account-erasure boundary was %/%, expected 1/2',
+      boundary_workspace_revision,
+      boundary_evidence_revision;
+  end if;
+
+  -- Reading evidence may update this deprecated access timestamp. PostgreSQL
+  -- also presents Storage's generated path_tokens as transiently null to a
+  -- BEFORE UPDATE trigger. Neither is a byte, path, or durable metadata
+  -- mutation and neither may stale the backup.
+  update storage.objects
+  set last_accessed_at = clock_timestamp() + interval '1 second'
+  where id = '70000000-0000-0000-0000-0000000000a3';
+  select evidence_revision
+  into next_evidence_revision
+  from public.read_account_erasure_backup_boundary(
+    '00000000-0000-0000-0000-0000000000a1'
+  );
+  if next_evidence_revision <> boundary_evidence_revision then
+    raise exception 'last_accessed_at-only update advanced evidence revision from % to %',
+      boundary_evidence_revision,
+      next_evidence_revision;
+  end if;
+
+  update storage.objects
+  set metadata = '{"eTag":"rls-regression"}'::jsonb
+  where id = '70000000-0000-0000-0000-0000000000a3';
+  select evidence_revision
+  into next_evidence_revision
+  from public.read_account_erasure_backup_boundary(
+    '00000000-0000-0000-0000-0000000000a1'
+  );
+  if next_evidence_revision <> boundary_evidence_revision + 1 then
+    raise exception 'metadata update did not advance evidence revision exactly once';
+  end if;
+  boundary_evidence_revision := next_evidence_revision;
+
+  update storage.objects
+  set name = '00000000-0000-0000-0000-0000000000a1/goal-a/evidence-a/renamed-allowed.txt'
+  where id = '70000000-0000-0000-0000-0000000000a3';
+  select evidence_revision
+  into next_evidence_revision
+  from public.read_account_erasure_backup_boundary(
+    '00000000-0000-0000-0000-0000000000a1'
+  );
+  if next_evidence_revision <> boundary_evidence_revision + 1 then
+    raise exception 'same-owner rename did not advance evidence revision exactly once';
+  end if;
+  boundary_evidence_revision := next_evidence_revision;
+
+  if not (
+    select claimed
+    from public.claim_evidence_cleanup(
+      '00000000-0000-0000-0000-0000000000a1',
+      array['00000000-0000-0000-0000-0000000000a1/goal-a/evidence-a/renamed-allowed.txt']
+    )
+  ) then
+    raise exception 'unreferenced evidence path was not atomically claimed';
+  end if;
+  perform pg_temp.expect_sqlstate(
+    'snapshot cannot resurrect a claimed evidence path',
+    $sql$select * from public.save_workspace_snapshot(
+      '00000000-0000-0000-0000-0000000000a1'::uuid,
+      '{"version":3,"owner":"a","goals":[{"evidence":[{"remotePath":"00000000-0000-0000-0000-0000000000a1/goal-a/evidence-a/renamed-allowed.txt"}]}]}'::jsonb,
+      1
+    )$sql$,
+    'PT409'
+  );
+
+  -- Model the transaction-local marker used by the supported Storage API so
+  -- this test covers the authenticated delete policy and DELETE trigger.
+  perform set_config('storage.allow_delete_query', 'true', true);
+  delete from storage.objects
+  where id = '70000000-0000-0000-0000-0000000000a3';
+  perform set_config('storage.allow_delete_query', 'false', true);
+  select evidence_revision
+  into next_evidence_revision
+  from public.read_account_erasure_backup_boundary(
+    '00000000-0000-0000-0000-0000000000a1'
+  );
+  if next_evidence_revision <> boundary_evidence_revision + 1 then
+    raise exception 'evidence delete did not advance evidence revision exactly once';
+  end if;
+  boundary_evidence_revision := next_evidence_revision;
+
+  perform pg_temp.expect_denied(
+    'claimed evidence path cannot be uploaded again',
+    $sql$insert into storage.objects (id, bucket_id, name) values ('70000000-0000-0000-0000-0000000000f5', 'evidence', '00000000-0000-0000-0000-0000000000a1/goal-a/evidence-a/renamed-allowed.txt')$sql$
+  );
+
+  insert into storage.objects (id, bucket_id, name)
+  values (
+    '70000000-0000-0000-0000-0000000000a3',
+    'evidence',
+    '00000000-0000-0000-0000-0000000000a1/goal-a/evidence-a/replacement.txt'
+  );
+  select evidence_revision
+  into next_evidence_revision
+  from public.read_account_erasure_backup_boundary(
+    '00000000-0000-0000-0000-0000000000a1'
+  );
+  if next_evidence_revision <> boundary_evidence_revision + 1 then
+    raise exception 'replacement evidence insert did not advance evidence revision exactly once';
+  end if;
+end;
+$$;
 select pg_temp.expect_denied('evidence cross-owner upload', $sql$insert into storage.objects (id, bucket_id, name) values ('70000000-0000-0000-0000-0000000000f1', 'evidence', '00000000-0000-0000-0000-0000000000b2/forged.txt')$sql$);
-select pg_temp.expect_denied('evidence cross-owner move', $sql$update storage.objects set name = '00000000-0000-0000-0000-0000000000b2/moved.txt' where id = '70000000-0000-0000-0000-0000000000a3'$sql$);
+select pg_temp.expect_denied('evidence malformed own path', $sql$insert into storage.objects (id, bucket_id, name) values ('70000000-0000-0000-0000-0000000000f2', 'evidence', '00000000-0000-0000-0000-0000000000a1/unclaimable.txt')$sql$);
+select pg_temp.expect_denied('evidence cross-owner move', $sql$update storage.objects set name = '00000000-0000-0000-0000-0000000000b2/goal-b/evidence-b/moved.txt' where id = '70000000-0000-0000-0000-0000000000a3'$sql$);
+do $$
+declare
+  affected_rows integer;
+begin
+  perform set_config('storage.allow_delete_query', 'true', true);
+  delete from storage.objects where id = '70000000-0000-0000-0000-0000000000a3';
+  get diagnostics affected_rows = row_count;
+  perform set_config('storage.allow_delete_query', 'false', true);
+  if affected_rows <> 0 then
+    raise exception 'active evidence delete succeeded without a durable cleanup claim';
+  end if;
+end;
+$$;
+do $$
+declare
+  was_claimed boolean;
+  claimed_revision bigint;
+begin
+  select claimed, workspace_revision into was_claimed, claimed_revision
+  from public.claim_evidence_cleanup(
+    '00000000-0000-0000-0000-0000000000a1',
+    array['00000000-0000-0000-0000-0000000000a1/goal-a/evidence-a/replacement.txt']
+  );
+  if not was_claimed or claimed_revision <> 1 then
+    raise exception 'unreferenced replacement path was not claimed at workspace revision 1';
+  end if;
+  select claimed, workspace_revision into was_claimed, claimed_revision
+  from public.claim_evidence_cleanup(
+    '00000000-0000-0000-0000-0000000000a1',
+    array['00000000-0000-0000-0000-0000000000a1/goal-a/evidence-a/replacement.txt']
+  );
+  if not was_claimed or claimed_revision <> 1 then
+    raise exception 'retrying an evidence cleanup claim was not idempotent';
+  end if;
+end;
+$$;
 select pg_temp.expect_sqlstate(
   'direct evidence metadata delete requires Storage API marker',
   $sql$delete from storage.objects where id = '70000000-0000-0000-0000-0000000000a3'$sql$,
   '42501'
 );
+do $$
+declare
+  current_evidence_revision bigint;
+begin
+  select evidence_revision
+  into current_evidence_revision
+  from public.read_account_erasure_backup_boundary(
+    '00000000-0000-0000-0000-0000000000a1'
+  );
+  if current_evidence_revision <> 6 then
+    raise exception 'denied evidence mutations changed revision to %, expected 6',
+      current_evidence_revision;
+  end if;
+end;
+$$;
 insert into storage.objects (id, bucket_id, name)
-values ('70000000-0000-0000-0000-0000000000a4', 'evidence', '00000000-0000-0000-0000-0000000000a1/delete-with-account.txt');
+values ('70000000-0000-0000-0000-0000000000a4', 'evidence', '00000000-0000-0000-0000-0000000000a1/goal-a/evidence-delete/delete-with-account.txt');
 
 -- Lifecycle state cannot be forged or cleared through direct table access, and
 -- the final RPC cannot skip phase one or the Storage sweep.
+select pg_temp.expect_denied('direct snapshot delete cannot reset the backup revision', $sql$delete from public.workspace_snapshots where user_id = '00000000-0000-0000-0000-0000000000a1'$sql$);
 select pg_temp.expect_denied('direct lifecycle insert', $sql$insert into public.account_lifecycle (user_id, status) values ('00000000-0000-0000-0000-0000000000b2', 'deleting') on conflict (user_id) do update set status = excluded.status$sql$);
 select pg_temp.expect_denied('direct lifecycle update', $sql$update public.account_lifecycle set status = 'active' where user_id = '00000000-0000-0000-0000-0000000000a1'$sql$);
 select pg_temp.expect_sqlstate(
   'begin cannot nominate another account',
   $sql$select public.begin_account_deletion('00000000-0000-0000-0000-0000000000b2')$sql$,
+  '42501'
+);
+select pg_temp.expect_sqlstate(
+  'boundary-aware begin cannot nominate another account',
+  $sql$select public.begin_account_deletion('00000000-0000-0000-0000-0000000000b2', 0, 0)$sql$,
   '42501'
 );
 select pg_temp.expect_sqlstate(
@@ -452,14 +782,84 @@ select pg_temp.expect_sqlstate(
   '55000'
 );
 
--- Phase one takes a conflicting row lock, waits for existing evidence writes,
--- and commits a deleting state in production. This same-user request models a
--- second valid session after that transition: upload is denied and UPDATE can
--- no longer see a writable row, while SELECT/DELETE remain available to sweep.
-select public.begin_account_deletion('00000000-0000-0000-0000-0000000000a1');
+-- Only an exact backup boundary may move an active account into deletion. Both
+-- stale coordinates fail without changing lifecycle state; the retired
+-- one-argument contract is resume-only. A matching request commits the fence,
+-- after which the old signature may idempotently resume an already-authorized
+-- deletion during a rolling client deployment.
+do $$
+declare
+  account_id constant uuid := '00000000-0000-0000-0000-0000000000a1';
+  boundary_workspace_revision bigint;
+  boundary_evidence_revision bigint;
+  observed_workspace_revision bigint;
+  observed_evidence_revision bigint;
+begin
+  select workspace_revision, evidence_revision
+  into boundary_workspace_revision, boundary_evidence_revision
+  from public.read_account_erasure_backup_boundary(account_id);
+
+  perform pg_temp.expect_sqlstate(
+    'stale account-erasure workspace boundary',
+    format(
+      'select public.begin_account_deletion(%L::uuid, %s::bigint, %s::bigint)',
+      account_id,
+      boundary_workspace_revision + 1,
+      boundary_evidence_revision
+    ),
+    'PT409'
+  );
+  select workspace_revision, evidence_revision
+  into observed_workspace_revision, observed_evidence_revision
+  from public.read_account_erasure_backup_boundary(account_id);
+  if observed_workspace_revision <> boundary_workspace_revision
+     or observed_evidence_revision <> boundary_evidence_revision then
+    raise exception 'stale workspace boundary changed active account coordinates';
+  end if;
+
+  perform pg_temp.expect_sqlstate(
+    'stale account-erasure evidence boundary',
+    format(
+      'select public.begin_account_deletion(%L::uuid, %s::bigint, %s::bigint)',
+      account_id,
+      boundary_workspace_revision,
+      boundary_evidence_revision + 1
+    ),
+    'PT409'
+  );
+  select workspace_revision, evidence_revision
+  into observed_workspace_revision, observed_evidence_revision
+  from public.read_account_erasure_backup_boundary(account_id);
+  if observed_workspace_revision <> boundary_workspace_revision
+     or observed_evidence_revision <> boundary_evidence_revision then
+    raise exception 'stale evidence boundary changed active account coordinates';
+  end if;
+
+  perform pg_temp.expect_sqlstate(
+    'legacy begin cannot fence an active account',
+    format(
+      'select public.begin_account_deletion(%L::uuid)',
+      account_id
+    ),
+    'PT409'
+  );
+
+  perform public.begin_account_deletion(
+    account_id,
+    boundary_workspace_revision,
+    boundary_evidence_revision
+  );
+  -- Once the server fence is durable, even a retried request carrying obsolete
+  -- coordinates is resume-only and cannot authorize a different account.
+  perform public.begin_account_deletion(account_id, 0, 0);
+  -- This succeeds only because the boundary-aware call already committed the
+  -- deleting state; it cannot authorize a new active-account deletion.
+  perform public.begin_account_deletion(account_id);
+end;
+$$;
 select pg_temp.expect_sqlstate(
   'snapshot CAS write after deletion begins',
-  $sql$select * from public.save_workspace_snapshot('{"version":3,"owner":"a","stale-tab":true}'::jsonb, 1)$sql$,
+  $sql$select * from public.save_workspace_snapshot('00000000-0000-0000-0000-0000000000a1'::uuid, '{"version":3,"owner":"a","stale-tab":true}'::jsonb, 1)$sql$,
   '55000'
 );
 select pg_temp.expect_denied('evidence upload after deletion begins', $sql$insert into storage.objects (id, bucket_id, name) values ('70000000-0000-0000-0000-0000000000f3', 'evidence', '00000000-0000-0000-0000-0000000000a1/racing-upload.txt')$sql$);
@@ -509,6 +909,7 @@ select pg_temp.expect_denied('evidence upload from stale JWT', $sql$insert into 
 -- A client that lost the successful final response can safely replay both
 -- phases with the same still-valid JWT subject. Both calls are idempotent.
 select public.begin_account_deletion('00000000-0000-0000-0000-0000000000a1');
+select public.begin_account_deletion('00000000-0000-0000-0000-0000000000a1', 0, 0);
 select public.delete_my_account('00000000-0000-0000-0000-0000000000a1');
 reset role;
 select set_config('request.jwt.claim.sub', '', true);
@@ -532,9 +933,16 @@ begin
   if exists (select 1 from public.user_settings where user_id = '00000000-0000-0000-0000-0000000000a1') then raise exception 'A settings survived cascade'; end if;
   if exists (select 1 from public.workspace_snapshots where user_id = '00000000-0000-0000-0000-0000000000a1') then raise exception 'A workspace survived cascade'; end if;
   if exists (select 1 from public.account_lifecycle where user_id = '00000000-0000-0000-0000-0000000000a1') then raise exception 'A lifecycle row survived cascade'; end if;
-  if not exists (select 1 from public.account_lifecycle where user_id = '00000000-0000-0000-0000-0000000000b2' and status = 'active') then raise exception 'B active lifecycle row was deleted or changed'; end if;
+  if not exists (
+    select 1
+    from public.account_lifecycle
+    where user_id = '00000000-0000-0000-0000-0000000000b2'
+      and status = 'active'
+      and evidence_revision = 1
+  ) then raise exception 'B active lifecycle row or evidence revision was deleted or changed'; end if;
   if exists (select 1 from storage.objects where bucket_id = 'evidence' and name like '00000000-0000-0000-0000-0000000000a1/%') then raise exception 'A evidence survived deletion'; end if;
-  if not exists (select 1 from storage.objects where bucket_id = 'evidence' and name = '00000000-0000-0000-0000-0000000000b2/seed-b.txt') then raise exception 'B evidence was deleted'; end if;
+  if exists (select 1 from private.evidence_cleanup_claims where user_id = '00000000-0000-0000-0000-0000000000a1') then raise exception 'A evidence cleanup claims survived account deletion'; end if;
+  if not exists (select 1 from storage.objects where bucket_id = 'evidence' and name = '00000000-0000-0000-0000-0000000000b2/seed-goal/seed-evidence/seed-b.txt') then raise exception 'B evidence was deleted'; end if;
 end;
 $$;
 

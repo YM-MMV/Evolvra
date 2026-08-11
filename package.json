@@ -12,7 +12,10 @@
     "build": "next build",
     "audit:dependencies": "npm audit --omit=dev --audit-level=high",
     "check:bundle": "node scripts/check-bundle-budget.mjs",
+    "check:contexts": "node scripts/check-provider-contexts.mjs",
     "check:no-ai": "node scripts/check-no-ai-integration.mjs",
+    "check:pwa-icons": "node scripts/check-pwa-icons.mjs",
+    "check:production": "node scripts/check-production.mjs",
     "check:gamification": "node scripts/check-no-gamification.mjs",
     "check:sql-fixtures": "node scripts/check-state-v3-fixtures.mjs",
     "check:sw": "node scripts/check-service-worker.mjs",
@@ -20,12 +23,14 @@
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
+    "test:coverage": "vitest run lib/account-erasure.test.ts lib/account-erasure-checkpoint.test.ts lib/state-schema.test.ts lib/persistence.test.ts lib/sync-reconciliation.test.ts lib/workspace-merge.test.ts lib/provider-evidence.test.ts lib/provider-goal-evidence.test.ts lib/provider-local-bootstrap.test.ts lib/provider-portable-archive.test.ts lib/provider-state.test.ts lib/provider-domain-commands.test.ts lib/provider-cloud-reconciliation.test.ts lib/provider-cloud-save.test.ts lib/provider-remote-evidence-cleanup.test.ts lib/provider-workspace-replacement.test.ts lib/portable-workspace-archive.test.ts lib/review-metric-movements.test.ts lib/workspace-capacity.test.ts lib/cloud-snapshot-budget.test.ts lib/utils.test.ts lib/safety-properties.test.ts --coverage",
     "test:e2e": "npm run build && playwright test",
     "test:e2e:cloud": "playwright test e2e/cloud-integration.spec.ts",
     "test:e2e:run": "playwright test",
     "test:e2e:debug": "playwright test --debug",
+    "test:storage-backup": "vitest run scripts/supabase-storage-evidence.test.mjs",
     "test:watch": "vitest",
-    "check": "npm run check:gamification && npm run check:no-ai && npm run check:sql-fixtures && npm run typecheck && npm run lint && npm test && npm run check:sw && npm run build && npm run check:bundle && npm run test:e2e:run"
+    "check": "npm run audit:dependencies && npm run check:gamification && npm run check:no-ai && npm run check:contexts && npm run check:sql-fixtures && npm run check:pwa-icons && npm run typecheck && npm run lint && npm test && npm run test:coverage && npm run check:sw && npm run build && npm run check:bundle && npm run test:e2e:run"
   },
   "dependencies": {
     "@supabase/supabase-js": "2.110.6",
@@ -43,14 +48,17 @@
     "@types/node": "24.13.3",
     "@types/react": "19.2.17",
     "@types/react-dom": "19.2.3",
+    "@vitest/coverage-v8": "4.1.10",
     "axe-core": "4.12.1",
     "eslint": "9.39.5",
     "eslint-config-next": "16.2.10",
+    "sharp": "0.35.3",
     "typescript": "6.0.3",
     "vitest": "4.1.10"
   },
   "overrides": {
-    "postcss": "8.5.19",
+    "nanoid": "3.3.17",
+    "postcss": "8.5.26",
     "sharp": "0.35.3"
   }
 }
