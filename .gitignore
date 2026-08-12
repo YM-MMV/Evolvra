@@ -9,6 +9,7 @@ out
 coverage
 playwright-report
 test-results
+test-results-production
 .vercel
 next-env.d.ts
 .env*

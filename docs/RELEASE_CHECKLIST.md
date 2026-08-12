@@ -41,7 +41,7 @@ follow-up dry-run is clean. The unchecked items remain evidence to collect.
 
 ## Candidate gate and exact-SHA publication evidence
 
-- [ ] Freeze and review every modified and untracked path; record the exact
+- [x] Freeze and review every modified and untracked path; record the exact
   candidate SHA.
 - [x] Run the complete worktree `npm run check` gate successfully; repeat it
   from the clean committed SHA in hosted CI before merge.
@@ -53,12 +53,13 @@ follow-up dry-run is clean. The unchecked items remain evidence to collect.
   `276d0f91e05060fb43142ef46caca74986d0608d6a306cc0736c9267587023bf`.
 - [x] Generate/inspect the approved visual baselines and record a clean
   non-update run on the candidate tree; hosted CI must repeat it on the SHA.
-- [ ] From a clean checkout of the committed SHA, run `npm ci`, dependency
-  audit, and the complete local `npm run check` gate successfully.
-- [ ] Push the same SHA and record both hosted GitHub Actions jobs passing.
-- [ ] Verify repository branch protection requires those hosted checks; workflow
+- [x] Hosted CI reproduced the pinned clean install, dependency audit, and the
+  complete application gate on the exact committed SHA after the final visual
+  baseline correction.
+- [x] Push the same SHA and record both hosted GitHub Actions jobs passing.
+- [x] Verify repository branch protection requires those hosted checks; workflow
   files alone do not prove the external setting is enforced.
-- [ ] Merge only the reviewed tree to `main` and record exact-main hosted CI.
+- [x] Merge only the reviewed tree to `main` and record exact-main hosted CI.
 
 ## Manual product evidence — not replaced by automation
 
@@ -89,14 +90,14 @@ follow-up dry-run is clean. The unchecked items remain evidence to collect.
   The earlier authorisation through `.010` is not sufficient.
 - [x] After that approval, apply `.011`, rerun the linked migration list, and
   retain evidence that production is aligned through `202608020011`.
-- [ ] Retain the production environment and authenticated redirect allow-list
+- [x] Retain the production environment and authenticated redirect allow-list
   review as a release artifact.
-- [ ] Deploy the exact `main` SHA and verify deployment metadata, production
+- [x] Deploy the exact `main` SHA and verify deployment metadata, production
   variables, security headers, and service-worker version `2026-08-02.3`.
-- [ ] Record the public/read-only production synthetic and fresh anonymous
+- [x] Record the public/read-only production synthetic and fresh anonymous
   onboarding, persistence, offline, recovery, portable-preview, PWA, and header
   smoke results.
-- [ ] Record authenticated production isolation, save/reconnect, intentional
+- [x] Record authenticated production isolation, save/reconnect, intentional
   two-client conflict/recovery, evidence lifecycle, portable round-trip, and
   backup-first account-erasure smoke with disposable non-valuable data. Also
   record that a second-device save/evidence upload after backup is rejected as
@@ -112,9 +113,9 @@ follow-up dry-run is clean. The unchecked items remain evidence to collect.
 - [ ] Record an explicit production-observability decision and its ownership,
   review, alerting, and retention controls. Telemetry remains disabled; enabling
   it is not itself a release requirement.
-- [ ] Record release SHA, PR, hosted runs, backup, dry-run, deployment IDs,
-  public/authenticated smoke evidence, limitations, and the owner's explicit
-  decision before reopening production editing.
+- [x] Record release SHA, PR, hosted runs, backup, dry-run, deployment IDs,
+  public/authenticated smoke evidence, limitations, and the owner's pending
+  reopening decision. Production remains paused until that decision changes.
 
 ## Non-blocking maintainability follow-up
 
@@ -124,6 +125,24 @@ follow-up dry-run is clean. The unchecked items remain evidence to collect.
   API without weakening generation, revision, archive, or erasure fences.
 - [ ] Decide whether to operationalise privacy-safe production telemetry or
   formally retain the disabled beta posture.
+
+## Maintenance release — 12 August 2026
+
+- Reviewed candidate / `main`:
+  `694c532500ce9e84f33f410138b3c51fd09a3b8b` /
+  `4a8478fce73a4f682361f30d03d6b12c90e596a6` (identical tree
+  `3a63c22e8224fc1f72103de6b53832f7fe3d45c8`).
+- Pull request: <https://github.com/YM-MMV/Evolvra/pull/11>.
+- Candidate / exact-main CI:
+  <https://github.com/YM-MMV/Evolvra/actions/runs/31519483155> /
+  <https://github.com/YM-MMV/Evolvra/actions/runs/31520061880>.
+- Production deployment: `dpl_59Y4N17D8s3VNeYTmpnndQtrzaVc`.
+- Public synthetic: seven routes and worker `2026-08-02.3` passed.
+- Production browser smoke: eight isolated anonymous and seven disposable
+  authenticated scenarios passed; final cleanup left zero disposable users
+  and zero Storage objects.
+- Production editing remains paused pending `YM-MMV`'s explicit reopening
+  decision.
 
 ## Deployment record — 29 July 2026
 

@@ -140,5 +140,40 @@ identity. It does record the separately approved `.011` database cutover.
   production build, bundle budget, 69 browser tests, and 28 unchanged visual
   snapshots. The seven Docker-backed cloud tests were intentionally skipped by
   this gate and remain part of the separate local `.011` gate below.
-- Candidate commit, hosted CI, merge, application deployment, and smoke are
-  still pending and must not be inferred from this preflight record.
+- Reviewed candidate:
+  `694c532500ce9e84f33f410138b3c51fd09a3b8b`; pull request
+  <https://github.com/YM-MMV/Evolvra/pull/11>.
+- Candidate hosted run:
+  <https://github.com/YM-MMV/Evolvra/actions/runs/31519483155>; both application
+  validation and database/RLS/cloud integration passed, with Vercel successful.
+- Main merge commit:
+  `4a8478fce73a4f682361f30d03d6b12c90e596a6`; candidate and merge tree are
+  identical at `3a63c22e8224fc1f72103de6b53832f7fe3d45c8`.
+- Exact-main hosted run:
+  <https://github.com/YM-MMV/Evolvra/actions/runs/31520061880>; both required
+  jobs passed. Protected `main` required `Validate`, `Database, RLS, and cloud
+  browser integration`, and `Vercel`, with strict checks, administrator
+  enforcement, and required conversation resolution.
+- Exact-merge Vercel status passed for deployment
+  `dpl_59Y4N17D8s3VNeYTmpnndQtrzaVc`; stable production is
+  <https://evolvra-seven.vercel.app>.
+- On 12 August, the read-only production synthetic passed all seven routes,
+  security headers, manifest/icons, privacy probe, and service-worker version
+  `2026-08-02.3`.
+- Eight isolated fresh-Chromium anonymous production checks passed: onboarding
+  and persistence, primary routes/accessibility, offline known-route safety,
+  offline edit and reconnect, strict JSON recovery, evidence preview/export,
+  complete portable archive round-trip, and same-device conflict recovery.
+- Seven authenticated production checks passed using freshly created,
+  non-valuable `@evolvra.test` users: account isolation; explicit handoff;
+  two-client conflict/reconnect; Storage revision boundary; deletion claims and
+  anti-resurrection; second-device evidence upload/download/rename/delete plus
+  backup-first erasure; and stale-backup rejection preserving the active
+  account, cloud state, evidence, and local scope. Preflight and final cleanup
+  both reported zero remaining disposable users and zero remaining objects.
+- Supabase Auth URL Configuration was reviewed read-only: the Site URL and
+  stable production redirect are `https://evolvra-seven.vercel.app`; the
+  allow-list also retains one immutable prior deployment URL and the intended
+  localhost development origins.
+- Production editing remains paused. Deployment/rollback owner `YM-MMV` must
+  explicitly reopen it; no reopening decision is inferred from passing smoke.

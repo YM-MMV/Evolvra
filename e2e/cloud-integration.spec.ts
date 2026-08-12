@@ -137,9 +137,9 @@ async function claimEvidenceCleanup(
   };
 }
 
-test.describe("local Supabase browser integration", () => {
+test.describe("Supabase browser integration", () => {
   test.setTimeout(90_000);
-  test.skip(!cloudE2eEnabled, "Set local Supabase URL, anon key, and service-role key to run cloud integration E2E.");
+  test.skip(!cloudE2eEnabled, "Set a guarded Supabase URL, anon key, and service-role key to run cloud integration E2E.");
 
   const accountIds = new Set<string>();
   test.afterEach(async () => {
