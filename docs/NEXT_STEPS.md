@@ -9,25 +9,30 @@ The original P0 data-safety risks and the major workflow gaps are implemented,
 and a final read-only audit found no remaining P0 product or data-safety defect.
 AI remains deliberately deferred and is not an unfinished release item.
 
-The current working tree is a new maintenance candidate built on the completed
-state-v3 production cutover at `292d4bc`. It adds product-truth fixes, complete
-portable backups, capacity recovery, narrower provider contexts, more testable
-cloud coordinators, recovery-dialog accessibility, browser/device/visual gates,
-Storage backup tooling, and scheduled production assurance. This candidate is
-not a release until its exact commit passes the local and hosted gates, is
-merged to `main`, deployed, and smoke-tested.
+The maintenance release is deployed from reviewed candidate
+`694c532500ce9e84f33f410138b3c51fd09a3b8b` and merge commit
+`4a8478fce73a4f682361f30d03d6b12c90e596a6`. Candidate and merge trees are
+identical, exact-main hosted CI and Vercel promotion passed, and public,
+anonymous, and authenticated production smokes passed on 12 August.
 
-Production editing remains paused until the owner-assisted authenticated smoke
-is recorded. After the Docker/local gate, linked dry-run, and explicit
-deployment-owner approval were recorded on 11 August, production migration
-`202608020011_account_erasure_backup_boundary.sql` was applied. The linked
-ledger is aligned through `.011`, and a follow-up dry-run reports the remote
-database up to date. The compatible application is not deployed yet.
+Production editing remains paused until deployment/rollback owner `YM-MMV`
+explicitly reopens it. Migration
+`202608020011_account_erasure_backup_boundary.sql` is applied, the linked
+ledger is aligned through `.011`, and the compatible application and complete
+production smoke are now deployed and recorded.
 
 ## Current release facts
 
-- Working branch: `agent/finish-product-plan`.
-- Current production and `main`: `292d4bc81bcacb8097a082006be3dc60f1aab8a2`.
+- Reviewed application branch: `agent/finish-product-plan`.
+- Reviewed candidate: `694c532500ce9e84f33f410138b3c51fd09a3b8b`.
+- Production application and `main` merge commit:
+  `4a8478fce73a4f682361f30d03d6b12c90e596a6`.
+- Candidate and merge tree:
+  `3a63c22e8224fc1f72103de6b53832f7fe3d45c8`.
+- Pull request: <https://github.com/YM-MMV/Evolvra/pull/11>.
+- Candidate CI: <https://github.com/YM-MMV/Evolvra/actions/runs/31519483155>.
+- Exact-main CI: <https://github.com/YM-MMV/Evolvra/actions/runs/31520061880>.
+- Production deployment: `dpl_59Y4N17D8s3VNeYTmpnndQtrzaVc`.
 - Stable production URL: <https://evolvra-seven.vercel.app>.
 - Linked Supabase project: `gmityvwkrhrraubhmyez`, PostgreSQL
   `17.6.1.141`, production migrations aligned through `202608020011`.
@@ -41,10 +46,9 @@ database up to date. The compatible application is not deployed yet.
   rows, or Storage objects; the empty inventory is current backup evidence but
   not a non-empty restore drill. PostgreSQL dumps never contain Storage bytes.
 - Deployment and rollback owner: `YM-MMV`.
-- The owner has paused production editing and authorised the fresh backup,
-  local and linked `.011` verification, production `.011` application, merge,
-  deployment, and smoke testing. Completion evidence is still required for
-  Git publication, hosted CI, deployment, and smoke testing.
+- The owner paused production editing and authorised the fresh backup, local
+  and linked `.011` verification, application, merge, deployment, and smoke.
+  Those actions are complete. Reopening editing remains the owner's decision.
 - Required rollback strategy: roll forward with a state-v3/IndexedDB-v4-
   compatible hotfix; never deploy a pre-v3 application or an IndexedDB-v3-or-
   earlier persistence client after the v4 fence has opened.
@@ -239,10 +243,15 @@ These steps are sequential. Do not reopen production editing between them.
 14. Record the release commit, PR, CI runs, deployment IDs, smoke evidence, any
    limitation, and the owner decision to reopen production editing.
 
+Steps 1–13 are complete. Step 14 is complete except for the owner's explicit
+decision to reopen production editing. The production harness is retained as
+`npm run test:e2e:production` and `npm run test:e2e:production:cloud`.
+
 Release definition of done:
 
-- The reviewed commit tree, hosted CI tree, `main` tree, and production artifact
-  are identical.
+- The reviewed application commit tree, hosted CI tree, `main` tree, and
+  deployed application artifact are identical. The post-release harness and
+  evidence record are a separate non-runtime follow-up.
 - Every automated gate passes on that exact tree.
 - Public and authenticated production smoke evidence is recorded.
 - Required branch protection is verified, not inferred from workflow files.
@@ -317,10 +326,8 @@ it must not be introduced as an incidental enhancement.
 
 ## Owner assistance required
 
-No additional product decision is blocking the code freeze. Owner or repository
-administrator assistance is still required to verify branch-protection
-settings, complete the authenticated production smoke in step 13, accept any required
-manual real-device/assistive-technology evidence, and explicitly reopen
-production editing after the release evidence is recorded. The Storage restore
-drill also requires real retained objects; it remains unrecorded rather than
-being treated as satisfied by the July database backup.
+Branch protection and authenticated production smoke are verified. Owner
+assistance is now required only to decide whether to reopen production editing
+and to accept or schedule the non-blocking real-device/assistive-technology
+walkthrough. The Storage restore drill requires real retained objects and
+remains unrecorded rather than being treated as satisfied by an empty inventory.

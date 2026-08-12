@@ -5,6 +5,10 @@ import { requireLocalSupabaseUrl } from "../lib/local-supabase-url";
 const apiUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
 const anonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
 const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const productionProjectRef = process.env.EVOLVRA_PRODUCTION_SUPABASE_PROJECT_REF;
+const productionConfirmation = "RUN_DISPOSABLE_PRODUCTION_CLOUD_E2E";
+const productionCloudE2eEnabled = process.env.EVOLVRA_ALLOW_PRODUCTION_CLOUD_E2E
+  === productionConfirmation;
 const anyCloudCredential = Boolean(apiUrl || anonKey || serviceRoleKey);
 const allCloudCredentials = Boolean(apiUrl && anonKey && serviceRoleKey);
 
@@ -12,7 +16,35 @@ if (anyCloudCredential && !allCloudCredentials) {
   throw new Error("Cloud E2E URL, anon key, and service-role key must be provided together.");
 }
 
-const guardedApiUrl = allCloudCredentials ? requireLocalSupabaseUrl(apiUrl) : undefined;
+function requireProductionSupabaseUrl(value: string | undefined): string {
+  if (!value || !productionProjectRef) {
+    throw new Error(
+      "Production cloud E2E requires the exact Supabase URL and project ref.",
+    );
+  }
+  const url = new URL(value);
+  const expectedHost = `${productionProjectRef}.supabase.co`;
+  if (
+    url.protocol !== "https:"
+    || url.hostname !== expectedHost
+    || url.username
+    || url.password
+    || url.search
+    || url.hash
+    || (url.pathname !== "/" && url.pathname !== "")
+  ) {
+    throw new Error(
+      `Production cloud E2E URL must be exactly https://${expectedHost}.`,
+    );
+  }
+  return url.origin;
+}
+
+const guardedApiUrl = allCloudCredentials
+  ? productionCloudE2eEnabled
+    ? requireProductionSupabaseUrl(apiUrl)
+    : requireLocalSupabaseUrl(apiUrl)
+  : undefined;
 export const cloudE2eEnabled = Boolean(guardedApiUrl);
 
 let admin: SupabaseClient | null = null;
