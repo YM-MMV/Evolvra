@@ -102,17 +102,17 @@ export default function QuestsPage() {
   const canCompleteSelection = selectedGoal?.status === "active" && selectedQuest && isQuestAvailable(selectedQuest);
 
   return (
-    <div>
-      <section className="page-header">
+    <div className="instrument-route instrument-route-quests">
+      <section className="page-header instrument-route-header">
         <div>
-          <p className="eyebrow">{terms.quests.plural} with purpose</p>
+          <p className="eyebrow">Action register</p>
           <h1>{terms.quests.plural} board</h1>
           <p className="page-lead">Choose {terms.quests.pluralLower} that move a real {terms.goals.singularLower}. Missing a day never destroys your progress.</p>
         </div>
         <Link href="/goals" className="button button-primary"><Plus size={17} aria-hidden="true" /> Add through a {terms.goals.singularLower}</Link>
       </section>
 
-      <div className="toolbar panel">
+      <div className="toolbar panel instrument-toolbar">
         <div className="search-box"><Search size={17} aria-hidden="true" /><input value={query} onChange={(event) => { setQuery(event.target.value); setVisibleCompletions(50); }} placeholder={`Search ${terms.quests.pluralLower}…`} aria-label={`Search ${terms.quests.pluralLower} and completion history`} /></div>
         <div className="filter-tabs" role="group" aria-label={`${terms.quests.singular} view`}>
           <button type="button" className={view === "available" ? "active" : ""} onClick={() => { setView("available"); setVisibleCompletions(50); }} aria-pressed={view === "available"}>Available</button>

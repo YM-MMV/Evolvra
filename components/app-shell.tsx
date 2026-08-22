@@ -420,7 +420,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   });
 
   return (
-    <div className="app-layout">
+    <div className="app-layout app-layout-instrument">
       <aside ref={sidebarRef} id="primary-navigation" tabIndex={mobileOpen ? -1 : undefined} role={mobileOpen ? "dialog" : undefined} aria-modal={mobileOpen ? true : undefined} aria-label="Primary navigation" className={`sidebar ${mobileOpen ? "mobile-open" : ""}`}>
         <div className="sidebar-top">
           <Link className="brand" href="/" onClick={() => setMobileOpen(false)}><span className="brand-mark"><Sparkles size={20} /></span><span className="brand-copy"><strong>Evolvra</strong><small>Personal OS</small></span></Link>

@@ -51,17 +51,17 @@ function GoalsContent() {
   );
 
   return (
-    <div>
-      <section className="page-header">
+    <div className="instrument-route instrument-route-goals">
+      <section className="page-header instrument-route-header">
         <div>
-          <p className="eyebrow">Outcomes over activity</p>
+          <p className="eyebrow">Objective register</p>
           <h1>Your {terms.goals.pluralLower}</h1>
           <p className="page-lead">Define what matters, choose an honest measurement, and always know the next useful action.</p>
         </div>
         <Button type="button" onClick={() => setFormOpen(true)}><Plus size={17} aria-hidden="true" /> New {terms.goals.singularLower}</Button>
       </section>
 
-      <div className="toolbar panel">
+      <div className="toolbar panel instrument-toolbar">
         <div className="search-box"><Search size={17} aria-hidden="true" /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder={`Search ${terms.goals.pluralLower}…`} aria-label={`Search ${terms.goals.pluralLower}`} /></div>
         <select
           value={view === "board" ? "all" : status}

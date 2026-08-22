@@ -47,6 +47,7 @@ describe("MetricHistoryChart", () => {
     expect(html).toContain("10 km");
     expect(html).not.toContain("5 mi");
     expect(html).toContain("<polyline");
+    expect(html).not.toContain("<title>");
   });
 
   it("does not draw a false continuous trend across different recorded units", () => {

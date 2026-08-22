@@ -365,8 +365,8 @@ export default function ReviewsPage() {
   const filled = prompts[cadence].filter((prompt) => answers[prompt.key]?.trim()).length;
   const sortedReviews = [...state.reviews].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
 
-  return <div>
-    <section className="page-header"><div><p className="eyebrow">Reflection without judgement</p><h1>Reviews</h1><p className="page-lead">Turn activity into understanding. Adjust your system without treating a quiet period as failure.</p></div></section>
+  return <div className="instrument-route instrument-route-reviews">
+    <section className="page-header instrument-route-header"><div><p className="eyebrow">Reflection log</p><h1>Reviews</h1><p className="page-lead">Turn activity into understanding. Adjust your system without treating a quiet period as failure.</p></div></section>
     <div className="review-summary-grid" aria-label={`Recorded activity from ${reviewContext.weekLabel}`}>{[
       { label: "Active days this week", value: reviewContext.summary.activeDays, href: timelineHref(reviewContext.weekRange) },
       { label: `${termLabels.quests.plural} completed`, value: reviewContext.summary.quests, href: timelineHref({ ...reviewContext.weekRange, type: "quest" }) },

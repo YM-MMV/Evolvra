@@ -34,7 +34,7 @@ export function MetricHistoryChart({ metric, entries, color }: { metric: Progres
         {mixedUnits ? <ol className="metric-history-unit-list" aria-hidden="true">{data.map((item, index) => <li key={`${item.label}-${index}`}><span>{item.label}</span><strong>{item.value.toLocaleString()} {item.unit}</strong></li>)}</ol> : <svg viewBox={`0 0 ${chart.width} ${chart.height}`} aria-hidden="true" focusable="false">
           {ticks.map((value) => <g key={value}><line x1={chart.left} x2={chart.width - chart.right} y1={y(value)} y2={y(value)} stroke="var(--line)" /><text x={chart.left - 8} y={y(value) + 4} textAnchor="end" fill="var(--muted)" fontSize="10">{value.toLocaleString()}</text></g>)}
           <polyline points={points} fill="none" stroke={color ?? "var(--accent)"} strokeWidth="2.5" vectorEffect="non-scaling-stroke" />
-          {data.map((item, index) => <circle key={`${item.label}-${index}`} cx={x(index)} cy={y(item.value)} r="3" fill={color ?? "var(--accent)"}><title>{item.label}: {item.value.toLocaleString()} {item.unit}</title></circle>)}
+          {data.map((item, index) => <circle key={`${item.label}-${index}`} cx={x(index)} cy={y(item.value)} r="3" fill={color ?? "var(--accent)"} />)}
           <text x={chart.left} y={chart.height - 5} fill="var(--muted)" fontSize="10">{data[0].label}</text>
           <text x={chart.width - chart.right} y={chart.height - 5} textAnchor="end" fill="var(--muted)" fontSize="10">{data.at(-1)!.label}</text>
         </svg>}

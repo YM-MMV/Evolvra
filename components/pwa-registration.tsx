@@ -399,7 +399,7 @@ export function PwaRegistration({
   }
 
   return (
-    <div className="system-alert" role={status.state === "error" ? "alert" : "status"} aria-live="polite" aria-atomic="true">
+    <div className={`system-alert pwa-status-alert pwa-status-${status.state}`} role={status.state === "error" ? "alert" : "status"} aria-live="polite" aria-atomic="true">
       <span>{status.message}</span>
       {status.state === "update-available" && <button type="button" className="button button-secondary" onClick={applyUpdate}>Update now</button>}
       {canOfferInstall && status.state !== "update-available" && <><span>Install Evolvra for quicker access and offline-ready pages.</span><button type="button" className="button button-secondary" onClick={() => void install()}>Install app</button><button type="button" className="button button-ghost" onClick={() => setInstallDismissed(true)}>Not now</button></>}
