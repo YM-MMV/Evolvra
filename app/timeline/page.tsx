@@ -129,8 +129,8 @@ export default function TimelinePage() {
     setFilters({});
   };
 
-  return <div>
-    <section className="page-header"><div><p className="eyebrow">Your permanent record</p><h1>Timeline</h1><p className="page-lead">A reconciled chronological account of completed {terms.quests.pluralLower}, measurements, {terms.milestones.pluralLower}, check-ins, reflections, and {terms.goals.singularLower} changes.</p></div></section>
+  return <div className="instrument-route instrument-route-timeline">
+    <section className="page-header instrument-route-header"><div><p className="eyebrow">Source record ledger</p><h1>Timeline</h1><p className="page-lead">A reconciled chronological account of completed {terms.quests.pluralLower}, measurements, {terms.milestones.pluralLower}, check-ins, reflections, and {terms.goals.singularLower} changes.</p></div></section>
     <div className="timeline-stats">
       <Panel><Activity /><div><strong>{events.length}</strong><span>{activeFilters ? "matching records" : "recorded entries"}</span></div></Panel>
       <Panel><CheckCircle2 /><div><strong>{actionCount}</strong><span>matching {actionCount === 1 ? terms.quests.singularLower : terms.quests.pluralLower}</span></div></Panel>

@@ -2,7 +2,7 @@
 
 import { useState, type ReactNode } from "react";
 import Link from "next/link";
-import { ArrowRight, Check, ChevronRight, Flame, Plus, Sparkles, TrendingUp } from "lucide-react";
+import { ArrowRight, BookOpenCheck, Check, ChevronRight, Flame, Plus, Target, TrendingUp } from "lucide-react";
 import { useWorkspaceData } from "@/components/app-provider";
 import { DynamicIcon } from "@/components/icons";
 import { GoalCard } from "@/components/goal-card";
@@ -40,6 +40,7 @@ export default function DashboardPage() {
     };
   });
   const maxDay = Math.max(...days.map((day) => day.activity), 1);
+  const peakIndex = days.reduce((bestIndex, day, index) => day.activity > days[bestIndex].activity ? index : bestIndex, 0);
   const weeklyActivity = days.reduce((sum, day) => sum + day.activity, 0);
   const weeklyActivityHref = timelineHref({ type: "activity", from: days[0].key, to: days[days.length - 1].key });
   const milestoneCount = state.goals.flatMap((goal) => goal.milestones).filter((milestone) => milestone.completedAt).length;
@@ -94,14 +95,20 @@ export default function DashboardPage() {
       <Panel id="dashboard-momentum" className="momentum-panel">
         <div className="section-heading compact"><div><p className="eyebrow">Last 7 days</p><h2>Momentum</h2></div><span className="section-icon warm" aria-hidden="true"><Flame size={18} /></span></div>
         <Link className="momentum-total trace-link" href={weeklyActivityHref} aria-label={`Inspect ${weeklyActivity} recorded moments from the last seven days`}><strong>{weeklyActivity}</strong><span>recorded moments in the last seven days</span></Link>
-        <div className="mini-chart" role="img" aria-label={`Activity over the last seven days: ${days.map((day) => `${day.activity} on ${day.key}`).join(", ")}`}>{days.map((day) => <div key={day.key} aria-hidden="true"><span style={{ height: `${day.activity ? Math.max(6, (day.activity / maxDay) * 100) : 0}%` }} title={`${day.activity} recorded ${day.activity === 1 ? "moment" : "moments"}`} /><small>{day.label}</small></div>)}</div>
+        <div className="instrument-momentum-chart">
+          <div className="instrument-chart-axis" aria-hidden="true"><span>{maxDay}</span><span>0</span></div>
+          <div className="instrument-chart-plot">
+            <div className="mini-chart" role="img" aria-label={`Activity over the last seven days: ${days.map((day) => `${day.activity} on ${day.key}`).join(", ")}`}>{days.map((day, index) => <div className={index === peakIndex ? "is-peak" : undefined} key={day.key} aria-hidden="true"><span style={{ height: `${day.activity ? Math.max(6, (day.activity / maxDay) * 100) : 0}%` }} title={`${day.activity} recorded ${day.activity === 1 ? "moment" : "moments"}`} /><small>{day.label}</small></div>)}</div>
+            {weeklyActivity > 0 && <span className="instrument-chart-annotation" aria-hidden="true">{days.at(-1)?.activity === maxDay ? "PEAK / TODAY" : "PEAK"}</span>}
+          </div>
+        </div>
         <p className="supportive-copy">Momentum describes recent activity. It is information, never a verdict. <Link className="trace-link" href={weeklyActivityHref}>Open source records</Link>.</p>
       </Panel>
     ),
     goals: (
       <section id="dashboard-goals">
         <div className="section-heading"><div><p className="eyebrow">Active objectives</p><h2>Your current {terms.goals.pluralLower}</h2></div><Link href="/goals">View all <ChevronRight size={16} aria-hidden="true" /></Link></div>
-        {activeGoals.length ? <div className="goal-grid">{activeGoals.slice(0, 4).map((goal) => <GoalCard key={goal.id} goal={goal} area={getArea(state, goal.areaId)} />)}</div> : <EmptyState icon={<Sparkles />} title="A clear field" body={`Create your first ${terms.goals.singularLower} and define what genuine progress looks like.`} action={<Link href="/goals?new=true" className="button button-primary">Create a {terms.goals.singularLower}</Link>} />}
+        {activeGoals.length ? <div className="goal-grid">{activeGoals.slice(0, 4).map((goal) => <GoalCard key={goal.id} goal={goal} area={getArea(state, goal.areaId)} variant="readout" />)}</div> : <EmptyState icon={<Target />} title="A clear field" body={`Create your first ${terms.goals.singularLower} and define what genuine progress looks like.`} action={<Link href="/goals?new=true" className="button button-primary">Create a ${terms.goals.singularLower}</Link>} />}
       </section>
     ),
     qualities: (
@@ -117,7 +124,7 @@ export default function DashboardPage() {
     ),
     review: (
       <Panel id="dashboard-review" className="review-nudge">
-        <span className="review-orb" aria-hidden="true"><Sparkles size={20} /></span>
+        <span className="review-orb" aria-hidden="true"><BookOpenCheck size={20} /></span>
         <div><p className="eyebrow">Reflection</p><h3>Make sense of the week</h3><p>Notice movement, blockers, and what deserves attention next.</p></div>
         <Link href="/reviews" className="button button-secondary">Start a review</Link>
       </Panel>
@@ -129,7 +136,7 @@ export default function DashboardPage() {
     .filter((section) => !state.settings.hiddenDashboardSections.includes(section));
 
   return (
-    <div className="dashboard-page">
+    <div className="dashboard-page dashboard-page-instrument">
       {state.settings.hiddenDashboardSections.includes("hero") && <h1 className="visually-hidden">Dashboard</h1>}
       <div className="dashboard-sections">
         {orderedSections.map((section) => (
@@ -141,7 +148,7 @@ export default function DashboardPage() {
             {dashboardSections[section]}
           </div>
         ))}
-        {!orderedSections.length && <Panel className="dashboard-empty"><div className="calm-empty"><Sparkles size={20} aria-hidden="true" /><strong>Your dashboard is clear</strong><p>Restore any section from dashboard arrangement in settings.</p><Link href="/settings" className="panel-link">Open settings <ArrowRight size={15} aria-hidden="true" /></Link></div></Panel>}
+        {!orderedSections.length && <Panel className="dashboard-empty"><div className="calm-empty"><Target size={20} aria-hidden="true" /><strong>Your dashboard is clear</strong><p>Restore any section from dashboard arrangement in settings.</p><Link href="/settings" className="panel-link">Open settings <ArrowRight size={15} aria-hidden="true" /></Link></div></Panel>}
       </div>
       {completionTarget && canCompleteSelection && selectedQuest && <QuestCompletionForm key={`${completionTarget.goalId}:${completionTarget.questId}`} goalId={completionTarget.goalId} quest={selectedQuest} open onClose={() => setCompletionTarget(null)} />}
     </div>
